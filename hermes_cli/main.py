@@ -13972,10 +13972,14 @@ Examples:
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        if type(result) is int:
+            return result
+        return None
     else:
         parser.print_help()
+        return None
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
