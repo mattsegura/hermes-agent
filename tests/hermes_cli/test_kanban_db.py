@@ -202,6 +202,202 @@ def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
     assert "Branch:   wt/t6-wire" in context
 
 
+def test_create_task_persists_funnel_fields_and_read_model(kanban_home):
+    with kb.connect() as conn:
+        intake = kb.create_task(
+            conn,
+            title="capture owner intent",
+            assignee="planner",
+            goal_id="close-deal",
+            workstream_id="owner-flow",
+            stage_key="intake",
+            action_key="capture",
+            funnel_data={"artifact": "owner-brief.md", "proof": "request captured"},
+        )
+        execute = kb.create_task(
+            conn,
+            title="execute next action",
+            assignee="worker",
+            parents=[intake],
+            goal_id="close-deal",
+            workstream_id="owner-flow",
+            stage_key="execute",
+            action_key="dispatch",
+        )
+        kb.complete_task(
+            conn,
+            intake,
+            summary="Owner intent captured.",
+            metadata={
+                "artifacts": ["/tmp/owner-brief.md"],
+                "proof": ["validated"],
+                "outcome": "ready for dispatch",
+            },
+        )
+        task = kb.get_task(conn, intake)
+        model = kb.build_funnel_read_model(conn, board="default")
+
+    assert task is not None
+    assert task.goal_id == "close-deal"
+    assert task.workstream_id == "owner-flow"
+    assert task.stage_key == "intake"
+    assert task.action_key == "capture"
+    assert task.funnel_data == {"artifact": "owner-brief.md", "proof": "request captured"}
+
+    assert model["summary"]["total_cards"] == 2
+    assert model["summary"]["stage_count"] == 2
+    assert model["summary"]["edge_count"] == 1
+    stages = {s["stage_key"]: s for s in model["stages"]}
+    assert stages["intake"]["metrics"]["done_cards"] == 1
+    assert stages["intake"]["metrics"]["artifact_count"] == 2
+    assert stages["intake"]["metrics"]["cards_with_proof"] == 1
+    assert stages["intake"]["metrics"]["cards_with_outcomes"] == 1
+    assert stages["execute"]["metrics"]["active_cards"] == 1
+    assert model["edges"][0]["task_edges"] == [
+        {"parent_id": intake, "child_id": execute}
+    ]
+
+
+def test_update_task_funnel_fields_persists_and_audits(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="backfill me", assignee="operator")
+        updated = kb.update_task_funnel_fields(
+            conn,
+            task_id,
+            goal_id="close-deal",
+            workstream_id="seller-flow",
+            stage_key="lead-gen",
+            action_key="source-leads",
+            funnel_data={"batch": "polk", "lead_count": 15},
+        )
+        events = kb.list_events(conn, task_id)
+        model = kb.build_funnel_read_model(conn, board="default")
+
+    assert updated.goal_id == "close-deal"
+    assert updated.workstream_id == "seller-flow"
+    assert updated.stage_key == "lead-gen"
+    assert updated.action_key == "source-leads"
+    assert updated.funnel_data == {"batch": "polk", "lead_count": 15}
+    assert events[-1].kind == "funnel_updated"
+    assert isinstance(events[-1].payload, dict)
+    assert events[-1].payload["stage_key"] == "lead-gen"
+    assert model["stages"][0]["stage_key"] == "lead-gen"
+
+
+def test_funnel_read_model_aggregates_compound_entities(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="negotiate owner conversations",
+            assignee="negotiator",
+            goal_id="close-deal",
+            workstream_id="seller-flow",
+            stage_key="negotiate",
+            action_key="work-conversations",
+            funnel_data={
+                "entities": [
+                    {
+                        "id": "lead-1",
+                        "type": "lead",
+                        "label": "Owner A",
+                        "state": "contacted",
+                        "next_action": {"action": "wait_for_reply"},
+                        "actor": "seller",
+                    }
+                ]
+            },
+        )
+        kb.complete_task(
+            conn,
+            task_id,
+            summary="Conversation batch updated.",
+            metadata={
+                "entities": [
+                    {
+                        "id": "lead-1",
+                        "type": "lead",
+                        "label": "Owner A",
+                        "state": "countered",
+                        "blocked": True,
+                        "next_action": {"action": "review_ceiling"},
+                        "actor": "team",
+                        "outcome": "counter above current ceiling",
+                        "proof": ["sms-thread:lead-1"],
+                    },
+                    {
+                        "id": "lead-2",
+                        "type": "lead",
+                        "label": "Owner B",
+                        "state": "agreement",
+                        "terminal": True,
+                        "next_action": "handoff_contract",
+                        "actor": "team",
+                        "artifact": "/tmp/lead-2-agreement.json",
+                    },
+                ]
+            },
+        )
+        model = kb.build_funnel_read_model(
+            conn,
+            board="default",
+            limit_entities_per_stage=1,
+        )
+
+    assert model["summary"]["entity_count"] == 2
+    assert model["summary"]["compound_stage_count"] == 1
+    assert model["summary"]["blocked_entities"] == 1
+    assert model["summary"]["terminal_entities"] == 1
+    assert model["summary"]["entities_with_next_action"] == 2
+
+    stage = model["stages"][0]
+    assert stage["stage_key"] == "negotiate"
+    assert stage["entity_metrics"]["total_entities"] == 2
+    assert stage["entity_metrics"]["blocked_entities"] == 1
+    assert stage["entity_metrics"]["terminal_entities"] == 1
+    assert stage["entity_metrics"]["by_type"] == {"lead": 2}
+    assert stage["entity_metrics"]["by_state"] == {"agreement": 1, "countered": 1}
+    assert stage["entity_metrics"]["by_stage"] == {"negotiate": 2}
+    assert stage["entity_metrics"]["by_next_action"] == {
+        "handoff_contract": 1,
+        "review_ceiling": 1,
+    }
+    assert stage["entity_states"] == [
+        {
+            "state": "agreement",
+            "count": 1,
+            "blocked": 0,
+            "terminal": 1,
+            "with_next_action": 1,
+            "by_type": {"lead": 1},
+        },
+        {
+            "state": "countered",
+            "count": 1,
+            "blocked": 1,
+            "terminal": 0,
+            "with_next_action": 1,
+            "by_type": {"lead": 1},
+        },
+    ]
+    assert stage["entity_next_actions"] == [
+        {
+            "action": "handoff_contract",
+            "count": 1,
+            "by_actor": {"team": 1},
+            "by_state": {"agreement": 1},
+        },
+        {
+            "action": "review_ceiling",
+            "count": 1,
+            "by_actor": {"team": 1},
+            "by_state": {"countered": 1},
+        },
+    ]
+    assert stage["entities_truncated"] == 1
+    assert len(stage["entities"]) == 1
+    assert stage["cards"][0]["signals"]["entity_count"] == 2
+
+
 def test_branch_name_requires_worktree_workspace(kanban_home):
     with kb.connect() as conn, pytest.raises(ValueError, match="worktree"):
         kb.create_task(
@@ -2596,18 +2792,22 @@ def test_task_dict_survives_corrupt_created_at(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_create_task_scratch_without_workspace_ignores_board_default_workdir(kanban_home, monkeypatch):
-    """Scratch tasks must NOT inherit board.default_workdir — would point auto-cleanup
-    at the user's source tree on completion (#28818)."""
+def test_create_task_without_workspace_auto_promotes_board_default_workdir(kanban_home, monkeypatch):
+    """A board default_workdir declares persistent shared workspaces.
+
+    Tasks created without an explicit workspace inherit it as a ``dir``
+    workspace so downstream stages share files and scratch cleanup never points
+    at the user's source tree.
+    """
     default_wd = "/home/user/project"
     kb.create_board("work-proj", default_workdir=default_wd)
 
     with kb.connect(board="work-proj") as conn:
-        tid = kb.create_task(conn, title="scratch-task", board="work-proj")
+        tid = kb.create_task(conn, title="persistent-task", board="work-proj")
         t = kb.get_task(conn, tid)
     assert t is not None
-    assert t.workspace_kind == "scratch"
-    assert t.workspace_path is None
+    assert t.workspace_kind == "dir"
+    assert t.workspace_path == default_wd
 
 
 def test_create_task_dir_without_workspace_inherits_board_default_workdir(kanban_home, monkeypatch):

@@ -78,6 +78,11 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "goal_id": t.goal_id,
+        "workstream_id": t.workstream_id,
+        "stage_key": t.stage_key,
+        "action_key": t.action_key,
+        "funnel_data": t.funnel_data,
     }
 
 
@@ -89,6 +94,21 @@ def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
     if st is None:
         return {}
     return {"state_type": st, "state_name": sn}
+
+
+def _parse_json_object_flag(raw: Optional[str], flag_name: str) -> tuple[Optional[dict], Optional[str]]:
+    if raw is None:
+        return None, None
+    text = str(raw).strip()
+    if not text:
+        return None, None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return None, f"{flag_name}: {exc}"
+    if not isinstance(parsed, dict):
+        return None, f"{flag_name}: must be a JSON object"
+    return parsed, None
 
 
 def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
@@ -332,6 +352,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(repeatable). Appended to the built-in "
                                "kanban-worker skill. Example: "
                                "--skill translation --skill github-code-review")
+    p_create.add_argument("--goal", default=None,
+                          help="Semantic funnel goal id for optimizer/UI read-models")
+    p_create.add_argument("--workstream", default=None,
+                          help="Semantic funnel workstream id under the goal")
+    p_create.add_argument("--stage", default=None,
+                          help="Semantic funnel stage key for the card")
+    p_create.add_argument("--action", default=None,
+                          help="Semantic funnel action key within the stage")
+    p_create.add_argument("--funnel-data", default=None,
+                          help="JSON object with structured funnel facts")
     p_create.add_argument("--max-retries", type=int, default=None,
                           metavar="N",
                           help="Per-task override for the consecutive-failure "
@@ -656,6 +686,41 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_stats.add_argument("--json", action="store_true")
 
+    # --- funnel ---
+    p_funnel = sub.add_parser(
+        "funnel",
+        help="Semantic goal/workstream/stage read-model over Kanban cards",
+    )
+    p_funnel.add_argument("--json", action="store_true", help="Emit JSON output")
+    p_funnel.add_argument("--archived", action="store_true", help="Include archived cards")
+    p_funnel.add_argument("--limit-cards", type=int, default=20,
+                          help="Max cards embedded per stage in output")
+    p_funnel.add_argument("--limit-entities", type=int, default=50,
+                          help="Max compound entity summaries embedded per stage in output")
+    p_funnel.add_argument("--goal", default=None, help="Filter by resolved goal id")
+    p_funnel.add_argument("--workstream", default=None, help="Filter by resolved workstream id")
+    p_funnel.add_argument("--stage", default=None, help="Filter by resolved stage key")
+    p_funnel.add_argument("--action", default=None, help="Filter by resolved action key")
+
+    p_funnel_set = sub.add_parser(
+        "funnel-set",
+        help="Set semantic funnel fields on an existing task",
+    )
+    p_funnel_set.add_argument("task_id")
+    p_funnel_set.add_argument("--goal", default=None,
+                              help="Semantic funnel goal id")
+    p_funnel_set.add_argument("--workstream", default=None,
+                              help="Semantic funnel workstream id")
+    p_funnel_set.add_argument("--stage", default=None,
+                              help="Semantic funnel stage key")
+    p_funnel_set.add_argument("--action", default=None,
+                              help="Semantic funnel action key")
+    p_funnel_set.add_argument("--funnel-data", default=None,
+                              help="JSON object with structured funnel facts")
+    p_funnel_set.add_argument("--merge-funnel-data", action="store_true",
+                              help="Shallow-merge --funnel-data into existing funnel_data")
+    p_funnel_set.add_argument("--json", action="store_true", help="Emit updated task as JSON")
+
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
         "notify-subscribe",
@@ -939,6 +1004,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         "daemon":   _cmd_daemon,
         "watch":    _cmd_watch,
         "stats":    _cmd_stats,
+        "funnel":   _cmd_funnel,
+        "funnel-set": _cmd_funnel_set,
         "log":      _cmd_log,
         "runs":     _cmd_runs,
         "heartbeat": _cmd_heartbeat,
@@ -1320,6 +1387,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    funnel_data, funnel_error = _parse_json_object_flag(
+        getattr(args, "funnel_data", None), "--funnel-data"
+    )
+    if funnel_error:
+        print(f"kanban: {funnel_error}", file=sys.stderr)
+        return 2
     with kb.connect() as conn:
         task_id = kb.create_task(
             conn,
@@ -1339,6 +1412,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
             initial_status=getattr(args, "initial_status", "running"),
+            goal_id=getattr(args, "goal", None),
+            workstream_id=getattr(args, "workstream", None),
+            stage_key=getattr(args, "stage", None),
+            action_key=getattr(args, "action", None),
+            funnel_data=funnel_data,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2345,6 +2423,117 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    return 0
+
+
+def _cmd_funnel(args: argparse.Namespace) -> int:
+    limit_cards = getattr(args, "limit_cards", 20)
+    if limit_cards is not None and limit_cards < 0:
+        print("kanban funnel: --limit-cards must be >= 0", file=sys.stderr)
+        return 2
+    limit_entities = getattr(args, "limit_entities", 50)
+    if limit_entities is not None and limit_entities < 0:
+        print("kanban funnel: --limit-entities must be >= 0", file=sys.stderr)
+        return 2
+    with kb.connect() as conn:
+        model = kb.build_funnel_read_model(
+            conn,
+            board=getattr(args, "board", None),
+            include_archived=bool(getattr(args, "archived", False)),
+            limit_cards_per_stage=limit_cards,
+            limit_entities_per_stage=limit_entities,
+            goal_id=getattr(args, "goal", None),
+            workstream_id=getattr(args, "workstream", None),
+            stage_key=getattr(args, "stage", None),
+            action_key=getattr(args, "action", None),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(model, indent=2, ensure_ascii=False))
+        return 0
+    summary = model["summary"]
+    print(f"Board: {model['board']}")
+    print(
+        f"Cards: {summary['total_cards']}  "
+        f"Stages: {summary['stage_count']}  "
+        f"Edges: {summary['edge_count']}  "
+        f"Entities: {summary.get('entity_count', 0)}"
+    )
+    if summary["counts_by_status"]:
+        parts = ", ".join(
+            f"{status}={count}"
+            for status, count in summary["counts_by_status"].items()
+        )
+        print(f"Status: {parts}")
+    for stage in model["stages"]:
+        metrics = stage["metrics"]
+        print(
+            f"\n{stage['goal_id']} / {stage['workstream_id']} / "
+            f"{stage['stage_key']} / {stage['action_key']}"
+        )
+        print(
+            f"  cards={metrics['total_cards']} active={metrics['active_cards']} "
+            f"waiting={metrics['waiting_cards']} blocked={metrics['blocked_cards']} "
+            f"done={metrics['done_cards']} artifacts={metrics['artifact_count']} "
+            f"entities={stage.get('entity_metrics', {}).get('total_entities', 0)}"
+        )
+        if stage.get("entity_states"):
+            states = ", ".join(
+                f"{bucket['state']}={bucket['count']}"
+                for bucket in stage["entity_states"]
+            )
+            print(f"  entity_states: {states}")
+        for card in stage["cards"]:
+            print(f"  - {card['id']} {card['status']:8s} {card['title']}")
+        if stage.get("cards_truncated"):
+            print(f"  … {stage['cards_truncated']} more card(s)")
+    return 0
+
+
+def _cmd_funnel_set(args: argparse.Namespace) -> int:
+    funnel_data = None
+    kwargs: dict[str, Any] = {}
+    raw_funnel_data = getattr(args, "funnel_data", None)
+    if raw_funnel_data is not None:
+        funnel_data, funnel_error = _parse_json_object_flag(raw_funnel_data, "--funnel-data")
+        if funnel_error:
+            print(f"kanban funnel-set: {funnel_error}", file=sys.stderr)
+            return 2
+        kwargs["funnel_data"] = funnel_data
+    for attr, param in (
+        ("goal", "goal_id"),
+        ("workstream", "workstream_id"),
+        ("stage", "stage_key"),
+        ("action", "action_key"),
+    ):
+        value = getattr(args, attr, None)
+        if value is not None:
+            kwargs[param] = value
+    if not kwargs:
+        print(
+            "kanban funnel-set: pass at least one of --goal, --workstream, "
+            "--stage, --action, or --funnel-data",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        with kb.connect() as conn:
+            task = kb.update_task_funnel_fields(
+                conn,
+                args.task_id,
+                merge_funnel_data=bool(getattr(args, "merge_funnel_data", False)),
+                **kwargs,
+            )
+    except ValueError as exc:
+        print(f"kanban funnel-set: {exc}", file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Updated {task.id}: goal={task.goal_id or '-'} "
+            f"workstream={task.workstream_id or '-'} "
+            f"stage={task.stage_key or '-'} action={task.action_key or '-'}"
+        )
     return 0
 
 

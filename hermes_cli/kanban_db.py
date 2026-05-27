@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import re
@@ -100,6 +101,7 @@ VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", 
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
+_UNSET = object()
 _IS_WINDOWS = sys.platform == "win32"
 
 # A running task's claim is valid for 15 minutes by default; after that the
@@ -658,6 +660,15 @@ class Task:
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
+    # Optional semantic funnel coordinates. These do NOT drive dispatch;
+    # they let optimizers and UIs group the same lifecycle cards into a
+    # goal/workstream/stage/action read-model without hardcoded columns or
+    # domain-specific title inference.
+    goal_id: Optional[str] = None
+    workstream_id: Optional[str] = None
+    stage_key: Optional[str] = None
+    action_key: Optional[str] = None
+    funnel_data: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -671,6 +682,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        funnel_data_value: Optional[dict] = None
+        if "funnel_data" in keys and row["funnel_data"]:
+            try:
+                parsed = json.loads(row["funnel_data"])
+                if isinstance(parsed, dict):
+                    funnel_data_value = parsed
+            except Exception:
+                funnel_data_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -727,6 +746,13 @@ class Task:
             session_id=(
                 row["session_id"] if "session_id" in keys else None
             ),
+            goal_id=row["goal_id"] if "goal_id" in keys else None,
+            workstream_id=(
+                row["workstream_id"] if "workstream_id" in keys else None
+            ),
+            stage_key=row["stage_key"] if "stage_key" in keys else None,
+            action_key=row["action_key"] if "action_key" in keys else None,
+            funnel_data=funnel_data_value,
         )
 
 
@@ -864,7 +890,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- for tasks created from the CLI, dashboard, or any path that doesn't
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
-    session_id           TEXT
+    session_id           TEXT,
+    -- Semantic funnel coordinates for optimizer/UI read-models. These
+    -- fields are descriptive only; dispatch still uses lifecycle status,
+    -- assignee, and task_links.
+    goal_id              TEXT,
+    workstream_id        TEXT,
+    stage_key            TEXT,
+    action_key           TEXT,
+    funnel_data          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -954,6 +988,112 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
+
+# ---------------------------------------------------------------------------
+# Cross-process file lock
+# ---------------------------------------------------------------------------
+# Every process that opens a kanban DB acquires an exclusive flock on a
+# sibling lockfile (.kanban.lock) in the same directory. This serializes
+# all writers across processes — the single-owner guarantee that prevents
+# WAL corruption from concurrent checkpoint/write races.
+#
+# The lock is held for the lifetime of the connection via _LockedConnection,
+# which releases it on close(). Within a single process, threads are
+# serialized by _INIT_LOCK (threading.RLock) as before.
+
+_LOCK_FDS: dict[str, int] = {}  # path -> fd, so we don't double-lock in-process
+
+
+def _acquire_db_lock(db_path: Path) -> int:
+    """Acquire an exclusive cross-process lock for a kanban DB directory.
+
+    Returns the file descriptor (kept open to hold the lock). The lock is
+    non-blocking for the first 30s via retry, then raises if still contended.
+    """
+    lockfile = db_path.parent / ".kanban.lock"
+    resolved = str(lockfile.resolve())
+    # If this process already holds the lock (re-entrant connect), return existing fd
+    if resolved in _LOCK_FDS:
+        return _LOCK_FDS[resolved]
+    fd = os.open(str(lockfile), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        # Try non-blocking first
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, BlockingIOError):
+            # Another process holds it — block with timeout via polling
+            deadline = time.monotonic() + 30
+            acquired = False
+            while time.monotonic() < deadline:
+                time.sleep(0.1)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except (OSError, BlockingIOError):
+                    continue
+            if not acquired:
+                os.close(fd)
+                raise sqlite3.OperationalError(
+                    f"kanban DB lock timeout after 30s: {db_path} — "
+                    f"another process is holding .kanban.lock"
+                )
+    except Exception:
+        os.close(fd)
+        raise
+    _LOCK_FDS[resolved] = fd
+    return fd
+
+
+def _release_db_lock(db_path: Path) -> None:
+    """Release the cross-process lock for a kanban DB directory."""
+    lockfile = db_path.parent / ".kanban.lock"
+    resolved = str(lockfile.resolve())
+    fd = _LOCK_FDS.pop(resolved, None)
+    if fd is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+class _LockedConnection:
+    """Wraps a sqlite3.Connection and releases the file lock on close().
+
+    Proxies all attribute access to the underlying connection so callers
+    see a normal sqlite3.Connection interface.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, db_path: Path):
+        object.__setattr__(self, '_conn', conn)
+        object.__setattr__(self, '_db_path', db_path)
+        object.__setattr__(self, '_closed', False)
+
+    def close(self):
+        if not object.__getattribute__(self, '_closed'):
+            object.__setattr__(self, '_closed', True)
+            conn = object.__getattribute__(self, '_conn')
+            db_path = object.__getattribute__(self, '_db_path')
+            try:
+                conn.close()
+            finally:
+                _release_db_lock(db_path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, '_conn'), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, '_conn'), name, value)
 
 
 def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
@@ -1077,12 +1217,15 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
 def _guard_existing_db_is_healthy(path: Path) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
-    Opens the probe in read/write mode so SQLite can recover or
-    checkpoint a healthy WAL/hot-journal DB before we declare it
-    corrupt. If the file is malformed, copy it (and any WAL/SHM
-    sidecars) to a timestamped backup and raise
-    :class:`KanbanDbCorruptError` so callers cannot silently recreate
-    the schema on top of a damaged DB.
+    If corruption is detected, attempts a multi-step recovery before raising:
+
+    1. WAL checkpoint (TRUNCATE) — often the WAL is fine, just needs flushing
+    2. ``.recover`` — SQLite's built-in row-level recovery into a new DB
+    3. Restore from most recent known-good guardian backup
+
+    Only raises :class:`KanbanDbCorruptError` if ALL recovery steps fail.
+    On successful recovery, logs a warning but does NOT raise — the caller
+    proceeds with the repaired DB.
 
     Transient lock/busy errors (``sqlite3.OperationalError``) are NOT
     treated as corruption; they propagate raw so the caller sees a
@@ -1090,17 +1233,8 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
 
     No-op for missing files, zero-byte files (treated as fresh), and
     paths already proven healthy this process (cache hit).
-
-    Path-trust note: ``path`` arrives via :func:`connect`, which itself
-    resolves it from an explicit ``db_path`` argument, the
-    :func:`kanban_db_path` env-var chain, or the kanban-home default —
-    all sources Hermes treats as user-controlled-but-trusted on the
-    user's own machine. We additionally resolve the path here and
-    confine all filesystem writes to its parent directory so any
-    accidental ``..`` segments are collapsed before any I/O happens.
     """
-    # Resolve before any I/O. ``Path.resolve()`` normalizes ``..`` and
-    # symlinks, giving us a canonical path whose parent dir we can pin.
+    # Resolve before any I/O.
     try:
         resolved = path.resolve()
     except OSError:
@@ -1122,12 +1256,110 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         if not row or (row[0] or "").lower() != "ok":
             reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
     except sqlite3.OperationalError:
-        # Lock contention, busy, transient IO — not corruption. Let it propagate.
+        # Lock contention, busy, transient IO — not corruption.
         raise
     except sqlite3.DatabaseError as exc:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
+
+    # --- Recovery cascade ---
+    _log.warning("Kanban DB corruption detected at %s: %s. Attempting recovery...", resolved, reason)
+
+    # Step 1: Try WAL checkpoint (sometimes WAL just needs flushing)
+    try:
+        probe = sqlite3.connect(str(resolved), timeout=5, isolation_level=None)
+        try:
+            probe.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            row = probe.execute("PRAGMA integrity_check").fetchone()
+            if row and (row[0] or "").lower() == "ok":
+                _log.warning("Recovery succeeded via WAL checkpoint for %s", resolved)
+                probe.close()
+                return
+        finally:
+            probe.close()
+    except Exception:
+        pass
+
+    # Step 2: Try .recover (SQLite's row-level recovery)
+    try:
+        import subprocess as _sp
+        recovered_path = resolved.parent / f"{resolved.name}.recovered"
+        result = _sp.run(
+            ["sqlite3", str(resolved), ".recover"],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # Pipe recovered SQL into a new DB
+            result2 = _sp.run(
+                ["sqlite3", str(recovered_path)],
+                input=result.stdout, capture_output=True, text=True, timeout=30
+            )
+            if result2.returncode == 0:
+                # Verify the recovered DB
+                verify = sqlite3.connect(str(recovered_path), timeout=5)
+                try:
+                    row = verify.execute("PRAGMA integrity_check").fetchone()
+                    count = verify.execute("SELECT COUNT(*) FROM tasks").fetchone()
+                finally:
+                    verify.close()
+                if row and row[0] == "ok" and count and count[0] > 0:
+                    # Recovery succeeded — swap files
+                    _backup_corrupt_db(resolved)
+                    # Remove corrupt original + sidecars
+                    for suffix in ("", "-wal", "-shm"):
+                        try:
+                            (resolved.parent / (resolved.name + suffix)).unlink()
+                        except FileNotFoundError:
+                            pass
+                    recovered_path.rename(resolved)
+                    _log.warning(
+                        "Recovery succeeded via .recover for %s (%d tasks restored)",
+                        resolved, count[0]
+                    )
+                    return
+        # Clean up failed recovery attempt
+        try:
+            recovered_path.unlink()
+        except FileNotFoundError:
+            pass
+    except Exception:
+        pass
+
+    # Step 3: Restore from most recent guardian backup
+    try:
+        backup_dir = resolved.parent.parent.parent / "backups"
+        board_name = resolved.parent.name
+        backups = sorted(
+            backup_dir.glob(f"{board_name}_kanban_*.db"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+        for backup_path in backups[:3]:  # Try up to 3 most recent
+            verify = sqlite3.connect(str(backup_path), timeout=5)
+            try:
+                row = verify.execute("PRAGMA integrity_check").fetchone()
+                count = verify.execute("SELECT COUNT(*) FROM tasks").fetchone()
+            finally:
+                verify.close()
+            if row and row[0] == "ok" and count and count[0] > 0:
+                # Backup is good — swap in
+                _backup_corrupt_db(resolved)
+                for suffix in ("", "-wal", "-shm"):
+                    try:
+                        (resolved.parent / (resolved.name + suffix)).unlink()
+                    except FileNotFoundError:
+                        pass
+                shutil.copy2(backup_path, resolved)
+                _log.warning(
+                    "Recovery succeeded via backup restore for %s (%d tasks, from %s)",
+                    resolved, count[0], backup_path.name
+                )
+                return
+    except Exception:
+        pass
+
+    # All recovery failed — preserve and raise
     backup = _backup_corrupt_db(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
@@ -1141,6 +1373,11 @@ def connect(
 
     WAL mode is enabled on every connection; it's a no-op after the first
     time but keeps the code robust if the DB file is ever re-created.
+
+    A cross-process file lock (.kanban.lock) is acquired before opening the
+    DB and held for the lifetime of the returned connection. This serializes
+    all writers across processes, preventing WAL corruption from concurrent
+    checkpoint/write races. The lock is released when close() is called.
 
     The first connection to a given path auto-runs :func:`init_db` so
     fresh installs and test harnesses that construct `connect()`
@@ -1160,42 +1397,54 @@ def connect(
     else:
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
-    # and other invalid-header cases without opening a sqlite connection.
-    _validate_sqlite_header(path)
-    # Full integrity probe — catches corruption past the header (malformed
-    # pages, broken internal metadata). Cached per-path after first success
-    # via _INITIALIZED_PATHS so it only runs once per process per path.
-    _guard_existing_db_is_healthy(path)
-    resolved = str(path.resolve())
-    conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
+    # Acquire cross-process lock BEFORE any DB I/O. On Windows, skip
+    # (fcntl is Unix-only) and fall back to SQLite's built-in locking.
+    if not _IS_WINDOWS:
+        _acquire_db_lock(path)
     try:
-        conn.row_factory = sqlite3.Row
-        with _INIT_LOCK:
-            # WAL activation can take an exclusive lock while SQLite creates the
-            # sidecar files for a fresh database. Keep it in the same process-local
-            # critical section as schema initialization so concurrent gateway
-            # startup threads do not race before _INITIALIZED_PATHS is populated.
-            # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
-            # falls back to DELETE with one WARNING so kanban stays usable there.
-            # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-            from hermes_state import apply_wal_with_fallback
-            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            needs_init = resolved not in _INITIALIZED_PATHS
-            if needs_init:
-                # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
-                # migrations. Cached so subsequent connect() calls in the same
-                # process are cheap. The lock prevents same-process dispatcher
-                # threads from racing through the additive ALTER TABLE pass with
-                # stale PRAGMA snapshots during gateway startup.
-                conn.executescript(SCHEMA_SQL)
-                _migrate_add_optional_columns(conn)
-                _INITIALIZED_PATHS.add(resolved)
+        # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
+        # and other invalid-header cases without opening a sqlite connection.
+        _validate_sqlite_header(path)
+        # Full integrity probe — catches corruption past the header (malformed
+        # pages, broken internal metadata). Cached per-path after first success
+        # via _INITIALIZED_PATHS so it only runs once per process per path.
+        _guard_existing_db_is_healthy(path)
+        resolved = str(path.resolve())
+        conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
+        try:
+            conn.row_factory = sqlite3.Row
+            with _INIT_LOCK:
+                # WAL activation can take an exclusive lock while SQLite creates the
+                # sidecar files for a fresh database. Keep it in the same process-local
+                # critical section as schema initialization so concurrent gateway
+                # startup threads do not race before _INITIALIZED_PATHS is populated.
+                # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
+                # falls back to DELETE with one WARNING so kanban stays usable there.
+                # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
+                from hermes_state import apply_wal_with_fallback
+                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                conn.execute("PRAGMA synchronous=FULL")
+                conn.execute("PRAGMA foreign_keys=ON")
+                needs_init = resolved not in _INITIALIZED_PATHS
+                if needs_init:
+                    # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
+                    # migrations. Cached so subsequent connect() calls in the same
+                    # process are cheap. The lock prevents same-process dispatcher
+                    # threads from racing through the additive ALTER TABLE pass with
+                    # stale PRAGMA snapshots during gateway startup.
+                    conn.executescript(SCHEMA_SQL)
+                    _migrate_add_optional_columns(conn)
+                    _INITIALIZED_PATHS.add(resolved)
+        except Exception:
+            conn.close()
+            raise
     except Exception:
-        conn.close()
+        if not _IS_WINDOWS:
+            _release_db_lock(path)
         raise
+    # Wrap in _LockedConnection so the lock is released on close()
+    if not _IS_WINDOWS:
+        return _LockedConnection(conn, path)  # type: ignore[return-value]
     return conn
 
 
@@ -1354,6 +1603,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    # Semantic funnel coordinates. Additive and nullable so old boards keep
+    # their exact dispatch semantics; the funnel read-model falls back to
+    # workflow_template_id/current_step_key and finally an unclassified bucket.
+    if "goal_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "goal_id", "goal_id TEXT")
+    if "workstream_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "workstream_id", "workstream_id TEXT")
+    if "stage_key" not in cols:
+        _add_column_if_missing(conn, "tasks", "stage_key", "stage_key TEXT")
+    if "action_key" not in cols:
+        _add_column_if_missing(conn, "tasks", "action_key", "action_key TEXT")
+    if "funnel_data" not in cols:
+        _add_column_if_missing(conn, "tasks", "funnel_data", "funnel_data TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -1367,6 +1630,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_funnel_stage "
+        "ON tasks(goal_id, workstream_id, stage_key, action_key)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -1524,6 +1791,40 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_funnel_text(value: Optional[Any]) -> Optional[str]:
+    """Normalize optional semantic funnel coordinates.
+
+    Empty strings, ``none``-style sentinels, and JSON nulls collapse to NULL.
+    Values are otherwise stored exactly as caller-provided strings so each
+    board can define its own vocabulary without central enums.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "null", "-"}:
+        return None
+    return text
+
+
+def _normalize_funnel_data(value: Optional[Any]) -> Optional[dict]:
+    """Validate optional funnel_data as a JSON object/dict."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            value = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"funnel_data must be a JSON object: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"funnel_data must be a JSON object/dict, got {type(value).__name__}"
+        )
+    return value
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -1544,6 +1845,11 @@ def create_task(
     max_retries: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    goal_id: Optional[str] = None,
+    workstream_id: Optional[str] = None,
+    stage_key: Optional[str] = None,
+    action_key: Optional[str] = None,
+    funnel_data: Optional[dict] = None,
     board: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
@@ -1587,6 +1893,11 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
     parents = tuple(p for p in parents if p)
+    goal_id = _normalize_funnel_text(goal_id)
+    workstream_id = _normalize_funnel_text(workstream_id)
+    stage_key = _normalize_funnel_text(stage_key)
+    action_key = _normalize_funnel_text(action_key)
+    funnel_data = _normalize_funnel_data(funnel_data)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -1659,11 +1970,20 @@ def create_task(
     # task would point cleanup at the user's source tree (#28818). The
     # containment guard in ``_cleanup_workspace`` is the safety rail, but
     # we also stop the bad state from being created in the first place.
-    if workspace_path is None and workspace_kind in {"dir", "worktree"}:
+    #
+    # Auto-promote: if the board has a default_workdir and the caller did
+    # not explicitly request a workspace kind, upgrade from scratch to dir.
+    # A board with default_workdir is declaring "tasks here need persistent
+    # workspaces" — requiring every caller to pass --workspace dir is
+    # error-prone and leads to data loss when stages share output files.
+    if workspace_path is None:
         board_slug = board if board else get_current_board()
         board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
-        if board_default:
+        if board_default and workspace_kind == "scratch":
+            workspace_kind = "dir"
+            workspace_path = str(board_default)
+        elif board_default and workspace_kind in {"dir", "worktree"}:
             workspace_path = str(board_default)
 
     # Retry once on the extremely unlikely id collision.
@@ -1709,8 +2029,9 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, session_id,
+                        goal_id, workstream_id, stage_key, action_key, funnel_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -1730,6 +2051,11 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
                         session_id,
+                        goal_id,
+                        workstream_id,
+                        stage_key,
+                        action_key,
+                        json.dumps(funnel_data, ensure_ascii=False) if funnel_data else None,
                     ),
                 )
                 for pid in parents:
@@ -1748,6 +2074,11 @@ def create_task(
                         "tenant": tenant,
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
+                        "goal_id": goal_id,
+                        "workstream_id": workstream_id,
+                        "stage_key": stage_key,
+                        "action_key": action_key,
+                        "funnel_data": funnel_data,
                     },
                 )
             return task_id
@@ -1775,6 +2106,87 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
+
+
+def update_task_funnel_fields(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    goal_id: Any = _UNSET,
+    workstream_id: Any = _UNSET,
+    stage_key: Any = _UNSET,
+    action_key: Any = _UNSET,
+    funnel_data: Any = _UNSET,
+    merge_funnel_data: bool = False,
+) -> Task:
+    """Update semantic funnel coordinates on an existing task.
+
+    This is the durable/operator path for backfills and manual corrections.
+    Omitted fields are left unchanged; fields explicitly passed as ``None`` are
+    cleared. ``funnel_data`` must be a JSON object when provided.
+    """
+    current = get_task(conn, task_id)
+    if current is None:
+        raise ValueError(f"unknown task: {task_id}")
+
+    next_goal = current.goal_id if goal_id is _UNSET else _normalize_funnel_text(goal_id)
+    next_workstream = (
+        current.workstream_id
+        if workstream_id is _UNSET else _normalize_funnel_text(workstream_id)
+    )
+    next_stage = current.stage_key if stage_key is _UNSET else _normalize_funnel_text(stage_key)
+    next_action = current.action_key if action_key is _UNSET else _normalize_funnel_text(action_key)
+    if funnel_data is _UNSET:
+        next_funnel_data = current.funnel_data
+    else:
+        normalized = _normalize_funnel_data(funnel_data)
+        if merge_funnel_data and isinstance(current.funnel_data, dict) and normalized:
+            next_funnel_data = {**current.funnel_data, **normalized}
+        else:
+            next_funnel_data = normalized
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task: {task_id}")
+        conn.execute(
+            """
+            UPDATE tasks
+               SET goal_id = ?,
+                   workstream_id = ?,
+                   stage_key = ?,
+                   action_key = ?,
+                   funnel_data = ?
+             WHERE id = ?
+            """,
+            (
+                next_goal,
+                next_workstream,
+                next_stage,
+                next_action,
+                json.dumps(next_funnel_data, ensure_ascii=False) if next_funnel_data else None,
+                task_id,
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "funnel_updated",
+            {
+                "goal_id": next_goal,
+                "workstream_id": next_workstream,
+                "stage_key": next_stage,
+                "action_key": next_action,
+                "funnel_data": next_funnel_data,
+                "merge_funnel_data": bool(merge_funnel_data),
+            },
+        )
+    updated = get_task(conn, task_id)
+    if updated is None:  # defensive: row existed inside the transaction.
+        raise ValueError(f"unknown task: {task_id}")
+    return updated
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
@@ -6082,6 +6494,739 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Funnel read-model helpers
+# ---------------------------------------------------------------------------
+
+_FUNNEL_WAITING_STATUSES = {"triage", "todo", "scheduled", "review"}
+_FUNNEL_ACTIVE_STATUSES = {"ready", "running"}
+_FUNNEL_FAILURE_OUTCOMES = {
+    "crashed", "timed_out", "spawn_failed", "gave_up", "failed"
+}
+_FUNNEL_ARTIFACT_KEYS = (
+    "artifacts", "artifact", "deliverables", "deliverable",
+    "attachments", "attachment", "files", "file", "paths", "path",
+)
+_FUNNEL_PROOF_KEYS = (
+    "proof", "proofs", "evidence", "verification", "verified",
+    "validation", "checks", "tests", "tests_run",
+)
+_FUNNEL_OUTCOME_KEYS = (
+    "outcome", "outcomes", "result", "results", "decision",
+    "decisions", "finding", "findings", "capability", "capabilities",
+)
+_FUNNEL_ENTITY_KEYS = ("entities", "funnel_entities", "entity", "items")
+_FUNNEL_ENTITY_ID_KEYS = ("id", "entity_id", "key", "ref")
+_FUNNEL_ENTITY_TYPE_KEYS = ("type", "entity_type", "kind")
+_FUNNEL_ENTITY_LABEL_KEYS = ("label", "name", "title")
+_FUNNEL_ENTITY_STATE_KEYS = ("state", "substate", "status")
+_FUNNEL_ENTITY_STAGE_KEYS = ("stage_key", "stage")
+_FUNNEL_ENTITY_NEXT_ACTION_KEYS = ("next_action", "next_actions")
+_FUNNEL_ENTITY_ACTOR_KEYS = ("actor", "owner", "assignee")
+
+
+def _json_safe_value(value: Any) -> Any:
+    """Return a JSON-serializable representation for read-model output."""
+    try:
+        json.dumps(value, ensure_ascii=False)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def _funnel_value_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _funnel_as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe_value(v) for v in value if _funnel_value_present(v)]
+    return [_json_safe_value(value)] if _funnel_value_present(value) else []
+
+
+def _funnel_collect_values(mapping: Optional[dict], keys: Iterable[str]) -> list[dict]:
+    if not isinstance(mapping, dict):
+        return []
+    out: list[dict] = []
+    for key in keys:
+        if key not in mapping:
+            continue
+        values = _funnel_as_list(mapping.get(key))
+        for value in values:
+            out.append({"key": key, "value": value})
+    return out
+
+
+def _funnel_first_present(mapping: dict, keys: Iterable[str]) -> Any:
+    for key in keys:
+        if key not in mapping:
+            continue
+        value = mapping.get(key)
+        if _funnel_value_present(value):
+            return value
+    return None
+
+
+def _funnel_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _funnel_collect_raw_entities(mapping: Optional[dict]) -> list[dict]:
+    """Extract explicit nested entity records from structured funnel data.
+
+    This intentionally looks only at JSON object/list fields. It does not parse
+    titles, summaries, or prose. Compound funnel stages are therefore powered by
+    worker/tool contracts, not keyword heuristics.
+    """
+    if not isinstance(mapping, dict):
+        return []
+    entity_shape_keys = (
+        _FUNNEL_ENTITY_ID_KEYS + _FUNNEL_ENTITY_TYPE_KEYS +
+        _FUNNEL_ENTITY_LABEL_KEYS + _FUNNEL_ENTITY_STATE_KEYS +
+        _FUNNEL_ENTITY_STAGE_KEYS + _FUNNEL_ENTITY_NEXT_ACTION_KEYS +
+        _FUNNEL_ENTITY_ACTOR_KEYS
+    )
+
+    def entity_like(value: dict) -> bool:
+        return any(k in value for k in entity_shape_keys)
+
+    out: list[dict] = []
+    for key in _FUNNEL_ENTITY_KEYS:
+        if key not in mapping:
+            continue
+        raw = mapping.get(key)
+        if isinstance(raw, dict):
+            if entity_like(raw):
+                out.append(dict(raw))
+            else:
+                for entity_id, value in raw.items():
+                    if isinstance(value, dict) and entity_like(value):
+                        item = dict(value)
+                        item.setdefault("id", str(entity_id))
+                        out.append(item)
+            continue
+        if isinstance(raw, (list, tuple, set)):
+            for value in raw:
+                if isinstance(value, dict) and entity_like(value):
+                    out.append(dict(value))
+    return out
+
+
+def _funnel_next_action_label(value: Any) -> Optional[str]:
+    if not _funnel_value_present(value):
+        return None
+    if isinstance(value, dict):
+        label = _funnel_first_present(value, ("action", "key", "type", "label", "status"))
+        if _funnel_value_present(label):
+            return str(label)
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    return str(value)
+
+
+def _funnel_normalize_entity(raw: dict, *, task_id: str, ordinal: int) -> dict:
+    entity_id = _funnel_first_present(raw, _FUNNEL_ENTITY_ID_KEYS)
+    entity_type = _funnel_first_present(raw, _FUNNEL_ENTITY_TYPE_KEYS) or "entity"
+    label = _funnel_first_present(raw, _FUNNEL_ENTITY_LABEL_KEYS) or entity_id
+    state = _funnel_first_present(raw, _FUNNEL_ENTITY_STATE_KEYS) or "unspecified"
+    stage_key = _funnel_first_present(raw, _FUNNEL_ENTITY_STAGE_KEYS)
+    next_action = _funnel_first_present(raw, _FUNNEL_ENTITY_NEXT_ACTION_KEYS)
+    actor = _funnel_first_present(raw, _FUNNEL_ENTITY_ACTOR_KEYS)
+    artifacts = [item["value"] for item in _funnel_collect_values(raw, _FUNNEL_ARTIFACT_KEYS)]
+    proof = _funnel_collect_values(raw, _FUNNEL_PROOF_KEYS)
+    outcomes = _funnel_collect_values(raw, _FUNNEL_OUTCOME_KEYS)
+    stable_id = str(entity_id) if _funnel_value_present(entity_id) else f"{task_id}:entity:{ordinal}"
+    return {
+        "id": stable_id,
+        "type": str(entity_type),
+        "label": str(label) if _funnel_value_present(label) else stable_id,
+        "state": str(state),
+        "stage_key": str(stage_key) if _funnel_value_present(stage_key) else None,
+        "source_task_id": task_id,
+        "terminal": _funnel_bool(raw.get("terminal")),
+        "blocked": _funnel_bool(raw.get("blocked")),
+        "next_action": _json_safe_value(next_action) if _funnel_value_present(next_action) else None,
+        "next_action_key": _funnel_next_action_label(next_action),
+        "next_action_actor": str(actor) if _funnel_value_present(actor) else None,
+        "outcome_keys": sorted({item["key"] for item in outcomes}),
+        "proof_keys": sorted({item["key"] for item in proof}),
+        "artifact_count": len(artifacts),
+        "data": {str(k): _json_safe_value(v) for k, v in raw.items()},
+    }
+
+
+def _funnel_entity_dedupe_key(entity: dict) -> tuple[str, str, str]:
+    return (
+        str(entity.get("stage_key") or ""),
+        str(entity.get("type") or "entity"),
+        str(entity.get("id") or ""),
+    )
+
+
+def _funnel_count(sorted_values: Iterable[Optional[str]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in sorted_values:
+        if not _funnel_value_present(value):
+            continue
+        key = str(value)
+        counts[key] = int(counts.get(key, 0)) + 1
+    return {key: counts[key] for key in sorted(counts)}
+
+
+def _funnel_increment_count(mapping: dict[str, int], value: Any, amount: int = 1) -> None:
+    if not _funnel_value_present(value):
+        return
+    key = str(value)
+    mapping[key] = int(mapping.get(key, 0)) + int(amount)
+
+
+def _funnel_task_node(task: Task) -> dict:
+    """Return the semantic stage node for a task.
+
+    Explicit funnel fields win. Existing workflow columns are a backward-
+    compatible fallback. Titles are deliberately ignored so the optimizer
+    reasons from structured data instead of domain keywords.
+    """
+    has_explicit = any((
+        task.goal_id, task.workstream_id, task.stage_key, task.action_key,
+    ))
+    has_workflow = any((task.workflow_template_id, task.current_step_key))
+    goal_id = task.goal_id or "default"
+    workstream_id = task.workstream_id or task.workflow_template_id or "default"
+    stage_key = task.stage_key or task.current_step_key or "unclassified"
+    action_key = task.action_key or "default"
+    if has_explicit:
+        semantic_source = "explicit"
+    elif has_workflow:
+        semantic_source = "workflow"
+    else:
+        semantic_source = "fallback"
+    return {
+        "id": (
+            f"goal={goal_id}|workstream={workstream_id}|"
+            f"stage={stage_key}|action={action_key}"
+        ),
+        "goal_id": goal_id,
+        "workstream_id": workstream_id,
+        "stage_key": stage_key,
+        "action_key": action_key,
+        "semantic_source": semantic_source,
+    }
+
+
+def _funnel_cycle_seconds(task: Task, runs: list[Run]) -> Optional[int]:
+    if task.completed_at is not None:
+        start = task.started_at or task.created_at
+        return max(0, int(task.completed_at) - int(start))
+    completed = [r for r in runs if r.outcome == "completed" and r.ended_at is not None]
+    if completed:
+        run = completed[-1]
+        ended_at = run.ended_at
+        if ended_at is not None:
+            return max(0, int(ended_at) - int(run.started_at))
+    return None
+
+
+def _funnel_latest_blocker(task: Task, events: list[Event]) -> Optional[dict]:
+    if task.status not in {"blocked", "scheduled"}:
+        return None
+    for event in reversed(events):
+        if event.kind not in {"blocked", "scheduled", "gave_up", "spawn_auto_blocked"}:
+            continue
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        reason = (
+            payload.get("reason") or payload.get("error") or
+            payload.get("message") or payload.get("summary")
+        )
+        return {
+            "task_id": task.id,
+            "kind": event.kind,
+            "reason": reason,
+            "created_at": event.created_at,
+        }
+    return {"task_id": task.id, "kind": task.status, "reason": None, "created_at": None}
+
+
+def _funnel_task_signals(task: Task, runs: list[Run], events: list[Event]) -> dict:
+    metadata_blobs: list[dict] = []
+    if isinstance(task.funnel_data, dict):
+        metadata_blobs.append(task.funnel_data)
+    for run in runs:
+        if isinstance(run.metadata, dict):
+            metadata_blobs.append(run.metadata)
+    for event in events:
+        if isinstance(event.payload, dict):
+            metadata_blobs.append(event.payload)
+
+    artifacts: list[Any] = []
+    proof: list[dict] = []
+    outcomes: list[dict] = []
+    entities_by_key: dict[tuple[str, str, str], dict] = {}
+    entity_ordinal = 0
+    for blob in metadata_blobs:
+        artifacts.extend(
+            item["value"] for item in _funnel_collect_values(blob, _FUNNEL_ARTIFACT_KEYS)
+        )
+        proof.extend(_funnel_collect_values(blob, _FUNNEL_PROOF_KEYS))
+        outcomes.extend(_funnel_collect_values(blob, _FUNNEL_OUTCOME_KEYS))
+        for raw_entity in _funnel_collect_raw_entities(blob):
+            entity_ordinal += 1
+            entity = _funnel_normalize_entity(
+                raw_entity,
+                task_id=task.id,
+                ordinal=entity_ordinal,
+            )
+            entities_by_key[_funnel_entity_dedupe_key(entity)] = entity
+    deduped_artifacts: list[Any] = []
+    seen_artifacts: set[str] = set()
+    for artifact in artifacts:
+        marker = json.dumps(artifact, sort_keys=True, ensure_ascii=False, default=str)
+        if marker in seen_artifacts:
+            continue
+        seen_artifacts.add(marker)
+        deduped_artifacts.append(artifact)
+    artifacts = deduped_artifacts
+    if task.result:
+        outcomes.append({"key": "task.result", "value": task.result})
+    latest_summary = None
+    for run in reversed(runs):
+        if run.summary:
+            latest_summary = run.summary
+            outcomes.append({"key": "run.summary", "value": run.summary})
+            break
+
+    failed_runs = sum(
+        1 for run in runs
+        if (run.outcome in _FUNNEL_FAILURE_OUTCOMES or run.status in _FUNNEL_FAILURE_OUTCOMES)
+    )
+    failure_count = int(task.consecutive_failures or 0) + failed_runs
+
+    return {
+        "artifacts": artifacts,
+        "proof": proof,
+        "outcomes": outcomes,
+        "entities": sorted(
+            entities_by_key.values(),
+            key=lambda e: (
+                str(e.get("stage_key") or ""),
+                str(e.get("type") or "entity"),
+                str(e.get("id") or ""),
+            ),
+        ),
+        "latest_summary": latest_summary,
+        "failed_runs": failed_runs,
+        "failure_count": failure_count,
+    }
+
+
+def build_funnel_read_model(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    include_archived: bool = False,
+    limit_cards_per_stage: Optional[int] = 20,
+    limit_entities_per_stage: Optional[int] = 50,
+    goal_id: Optional[str] = None,
+    workstream_id: Optional[str] = None,
+    stage_key: Optional[str] = None,
+    action_key: Optional[str] = None,
+) -> dict:
+    """Build a semantic funnel view over the Kanban board.
+
+    This is a read-model: it never mutates dispatch state. Lifecycle columns
+    still drive execution; funnel fields and run/event metadata drive the
+    optimizer/UI view of end-to-end goal flow.
+    """
+    if limit_cards_per_stage is None:
+        card_limit: Optional[int] = None
+    else:
+        card_limit = max(0, int(limit_cards_per_stage))
+    if limit_entities_per_stage is None:
+        entity_limit: Optional[int] = None
+    else:
+        entity_limit = max(0, int(limit_entities_per_stage))
+    goal_filter = _normalize_funnel_text(goal_id)
+    workstream_filter = _normalize_funnel_text(workstream_id)
+    stage_filter = _normalize_funnel_text(stage_key)
+    action_filter = _normalize_funnel_text(action_key)
+    board_slug = _normalize_board_slug(board) or get_current_board()
+
+    tasks = list_tasks(
+        conn,
+        include_archived=include_archived,
+        order_by="created",
+    )
+    links = conn.execute(
+        "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
+    ).fetchall()
+    parents_by_child: dict[str, list[str]] = {}
+    children_by_parent: dict[str, list[str]] = {}
+    for link in links:
+        parents_by_child.setdefault(link["child_id"], []).append(link["parent_id"])
+        children_by_parent.setdefault(link["parent_id"], []).append(link["child_id"])
+
+    stages: dict[str, dict] = {}
+    node_by_task: dict[str, str] = {}
+    summary_status: dict[str, int] = {}
+    semantic_sources: dict[str, int] = {}
+    uncategorized: list[dict] = []
+
+    for task in tasks:
+        node = _funnel_task_node(task)
+        if goal_filter and node["goal_id"] != goal_filter:
+            continue
+        if workstream_filter and node["workstream_id"] != workstream_filter:
+            continue
+        if stage_filter and node["stage_key"] != stage_filter:
+            continue
+        if action_filter and node["action_key"] != action_filter:
+            continue
+
+        node_id = node["id"]
+        node_by_task[task.id] = node_id
+        stage = stages.setdefault(
+            node_id,
+            {
+                **node,
+                "counts_by_status": {},
+                "metrics": {
+                    "total_cards": 0,
+                    "waiting_cards": 0,
+                    "active_cards": 0,
+                    "blocked_cards": 0,
+                    "done_cards": 0,
+                    "failure_count": 0,
+                    "completed_count": 0,
+                    "artifact_count": 0,
+                    "cards_with_artifacts": 0,
+                    "cards_with_proof": 0,
+                    "cards_with_outcomes": 0,
+                    "avg_cycle_seconds": None,
+                },
+                "blockers": [],
+                "cards": [],
+                "cards_truncated": 0,
+                "entities": [],
+                "entities_truncated": 0,
+                "entity_metrics": {
+                    "total_entities": 0,
+                    "blocked_entities": 0,
+                    "terminal_entities": 0,
+                    "entities_with_next_action": 0,
+                    "entities_with_artifacts": 0,
+                    "entities_with_proof": 0,
+                    "entities_with_outcomes": 0,
+                    "artifact_count": 0,
+                    "by_type": {},
+                    "by_state": {},
+                    "by_stage": {},
+                    "by_next_action": {},
+                    "by_next_action_actor": {},
+                },
+                "entity_states": [],
+                "entity_next_actions": [],
+                "_cycle_seconds": [],
+                "_cards_with_artifacts": set(),
+                "_cards_with_proof": set(),
+                "_cards_with_outcomes": set(),
+                "_entities_by_key": {},
+            },
+        )
+
+        runs = list_runs(conn, task.id)
+        events = list_events(conn, task.id)
+        signals = _funnel_task_signals(task, runs, events)
+        cycle_seconds = _funnel_cycle_seconds(task, runs)
+        blocker = _funnel_latest_blocker(task, events)
+        latest_run = runs[-1] if runs else None
+        parents = parents_by_child.get(task.id, [])
+        children = children_by_parent.get(task.id, [])
+
+        status_counts = stage["counts_by_status"]
+        status_counts[task.status] = int(status_counts.get(task.status, 0)) + 1
+        summary_status[task.status] = int(summary_status.get(task.status, 0)) + 1
+        semantic_sources[node["semantic_source"]] = (
+            int(semantic_sources.get(node["semantic_source"], 0)) + 1
+        )
+
+        metrics = stage["metrics"]
+        metrics["total_cards"] += 1
+        if task.status in _FUNNEL_WAITING_STATUSES:
+            metrics["waiting_cards"] += 1
+        if task.status in _FUNNEL_ACTIVE_STATUSES:
+            metrics["active_cards"] += 1
+        if task.status == "blocked":
+            metrics["blocked_cards"] += 1
+        if task.status == "done":
+            metrics["done_cards"] += 1
+            metrics["completed_count"] += 1
+        metrics["failure_count"] += signals["failure_count"]
+        metrics["artifact_count"] += len(signals["artifacts"])
+        if signals["artifacts"]:
+            stage["_cards_with_artifacts"].add(task.id)
+        if signals["proof"]:
+            stage["_cards_with_proof"].add(task.id)
+        if signals["outcomes"]:
+            stage["_cards_with_outcomes"].add(task.id)
+        if cycle_seconds is not None:
+            stage["_cycle_seconds"].append(cycle_seconds)
+        if blocker:
+            stage["blockers"].append(blocker)
+        for entity in signals["entities"]:
+            entity = dict(entity)
+            if not entity.get("stage_key"):
+                entity["stage_key"] = node["stage_key"]
+            stage["_entities_by_key"][_funnel_entity_dedupe_key(entity)] = entity
+
+        card = {
+            "id": task.id,
+            "title": task.title,
+            "status": task.status,
+            "assignee": task.assignee,
+            "priority": task.priority,
+            "tenant": task.tenant,
+            "created_by": task.created_by,
+            "created_at": task.created_at,
+            "started_at": task.started_at,
+            "completed_at": task.completed_at,
+            "cycle_seconds": cycle_seconds,
+            "current_run_id": task.current_run_id,
+            "latest_run": (
+                {
+                    "id": latest_run.id,
+                    "profile": latest_run.profile,
+                    "status": latest_run.status,
+                    "outcome": latest_run.outcome,
+                    "started_at": latest_run.started_at,
+                    "ended_at": latest_run.ended_at,
+                }
+                if latest_run else None
+            ),
+            "parents": parents,
+            "children": children,
+            "semantic": node,
+            "funnel_data": task.funnel_data,
+            "signals": {
+                "artifact_count": len(signals["artifacts"]),
+                "artifacts": signals["artifacts"],
+                "proof_keys": sorted({item["key"] for item in signals["proof"]}),
+                "outcome_keys": sorted({item["key"] for item in signals["outcomes"]}),
+                "latest_summary": signals["latest_summary"],
+                "failure_count": signals["failure_count"],
+                "failed_runs": signals["failed_runs"],
+                "entity_count": len(signals["entities"]),
+            },
+            "blocker": blocker,
+        }
+        if card_limit is None or len(stage["cards"]) < card_limit:
+            stage["cards"].append(card)
+        else:
+            stage["cards_truncated"] += 1
+        if node["semantic_source"] == "fallback":
+            uncategorized.append({
+                "id": task.id,
+                "title": task.title,
+                "status": task.status,
+                "assignee": task.assignee,
+            })
+
+    edge_map: dict[tuple[str, str], dict] = {}
+    for link in links:
+        parent_id = link["parent_id"]
+        child_id = link["child_id"]
+        parent_node = node_by_task.get(parent_id)
+        child_node = node_by_task.get(child_id)
+        if not parent_node or not child_node or parent_node == child_node:
+            continue
+        edge = edge_map.setdefault(
+            (parent_node, child_node),
+            {"from": parent_node, "to": child_node, "count": 0, "task_edges": []},
+        )
+        edge["count"] += 1
+        edge["task_edges"].append({"parent_id": parent_id, "child_id": child_id})
+
+    stage_list: list[dict] = []
+    for stage in stages.values():
+        metrics = stage["metrics"]
+        cycles = stage.pop("_cycle_seconds")
+        metrics["avg_cycle_seconds"] = (
+            int(sum(cycles) / len(cycles)) if cycles else None
+        )
+        metrics["cards_with_artifacts"] = len(stage.pop("_cards_with_artifacts"))
+        metrics["cards_with_proof"] = len(stage.pop("_cards_with_proof"))
+        metrics["cards_with_outcomes"] = len(stage.pop("_cards_with_outcomes"))
+        stage["counts_by_status"] = {
+            status: stage["counts_by_status"][status]
+            for status in sorted(stage["counts_by_status"])
+        }
+
+        entities = sorted(
+            stage.pop("_entities_by_key").values(),
+            key=lambda e: (
+                str(e.get("stage_key") or ""),
+                str(e.get("type") or "entity"),
+                str(e.get("state") or "unspecified"),
+                str(e.get("id") or ""),
+            ),
+        )
+        entity_metrics = stage["entity_metrics"]
+        entity_metrics["total_entities"] = len(entities)
+        entity_metrics["blocked_entities"] = sum(1 for e in entities if e.get("blocked"))
+        entity_metrics["terminal_entities"] = sum(1 for e in entities if e.get("terminal"))
+        entity_metrics["entities_with_next_action"] = sum(
+            1 for e in entities if _funnel_value_present(e.get("next_action_key"))
+        )
+        entity_metrics["entities_with_artifacts"] = sum(
+            1 for e in entities if int(e.get("artifact_count") or 0) > 0
+        )
+        entity_metrics["entities_with_proof"] = sum(
+            1 for e in entities if e.get("proof_keys")
+        )
+        entity_metrics["entities_with_outcomes"] = sum(
+            1 for e in entities if e.get("outcome_keys")
+        )
+        entity_metrics["artifact_count"] = sum(
+            int(e.get("artifact_count") or 0) for e in entities
+        )
+        entity_metrics["by_type"] = _funnel_count(e.get("type") for e in entities)
+        entity_metrics["by_state"] = _funnel_count(e.get("state") for e in entities)
+        entity_metrics["by_stage"] = _funnel_count(e.get("stage_key") for e in entities)
+        entity_metrics["by_next_action"] = _funnel_count(
+            e.get("next_action_key") for e in entities
+        )
+        entity_metrics["by_next_action_actor"] = _funnel_count(
+            e.get("next_action_actor") for e in entities
+        )
+
+        state_buckets: dict[str, dict] = {}
+        action_buckets: dict[str, dict] = {}
+        for entity in entities:
+            state_key = str(entity.get("state") or "unspecified")
+            state_bucket = state_buckets.setdefault(
+                state_key,
+                {
+                    "state": state_key,
+                    "count": 0,
+                    "blocked": 0,
+                    "terminal": 0,
+                    "with_next_action": 0,
+                    "by_type": {},
+                },
+            )
+            state_bucket["count"] += 1
+            if entity.get("blocked"):
+                state_bucket["blocked"] += 1
+            if entity.get("terminal"):
+                state_bucket["terminal"] += 1
+            if _funnel_value_present(entity.get("next_action_key")):
+                state_bucket["with_next_action"] += 1
+            _funnel_increment_count(state_bucket["by_type"], entity.get("type"))
+
+            action_key = entity.get("next_action_key")
+            if _funnel_value_present(action_key):
+                action_bucket = action_buckets.setdefault(
+                    str(action_key),
+                    {"action": str(action_key), "count": 0, "by_actor": {}, "by_state": {}},
+                )
+                action_bucket["count"] += 1
+                _funnel_increment_count(action_bucket["by_actor"], entity.get("next_action_actor"))
+                _funnel_increment_count(action_bucket["by_state"], entity.get("state"))
+
+        stage["entity_states"] = [
+            {
+                **bucket,
+                "by_type": {k: bucket["by_type"][k] for k in sorted(bucket["by_type"])},
+            }
+            for _, bucket in sorted(state_buckets.items())
+        ]
+        stage["entity_next_actions"] = [
+            {
+                **bucket,
+                "by_actor": {k: bucket["by_actor"][k] for k in sorted(bucket["by_actor"])},
+                "by_state": {k: bucket["by_state"][k] for k in sorted(bucket["by_state"])},
+            }
+            for _, bucket in sorted(action_buckets.items())
+        ]
+        if entity_limit is None or len(entities) <= entity_limit:
+            stage["entities"] = entities
+        else:
+            stage["entities"] = entities[:entity_limit]
+            stage["entities_truncated"] = len(entities) - entity_limit
+        stage_list.append(stage)
+
+    stage_list.sort(
+        key=lambda s: (s["goal_id"], s["workstream_id"], s["stage_key"], s["action_key"])
+    )
+    edges = sorted(edge_map.values(), key=lambda e: (e["from"], e["to"]))
+    summary = {
+        "total_cards": sum(summary_status.values()),
+        "counts_by_status": {
+            status: summary_status[status] for status in sorted(summary_status)
+        },
+        "stage_count": len(stage_list),
+        "edge_count": len(edges),
+        "semantic_sources": {
+            source: semantic_sources[source] for source in sorted(semantic_sources)
+        },
+        "active_cards": sum(
+            count for status, count in summary_status.items()
+            if status in _FUNNEL_ACTIVE_STATUSES
+        ),
+        "waiting_cards": sum(
+            count for status, count in summary_status.items()
+            if status in _FUNNEL_WAITING_STATUSES
+        ),
+        "blocked_cards": summary_status.get("blocked", 0),
+        "done_cards": summary_status.get("done", 0),
+        "entity_count": sum(
+            s["entity_metrics"].get("total_entities", 0) for s in stage_list
+        ),
+        "compound_stage_count": sum(
+            1 for s in stage_list if s["entity_metrics"].get("total_entities", 0)
+        ),
+        "blocked_entities": sum(
+            s["entity_metrics"].get("blocked_entities", 0) for s in stage_list
+        ),
+        "terminal_entities": sum(
+            s["entity_metrics"].get("terminal_entities", 0) for s in stage_list
+        ),
+        "entities_with_next_action": sum(
+            s["entity_metrics"].get("entities_with_next_action", 0) for s in stage_list
+        ),
+    }
+    out = {
+        "version": 1,
+        "board": board_slug,
+        "generated_at": int(time.time()),
+        "include_archived": include_archived,
+        "filters": {
+            "goal_id": goal_filter,
+            "workstream_id": workstream_filter,
+            "stage_key": stage_filter,
+            "action_key": action_filter,
+        },
+        "summary": summary,
+        "stages": stage_list,
+        "edges": edges,
+    }
+    if uncategorized:
+        out["uncategorized"] = uncategorized
+    return out
 
 
 # ---------------------------------------------------------------------------

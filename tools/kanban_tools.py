@@ -190,6 +190,172 @@ def _normalize_profile(value: Any) -> Optional[str]:
     return text
 
 
+def _get_company_workers() -> Optional[list]:
+    """Read the calling profile's company.workers from config.
+
+    Returns None if the profile has no company config (no enforcement).
+    Returns a list of allowed worker profile names if company.workers is defined.
+    """
+    from hermes_constants import get_hermes_home
+    config_path = get_hermes_home() / "config.yaml"
+    if not config_path.exists():
+        return None
+    try:
+        content = config_path.read_text()
+    except OSError:
+        return None
+    # Quick check: does this profile have type: company?
+    if "type: company" not in content:
+        return None
+    # Parse workers list from YAML (simple line-based, no dep needed)
+    workers = []
+    in_workers = False
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("workers:"):
+            val = stripped[len("workers:"):].strip()
+            if val == "[]":
+                return []
+            in_workers = True
+            continue
+        if in_workers:
+            if stripped.startswith("- "):
+                workers.append(stripped[2:].strip())
+            elif stripped and not stripped.startswith("#"):
+                break
+    return workers if workers else None
+
+
+def _get_company_optimizer() -> Optional[str]:
+    """Read the company.optimizer field from the CEO config that owns this worker."""
+    from hermes_constants import get_hermes_home
+    config_path = get_hermes_home() / "config.yaml"
+    if not config_path.exists():
+        return None
+    try:
+        content = config_path.read_text()
+    except OSError:
+        return None
+    # Check if this is a worker profile — find its company CEO
+    company_ceo = None
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("company:") and "name:" not in stripped:
+            company_ceo = stripped[len("company:"):].strip()
+            break
+    # If this IS the CEO, read optimizer directly
+    if "type: company" in content:
+        for line in content.split("\n"):
+            stripped = line.strip()
+            if stripped.startswith("optimizer:"):
+                return stripped[len("optimizer:"):].strip()
+        return None
+    # If this is a worker, read the CEO's config to find the optimizer
+    if company_ceo:
+        hermes_home = get_hermes_home()
+        # Go up to profiles dir
+        profiles_dir = hermes_home.parent
+        ceo_config = profiles_dir / company_ceo / "config.yaml"
+        if ceo_config.exists():
+            try:
+                ceo_content = ceo_config.read_text()
+            except OSError:
+                return None
+            for line in ceo_content.split("\n"):
+                stripped = line.strip()
+                if stripped.startswith("optimizer:"):
+                    return stripped[len("optimizer:"):].strip()
+    return None
+
+
+_optimizer_webhook_url_cache = None
+_optimizer_webhook_url_cache_time = 0
+_WEBHOOK_CACHE_TTL = 300  # 5 minutes
+
+
+def _get_optimizer_webhook_url() -> Optional[str]:
+    """Resolve the optimizer's webhook URL from the CEO config. Cached 5 min."""
+    global _optimizer_webhook_url_cache, _optimizer_webhook_url_cache_time
+    import time as _time
+    now = _time.time()
+    if _optimizer_webhook_url_cache and (now - _optimizer_webhook_url_cache_time) < _WEBHOOK_CACHE_TTL:
+        return _optimizer_webhook_url_cache
+
+    from hermes_constants import get_hermes_home
+    optimizer = _get_company_optimizer()
+    if not optimizer:
+        return None
+    # Find the optimizer's config to get its webhook port
+    hermes_home = get_hermes_home()
+    profiles_dir = hermes_home.parent
+    opt_config = profiles_dir / optimizer / "config.yaml"
+    if not opt_config.exists():
+        return None
+    try:
+        content = opt_config.read_text()
+    except OSError:
+        return None
+    # Parse port from webhook platform config
+    port = "8700"  # default
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("port:"):
+            port = stripped[len("port:"):].strip().strip('"')
+            break
+    # Parse host
+    host = "127.0.0.1"
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("host:"):
+            host = stripped[len("host:"):].strip().strip('"')
+            break
+    url = f"http://{host}:{port}/webhooks/card_event"
+    _optimizer_webhook_url_cache = url
+    _optimizer_webhook_url_cache_time = now
+    return url
+
+
+def _notify_optimizer(event_type: str, task_id: str, extra: dict = None):
+    """POST an event to the optimizer's webhook. Non-blocking, best-effort."""
+    import threading
+    url = _get_optimizer_webhook_url()
+    if not url:
+        return
+
+    def _post():
+        import urllib.request
+        import json as _json
+        payload = {"event_type": event_type, "task_id": task_id}
+        if extra:
+            payload.update(extra)
+        data = _json.dumps(payload).encode()
+        try:
+            req = urllib.request.Request(
+                url, data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5)
+        except Exception:
+            pass
+    threading.Thread(target=_post, daemon=True).start()
+
+
+def _notify_optimizer_of_block(kb, conn, task_id: str, reason: str, board=None):
+    """Notify optimizer that a card blocked."""
+    optimizer = _get_company_optimizer()
+    if not optimizer:
+        return
+    task = kb.get_task(conn, task_id)
+    if task and task.assignee == optimizer:
+        return
+    _notify_optimizer("card.blocked", task_id, {
+        "assignee": task.assignee if task else None,
+        "reason": reason,
+        "board": board,
+    })
+
+
 def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     value = args.get(name)
     if value is None:
@@ -241,6 +407,11 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "goal_id": getattr(task, "goal_id", None),
+        "workstream_id": getattr(task, "workstream_id", None),
+        "stage_key": getattr(task, "stage_key", None),
+        "action_key": getattr(task, "action_key", None),
+        "funnel_data": getattr(task, "funnel_data", None),
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -286,6 +457,11 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "goal_id": getattr(t, "goal_id", None),
+                    "workstream_id": getattr(t, "workstream_id", None),
+                    "stage_key": getattr(t, "stage_key", None),
+                    "action_key": getattr(t, "action_key", None),
+                    "funnel_data": getattr(t, "funnel_data", None),
                 }
 
             def _run_dict(r):
@@ -387,6 +563,57 @@ def _handle_list(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_list failed")
         return tool_error(f"kanban_list: {e}")
+
+
+def _handle_funnel(args: dict, **kw) -> str:
+    """Return the semantic funnel read-model for orchestrators/optimizers."""
+    guard = _require_orchestrator_tool("kanban_funnel")
+    if guard:
+        return guard
+    include_archived, bool_error = _parse_bool_arg(args, "include_archived")
+    if bool_error:
+        return tool_error(bool_error)
+    limit_cards = args.get("limit_cards_per_stage")
+    if limit_cards is None:
+        limit_cards = 20
+    try:
+        limit_cards = int(limit_cards)
+    except (TypeError, ValueError):
+        return tool_error("limit_cards_per_stage must be an integer")
+    if limit_cards < 0:
+        return tool_error("limit_cards_per_stage must be >= 0")
+    limit_entities = args.get("limit_entities_per_stage")
+    if limit_entities is None:
+        limit_entities = 50
+    try:
+        limit_entities = int(limit_entities)
+    except (TypeError, ValueError):
+        return tool_error("limit_entities_per_stage must be an integer")
+    if limit_entities < 0:
+        return tool_error("limit_entities_per_stage must be >= 0")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            model = kb.build_funnel_read_model(
+                conn,
+                board=board,
+                include_archived=include_archived,
+                limit_cards_per_stage=limit_cards,
+                limit_entities_per_stage=limit_entities,
+                goal_id=args.get("goal"),
+                workstream_id=args.get("workstream"),
+                stage_key=args.get("stage"),
+                action_key=args.get("action"),
+            )
+            return json.dumps(model, ensure_ascii=False)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_funnel: {e}")
+    except Exception as e:
+        logger.exception("kanban_funnel failed")
+        return tool_error(f"kanban_funnel: {e}")
 
 
 def _handle_complete(args: dict, **kw) -> str:
@@ -538,6 +765,8 @@ def _handle_block(args: dict, **kw) -> str:
                     f"could not block {tid} (unknown id or not in "
                     f"running/ready)"
                 )
+            # Notify optimizer: create a micro-card so it reacts in real-time
+            _notify_optimizer_of_block(kb, conn, tid, reason, board)
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
@@ -651,6 +880,14 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    # Enforce company-scoped assignment: if the calling profile has
+    # company.workers defined, only allow assignment to those workers.
+    _allowed = _get_company_workers()
+    if _allowed is not None and str(assignee) not in _allowed:
+        return tool_error(
+            f"assignee '{assignee}' is not in this company's workers list. "
+            f"Allowed: {', '.join(_allowed) if _allowed else '(none — no workers configured)'}"
+        )
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -681,6 +918,11 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+    funnel_data = args.get("funnel_data")
+    if funnel_data is not None and not isinstance(funnel_data, dict):
+        return tool_error(
+            f"funnel_data must be an object/dict, got {type(funnel_data).__name__}"
+        )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -705,6 +947,11 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                goal_id=args.get("goal"),
+                workstream_id=args.get("workstream"),
+                stage_key=args.get("stage"),
+                action_key=args.get("action"),
+                funnel_data=funnel_data,
             )
             new_task = kb.get_task(conn, new_tid)
             return _ok(
@@ -865,6 +1112,41 @@ KANBAN_LIST_SCHEMA = {
     },
 }
 
+KANBAN_FUNNEL_SCHEMA = {
+    "name": "kanban_funnel",
+    "description": (
+        "Return the semantic funnel read-model for the board: cards grouped "
+        "by goal, workstream, stage, and action with lifecycle counts, "
+        "dependency edges, blockers, run outcomes, artifacts, proof, and "
+        "compound entity/substate signals. This gives optimizer/orchestrator profiles a goal-flow "
+        "view without relying on title keywords or fixed columns. "
+        "Orchestrator-only — dispatcher-spawned task workers never see this tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "include_archived": {
+                "type": "boolean",
+                "description": "Include archived tasks. Defaults to false.",
+            },
+            "limit_cards_per_stage": {
+                "type": "integer",
+                "description": "Maximum card summaries embedded per stage. Defaults to 20.",
+            },
+            "limit_entities_per_stage": {
+                "type": "integer",
+                "description": "Maximum compound entity summaries embedded per stage. Defaults to 50.",
+            },
+            "goal": {"type": "string", "description": "Filter by resolved goal id."},
+            "workstream": {"type": "string", "description": "Filter by resolved workstream id."},
+            "stage": {"type": "string", "description": "Filter by resolved stage key."},
+            "action": {"type": "string", "description": "Filter by resolved action key."},
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
 KANBAN_COMPLETE_SCHEMA = {
     "name": "kanban_complete",
     "description": (
@@ -903,9 +1185,11 @@ KANBAN_COMPLETE_SCHEMA = {
                 "type": "object",
                 "description": (
                     "Free-form dict of structured facts about this "
-                    "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "attempt — changed_files, tests_run, findings, "
+                    "artifacts, proof, outcomes, decisions, capabilities, "
+                    "entities/funnel_entities for compound stages, "
+                    "or other machine-readable handoff facts. Surfaced to "
+                    "downstream workers and the funnel read-model alongside ``summary``."
                 ),
             },
             "result": {
@@ -1166,6 +1450,26 @@ KANBAN_CREATE_SCHEMA = {
                     "assignee's profile."
                 ),
             },
+            "goal": {
+                "type": "string",
+                "description": "Semantic funnel goal id for optimizer/UI grouping.",
+            },
+            "workstream": {
+                "type": "string",
+                "description": "Semantic funnel workstream id under the goal.",
+            },
+            "stage": {
+                "type": "string",
+                "description": "Semantic funnel stage key for this card.",
+            },
+            "action": {
+                "type": "string",
+                "description": "Semantic funnel action key within the stage.",
+            },
+            "funnel_data": {
+                "type": "object",
+                "description": "Optional structured funnel facts for the read-model.",
+            },
             "board": _board_schema_prop(),
         },
         "required": ["title", "assignee"],
@@ -1231,6 +1535,15 @@ registry.register(
     handler=_handle_list,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
+)
+
+registry.register(
+    name="kanban_funnel",
+    toolset="kanban",
+    schema=KANBAN_FUNNEL_SCHEMA,
+    handler=_handle_funnel,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🧭",
 )
 
 registry.register(

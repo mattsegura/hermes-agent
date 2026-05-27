@@ -110,10 +110,11 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
     kanban = {n for n in names if n and n.startswith("kanban_")}
     assert {
         "kanban_list",
+        "kanban_funnel",
         "kanban_unblock",
     }.isdisjoint(kanban), (
         f"Board-routing tools leaked into worker schema: "
-        f"{kanban & {'kanban_list', 'kanban_unblock'}}"
+        f"{kanban & {'kanban_list', 'kanban_funnel', 'kanban_unblock'}}"
     )
 
 
@@ -135,6 +136,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_list",
+        "kanban_funnel",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock",
@@ -225,6 +227,53 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     })
     tenant_ids = [t["id"] for t in json.loads(tenant_out)["tasks"]]
     assert tenant_ids == [c]
+
+
+def test_funnel_returns_semantic_read_model(monkeypatch, worker_env):
+    """kanban_funnel gives orchestrators the goal-flow view."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="semantic work",
+            assignee="factory",
+            goal_id="goal-a",
+            workstream_id="stream-a",
+            stage_key="stage-a",
+            action_key="action-a",
+            funnel_data={
+                "proof": "seeded",
+                "entities": [
+                    {"id": "entity-1", "type": "lead", "state": "contacted"},
+                    {"id": "entity-2", "type": "lead", "state": "qualified"},
+                ],
+            },
+        )
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_funnel({
+        "goal": "goal-a",
+        "limit_cards_per_stage": 5,
+        "limit_entities_per_stage": 1,
+    })
+    d = json.loads(out)
+    assert d["summary"]["total_cards"] == 1
+    assert d["stages"][0]["goal_id"] == "goal-a"
+    assert d["stages"][0]["workstream_id"] == "stream-a"
+    assert d["stages"][0]["stage_key"] == "stage-a"
+    assert d["stages"][0]["cards"][0]["id"] == tid
+    assert d["stages"][0]["metrics"]["cards_with_proof"] == 1
+    assert d["stages"][0]["entity_metrics"]["total_entities"] == 2
+    assert d["stages"][0]["entity_metrics"]["by_state"] == {
+        "contacted": 1,
+        "qualified": 1,
+    }
+    assert d["stages"][0]["entities_truncated"] == 1
+    assert len(d["stages"][0]["entities"]) == 1
 
 
 def test_list_rejects_invalid_status(monkeypatch, worker_env):
