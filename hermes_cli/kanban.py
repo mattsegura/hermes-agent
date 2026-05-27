@@ -412,10 +412,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                f"(default {kb.DEFAULT_FAILURE_LIMIT}).")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
-                          default="running",
+                          default=None,
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-blocked transition.")
+                               "to skip the brief running-to-blocked transition. "
+                               "Omitted root tasks on kernel boards land in todo.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -1555,32 +1556,37 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if funnel_error:
         print(f"kanban: {funnel_error}", file=sys.stderr)
         return 2
-    with kb.connect() as conn:
-        task_id = kb.create_task(
-            conn,
-            title=args.title,
-            body=args.body,
-            assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind,
-            workspace_path=ws_path,
-            branch_name=branch_name,
-            tenant=args.tenant,
-            priority=args.priority,
-            parents=tuple(args.parent or ()),
-            triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime,
-            skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries,
-            initial_status=getattr(args, "initial_status", "running"),
-            goal_id=getattr(args, "goal", None),
-            workstream_id=getattr(args, "workstream", None),
-            stage_key=getattr(args, "stage", None),
-            action_key=getattr(args, "action", None),
-            funnel_data=funnel_data,
-        )
-        task = kb.get_task(conn, task_id)
+    try:
+        with kb.connect() as conn:
+            task_id = kb.create_task(
+                conn,
+                title=args.title,
+                body=args.body,
+                assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind,
+                workspace_path=ws_path,
+                branch_name=branch_name,
+                tenant=args.tenant,
+                priority=args.priority,
+                parents=tuple(args.parent or ()),
+                triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime,
+                skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries,
+                initial_status=getattr(args, "initial_status", None),
+                goal_id=getattr(args, "goal", None),
+                workstream_id=getattr(args, "workstream", None),
+                stage_key=getattr(args, "stage", None),
+                action_key=getattr(args, "action", None),
+                funnel_data=funnel_data,
+                board=getattr(args, "board", None),
+            )
+            task = kb.get_task(conn, task_id)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 1
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -2280,16 +2286,20 @@ def _cmd_trigger(args: argparse.Namespace) -> int:
 
 def _cmd_transition(args: argparse.Namespace) -> int:
     evidence = list(getattr(args, "evidence", None) or [])
-    with kb.connect() as conn:
-        task = kb.transition_task_stage(
-            conn,
-            args.task_id,
-            to_stage=args.to_stage,
-            evidence=evidence,
-            action_key=getattr(args, "action", None),
-            actor=getattr(args, "actor", None) or _profile_author(),
-            board=getattr(args, "board", None),
-        )
+    try:
+        with kb.connect() as conn:
+            task = kb.transition_task_stage(
+                conn,
+                args.task_id,
+                to_stage=args.to_stage,
+                evidence=evidence,
+                action_key=getattr(args, "action", None),
+                actor=getattr(args, "actor", None) or _profile_author(),
+                board=getattr(args, "board", None),
+            )
+    except ValueError as exc:
+        print(f"kanban transition: {exc}", file=sys.stderr)
+        return 1
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -2767,6 +2777,7 @@ def _cmd_funnel_set(args: argparse.Namespace) -> int:
                 conn,
                 args.task_id,
                 merge_funnel_data=bool(getattr(args, "merge_funnel_data", False)),
+                board=getattr(args, "board", None),
                 **kwargs,
             )
     except ValueError as exc:

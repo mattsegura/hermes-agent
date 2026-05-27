@@ -635,8 +635,56 @@ def normalize_workflow_definition(workflow: Optional[Any]) -> Optional[dict]:
             exit_row["evidence_required"] = [str(e).strip() for e in evidence if str(e).strip()]
             normalized_exits.append(exit_row)
         row["exit_criteria"] = normalized_exits
+        actions = row.get("actions") or []
+        normalized_actions: list[dict] = []
+        for action in actions:
+            if not isinstance(action, dict):
+                normalized_actions.append(action)
+                continue
+            action_row = dict(action)
+            schema = action_row.get("output_schema")
+            if schema is None:
+                normalized_actions.append(action_row)
+                continue
+            if isinstance(schema, str):
+                schema = [schema]
+            if not isinstance(schema, list):
+                raise ValueError(
+                    f"workflow stage {row['key']!r} action {action_row.get('key')!r} "
+                    "output_schema must be a list of artifact keys"
+                )
+            action_row["output_schema"] = [
+                str(item).strip() for item in schema if str(item).strip()
+            ]
+            normalized_actions.append(action_row)
+        row["actions"] = normalized_actions
         normalized_stages.append(row)
     out["stages"] = normalized_stages
+    workstreams = _workflow_list_keys(out.get("workstreams"), field="workstreams")
+    if workstreams:
+        normalized_workstreams: list[dict] = []
+        for ws in workstreams:
+            ws_row = dict(ws)
+            stages_allowed = ws_row.get("stages") or ws_row.get("stage_keys") or []
+            if isinstance(stages_allowed, str):
+                stages_allowed = [stages_allowed]
+            if not isinstance(stages_allowed, list):
+                raise ValueError(
+                    f"workflow.workstreams.{ws_row['key']!r}.stages must be a list"
+                )
+            allowed = [str(s).strip() for s in stages_allowed if str(s).strip()]
+            bad = [s for s in allowed if s not in stage_keys]
+            if bad:
+                raise ValueError(
+                    f"workflow.workstream {ws_row['key']!r} references unknown stages: "
+                    + ", ".join(bad)
+                )
+            ws_row["stages"] = allowed
+            ws_row.pop("stage_keys", None)
+            normalized_workstreams.append(ws_row)
+        out["workstreams"] = normalized_workstreams
+    if out.get("require_semantics") is not None:
+        out["require_semantics"] = bool(out["require_semantics"])
     return out
 
 
@@ -648,6 +696,25 @@ def _workflow_stage_map(workflow: Optional[dict]) -> dict[str, dict]:
         for stage in workflow.get("stages") or []
         if isinstance(stage, dict) and stage.get("key")
     }
+
+
+def _workflow_workstream_map(workflow: Optional[dict]) -> dict[str, dict]:
+    if not isinstance(workflow, dict):
+        return {}
+    return {
+        str(ws.get("key")): ws
+        for ws in workflow.get("workstreams") or []
+        if isinstance(ws, dict) and ws.get("key")
+    }
+
+
+def _workflow_action_row(stage: Optional[dict], action_key: Optional[str]) -> Optional[dict]:
+    if not stage or not action_key:
+        return None
+    for action in stage.get("actions") or []:
+        if isinstance(action, dict) and str(action.get("key")) == action_key:
+            return action
+    return None
 
 
 def read_board_metadata(board: Optional[str] = None) -> dict:
@@ -796,7 +863,7 @@ def create_board(
     )
     if runtime_mode == "kernel":
         objective_meta = None
-        runtime_meta = None
+        runtime_meta = normalize_runtime_metadata({"mode": "kernel"})
         workflow_meta: Any = workflow if workflow is not None else None
     else:
         objective_meta = build_objective_metadata(
@@ -2222,7 +2289,9 @@ def _normalize_funnel_data(value: Optional[Any]) -> Optional[dict]:
 def _validate_task_against_workflow(
     board: Optional[str],
     *,
-    stage_key: Optional[str],
+    goal_id: Optional[str] = None,
+    workstream_id: Optional[str] = None,
+    stage_key: Optional[str] = None,
     action_key: Optional[str] = None,
     lifecycle_status: Optional[str] = None,
 ) -> None:
@@ -2231,8 +2300,17 @@ def _validate_task_against_workflow(
     if not isinstance(workflow, dict):
         return
     stages = _workflow_stage_map(workflow)
-    if workflow.get("require_semantics") and not stage_key:
-        raise ValueError("board workflow requires stage_key/--stage on tasks")
+    workstreams = _workflow_workstream_map(workflow)
+    if workflow.get("require_semantics"):
+        default_goal = _normalize_funnel_text(workflow.get("goal_id"))
+        if not goal_id and not default_goal:
+            raise ValueError("board workflow requires goal_id/--goal on tasks")
+        if not workstream_id:
+            raise ValueError("board workflow requires workstream_id/--workstream on tasks")
+        if not stage_key:
+            raise ValueError("board workflow requires stage_key/--stage on tasks")
+        if not action_key:
+            raise ValueError("board workflow requires action_key/--action on tasks")
     if not stage_key:
         return
     if stage_key not in stages:
@@ -2241,6 +2319,19 @@ def _validate_task_against_workflow(
             f"{workflow.get('id')!r}"
         )
     stage = stages[stage_key]
+    if workstream_id and workstreams:
+        ws = workstreams.get(workstream_id)
+        if ws is None:
+            raise ValueError(
+                f"workstream_id {workstream_id!r} is not defined in board workflow "
+                f"{workflow.get('id')!r}"
+            )
+        allowed_stages = ws.get("stages") or []
+        if allowed_stages and stage_key not in allowed_stages:
+            raise ValueError(
+                f"stage_key {stage_key!r} is not allowed for workstream "
+                f"{workstream_id!r}; allowed: {', '.join(allowed_stages)}"
+            )
     allowed = stage.get("allowed_lifecycle_states") or []
     if lifecycle_status and allowed and lifecycle_status not in allowed:
         raise ValueError(
@@ -2278,6 +2369,432 @@ def _funnel_transition_state(data: Optional[dict]) -> dict:
     return {"evidence": set(), "data": {}}
 
 
+def _completion_evidence_keys(
+    *,
+    metadata: Optional[dict],
+    result: Optional[str],
+    summary: Optional[str],
+    funnel_data: Optional[dict],
+) -> set[str]:
+    """Collect artifact/evidence keys present in completion payloads."""
+    keys = _evidence_keys(metadata)
+    keys |= _evidence_keys(funnel_data)
+    for blob in (metadata, funnel_data):
+        if not isinstance(blob, dict):
+            continue
+        for list_key in ("artifacts", "proof", "evidence", "transition_evidence"):
+            keys |= _evidence_keys(blob.get(list_key))
+    scan_text = " ".join(filter(None, [summary, result]))
+    if scan_text:
+        for match in re.findall(r"\b([a-z][a-z0-9_]{2,})\b", scan_text.lower()):
+            keys.add(match)
+    return keys
+
+
+def _apply_completion_evidence_and_maybe_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    metadata: Optional[dict],
+    result: Optional[str],
+    summary: Optional[str],
+    board: Optional[str],
+) -> None:
+    """Merge completion facts into transition_evidence; auto-advance when unambiguous.
+
+    Workers should put durable proof keys in ``metadata`` and/or ``funnel_data``.
+    When every key for exactly one workflow exit is satisfied, the card stage
+    advances via :func:`transition_task_stage` without a separate operator step.
+    """
+    task = get_task(conn, task_id)
+    if task is None or not task.stage_key:
+        return
+    workflow = read_board_metadata(board).get("workflow")
+    if not isinstance(workflow, dict):
+        _warn_action_output_schema(
+            conn, task, metadata=metadata, funnel_data=task.funnel_data, workflow=None,
+        )
+        return
+    stages = _workflow_stage_map(workflow)
+    stage = stages.get(task.stage_key)
+    if not stage:
+        _warn_action_output_schema(
+            conn, task, metadata=metadata, funnel_data=task.funnel_data, workflow=workflow,
+        )
+        return
+
+    provided = _completion_evidence_keys(
+        metadata=metadata,
+        result=result,
+        summary=summary,
+        funnel_data=task.funnel_data,
+    )
+    state = _funnel_transition_state(task.funnel_data)
+    merged = {str(e) for e in state["evidence"]} | provided
+    required_union: set[str] = set()
+    for exit_row in stage.get("exit_criteria") or []:
+        if isinstance(exit_row, dict):
+            required_union |= {str(e) for e in exit_row.get("evidence_required") or []}
+    newly_found = sorted(required_union & provided)
+    if not newly_found and not (merged - state["evidence"]):
+        _warn_action_output_schema(
+            conn, task, metadata=metadata, funnel_data=task.funnel_data, workflow=workflow,
+        )
+        return
+
+    next_data = state["data"]
+    if merged:
+        next_data["transition_evidence"] = sorted(merged)
+    next_data["missing_evidence"] = sorted(required_union - merged) if required_union else []
+
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET funnel_data = ? WHERE id = ?",
+            (
+                json.dumps(next_data, ensure_ascii=False) if next_data else None,
+                task_id,
+            ),
+        )
+        if newly_found:
+            _append_event(
+                conn,
+                task_id,
+                "funnel_evidence_merged",
+                {
+                    "stage_key": task.stage_key,
+                    "keys": newly_found,
+                    "transition_evidence": sorted(merged),
+                },
+            )
+
+    ready_transitions: list[tuple[str, list[str]]] = []
+    for exit_row in stage.get("exit_criteria") or []:
+        if not isinstance(exit_row, dict):
+            continue
+        target = str(exit_row.get("transition") or "").strip()
+        required = [str(e) for e in exit_row.get("evidence_required") or []]
+        if target and required and all(item in merged for item in required):
+            ready_transitions.append((target, required))
+
+    _warn_action_output_schema(
+        conn, task, metadata=metadata, funnel_data=next_data, workflow=workflow,
+    )
+
+    if len(ready_transitions) != 1:
+        return
+    to_stage, _required = ready_transitions[0]
+    try:
+        transition_task_stage(
+            conn,
+            task_id,
+            to_stage=to_stage,
+            evidence=sorted(merged),
+            action_key=task.action_key,
+            actor="completion_contract",
+            board=board,
+        )
+    except ValueError:
+        return
+
+
+def _warn_action_output_schema(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    metadata: Optional[dict],
+    funnel_data: Optional[dict],
+    workflow: Optional[dict],
+) -> None:
+    """Emit a soft warning when completion metadata lacks required action artifacts."""
+    if not isinstance(workflow, dict) or not task.stage_key or not task.action_key:
+        return
+    stage = _workflow_stage_map(workflow).get(task.stage_key)
+    action = _workflow_action_row(stage, task.action_key)
+    if not action:
+        return
+    required = action.get("output_schema") or []
+    if not required:
+        return
+    present = _completion_evidence_keys(
+        metadata=metadata,
+        result=task.result,
+        summary=None,
+        funnel_data=funnel_data,
+    )
+    missing = [key for key in required if key not in present]
+    if not missing:
+        return
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task.id,
+            "completion_output_schema_warn",
+            {
+                "stage_key": task.stage_key,
+                "action_key": task.action_key,
+                "missing_keys": missing,
+                "required_keys": list(required),
+            },
+        )
+
+
+def repair_orphan_task_runs(conn: sqlite3.Connection) -> list[dict]:
+    """Close open task_runs whose parent task is no longer ``running``.
+
+    Returns the rows that were reclaimed (empty when nothing to repair).
+    """
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT r.id, r.task_id, COALESCE(t.status, '<missing>') AS task_status,
+               COALESCE(t.title, '<missing>') AS title, r.worker_pid,
+               r.started_at, r.step_key
+          FROM task_runs r
+          LEFT JOIN tasks t ON t.id = r.task_id
+         WHERE r.status = 'running'
+           AND r.ended_at IS NULL
+           AND COALESCE(t.status, '') <> 'running'
+         ORDER BY r.id
+        """
+    ).fetchall()
+    if not rows:
+        return []
+    now = int(time.time())
+    ids = [int(row["id"]) for row in rows]
+    placeholders = ",".join("?" for _ in ids)
+    with write_txn(conn):
+        conn.execute(
+            f"""
+            UPDATE task_runs
+               SET status = 'reclaimed',
+                   outcome = 'reclaimed',
+                   ended_at = ?,
+                   summary = COALESCE(summary, 'kanban_db repair: closed orphan running task_run'),
+                   error = COALESCE(error, 'open run had no matching running task'),
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE id IN ({placeholders})
+               AND status = 'running'
+               AND ended_at IS NULL
+            """,
+            (now, *ids),
+        )
+    return [dict(row) for row in rows]
+
+
+def _load_profile_kanban_flags(profile_config_path: Path) -> dict[str, Any]:
+    try:
+        text = profile_config_path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    kanban: dict[str, Any] = {}
+    board: str | None = None
+    in_kanban = False
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not raw.startswith(" ") and stripped.endswith(":"):
+            section = stripped[:-1]
+            in_kanban = section == "kanban"
+            continue
+        if in_kanban and line.startswith("  ") and ":" in stripped:
+            key, value = [part.strip() for part in stripped.split(":", 1)]
+            if value.lower() in {"true", "false"}:
+                kanban[key] = value.lower() == "true"
+            else:
+                kanban[key] = value.strip("'\"")
+        if stripped.startswith("HERMES_KANBAN_BOARD="):
+            board = stripped.split("=", 1)[1].strip() or None
+    env_path = profile_config_path.parent / ".env"
+    try:
+        for env_line in env_path.read_text(encoding="utf-8").splitlines():
+            if env_line.startswith("HERMES_KANBAN_BOARD="):
+                board = env_line.split("=", 1)[1].strip() or board
+    except OSError:
+        pass
+    return {"board": board, "kanban": kanban}
+
+
+def audit_board_dispatcher_ownership(
+    board: str,
+    *,
+    home: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Return dispatcher ownership audit for a board (profiles + board.json owner)."""
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    meta = read_board_metadata(slug)
+    runtime = meta.get("runtime") if isinstance(meta.get("runtime"), dict) else {}
+    dispatcher = runtime.get("dispatcher") if isinstance(runtime.get("dispatcher"), dict) else {}
+    expected = str(dispatcher.get("profile") or "").strip() or None
+
+    root = home or kanban_home()
+    profiles_root = root / "profiles"
+    dispatchers: list[dict[str, Any]] = []
+    unscoped: list[str] = []
+    if profiles_root.exists():
+        for config_path in sorted(profiles_root.glob("*/config.yaml")):
+            flags = _load_profile_kanban_flags(config_path)
+            kanban = flags.get("kanban") if isinstance(flags.get("kanban"), dict) else {}
+            if not kanban.get("dispatch_in_gateway"):
+                continue
+            name = config_path.parent.name
+            profile_board = flags.get("board")
+            entry = {"profile": name, "board": profile_board}
+            if profile_board == slug:
+                dispatchers.append(entry)
+            elif profile_board is None:
+                unscoped.append(name)
+    live_profiles = [d["profile"] for d in dispatchers]
+    status = "ok"
+    summary = "single dispatcher profile claims this board"
+    if len(dispatchers) > 1:
+        status = "critical"
+        summary = "multiple profiles claim dispatch for this board"
+    elif len(dispatchers) == 0 and unscoped:
+        status = "warning"
+        summary = "no board-pinned dispatcher; unscoped dispatch-capable profiles exist"
+    elif len(dispatchers) == 0:
+        status = "warning"
+        summary = "no profile with dispatch_in_gateway pinned to this board"
+    if expected and live_profiles and expected not in live_profiles:
+        status = "warning" if status == "ok" else status
+        summary = (
+            f"board runtime.dispatcher.profile expects {expected!r} but active "
+            f"dispatchers are {live_profiles!r}"
+        )
+    return {
+        "board": slug,
+        "status": status,
+        "summary": summary,
+        "expected_dispatcher_profile": expected,
+        "dispatchers": dispatchers,
+        "unscoped_dispatch_profiles": unscoped,
+    }
+
+
+def kanban_semantic_diagnostics(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    include_archived: bool = False,
+) -> dict[str, Any]:
+    """Lint funnel semantics: invalid stages, lifecycle drift, and unclassified cards."""
+    board_slug = _normalize_board_slug(board) or get_current_board()
+    workflow = read_board_metadata(board_slug).get("workflow")
+    stages = _workflow_stage_map(workflow if isinstance(workflow, dict) else None)
+    workstreams = _workflow_workstream_map(workflow if isinstance(workflow, dict) else None)
+    require_semantics = bool(
+        isinstance(workflow, dict) and workflow.get("require_semantics")
+    )
+    default_goal = (
+        _normalize_funnel_text(workflow.get("goal_id"))
+        if isinstance(workflow, dict) else None
+    )
+
+    issues: list[dict[str, Any]] = []
+    tasks = list_tasks(conn, include_archived=include_archived)
+    for task in tasks:
+        node = _funnel_task_node(task)
+        if node["semantic_source"] == "fallback":
+            issues.append({
+                "task_id": task.id,
+                "code": "unclassified",
+                "severity": "warning",
+                "message": "card lacks explicit funnel coordinates",
+            })
+        if require_semantics:
+            for field in ("goal_id", "workstream_id", "stage_key", "action_key"):
+                if not getattr(task, field, None):
+                    issues.append({
+                        "task_id": task.id,
+                        "code": "missing_semantics",
+                        "severity": "error",
+                        "message": f"missing required funnel field {field}",
+                    })
+        if task.goal_id and default_goal and task.goal_id != default_goal:
+            issues.append({
+                "task_id": task.id,
+                "code": "goal_drift",
+                "severity": "warning",
+                "message": f"goal_id {task.goal_id!r} differs from workflow default {default_goal!r}",
+            })
+        if task.stage_key and stages and task.stage_key not in stages:
+            issues.append({
+                "task_id": task.id,
+                "code": "unknown_stage",
+                "severity": "error",
+                "message": f"stage_key {task.stage_key!r} is not in workflow",
+            })
+        elif task.stage_key and task.workstream_id and workstreams:
+            ws = workstreams.get(task.workstream_id)
+            allowed = (ws or {}).get("stages") or []
+            if ws is None:
+                issues.append({
+                    "task_id": task.id,
+                    "code": "unknown_workstream",
+                    "severity": "error",
+                    "message": f"workstream_id {task.workstream_id!r} is not in workflow",
+                })
+            elif allowed and task.stage_key not in allowed:
+                issues.append({
+                    "task_id": task.id,
+                    "code": "workstream_stage_mismatch",
+                    "severity": "error",
+                    "message": (
+                        f"stage_key {task.stage_key!r} is not allowed for "
+                        f"workstream {task.workstream_id!r}"
+                    ),
+                })
+            stage = stages.get(task.stage_key)
+            if stage:
+                allowed_lifecycle = stage.get("allowed_lifecycle_states") or []
+                if (
+                    allowed_lifecycle
+                    and task.status in VALID_STATUSES
+                    and task.status not in allowed_lifecycle
+                ):
+                    issues.append({
+                        "task_id": task.id,
+                        "code": "lifecycle_stage_mismatch",
+                        "severity": "warning",
+                        "message": (
+                            f"status {task.status!r} is not allowed in stage "
+                            f"{task.stage_key!r}"
+                        ),
+                    })
+                if task.action_key:
+                    action_keys = {
+                        str(a.get("key"))
+                        for a in stage.get("actions") or []
+                        if isinstance(a, dict) and a.get("key")
+                    }
+                    if action_keys and task.action_key not in action_keys:
+                        issues.append({
+                            "task_id": task.id,
+                            "code": "unknown_action",
+                            "severity": "error",
+                            "message": (
+                                f"action_key {task.action_key!r} is not defined for "
+                                f"stage {task.stage_key!r}"
+                            ),
+                        })
+
+    by_code: dict[str, int] = {}
+    for issue in issues:
+        code = str(issue.get("code") or "unknown")
+        by_code[code] = int(by_code.get(code, 0)) + 1
+    return {
+        "board": board_slug,
+        "generated_at": int(time.time()),
+        "issue_count": len(issues),
+        "issues": issues,
+        "summary": {"by_code": {k: by_code[k] for k in sorted(by_code)}},
+    }
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2296,7 +2813,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
-    initial_status: str = "running",
+    initial_status: Optional[str] = None,
     session_id: Optional[str] = None,
     goal_id: Optional[str] = None,
     workstream_id: Optional[str] = None,
@@ -2332,6 +2849,9 @@ def create_task(
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
+    initial_status_explicit = initial_status is not None
+    if initial_status is None:
+        initial_status = "running"
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -2346,7 +2866,12 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
     parents = tuple(p for p in parents if p)
+    board_slug = board if board else get_current_board()
+    board_meta = read_board_metadata(board_slug)
+    workflow = board_meta.get("workflow") if isinstance(board_meta.get("workflow"), dict) else None
     goal_id = _normalize_funnel_text(goal_id)
+    if not goal_id and isinstance(workflow, dict) and workflow.get("require_semantics"):
+        goal_id = _normalize_funnel_text(workflow.get("goal_id"))
     workstream_id = _normalize_funnel_text(workstream_id)
     stage_key = _normalize_funnel_text(stage_key)
     action_key = _normalize_funnel_text(action_key)
@@ -2469,6 +2994,11 @@ def create_task(
                         ).fetchall()
                         if any(r["status"] != "done" for r in rows):
                             task_status = "todo"
+                    elif (
+                        not initial_status_explicit
+                        and (board_meta.get("runtime") or {}).get("mode") == "kernel"
+                    ):
+                        task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
                 if triage and parents:
@@ -2478,6 +3008,8 @@ def create_task(
 
                 _validate_task_against_workflow(
                     board,
+                    goal_id=goal_id,
+                    workstream_id=workstream_id,
                     stage_key=stage_key,
                     action_key=action_key,
                     lifecycle_status=task_status,
@@ -2578,6 +3110,7 @@ def update_task_funnel_fields(
     action_key: Any = _UNSET,
     funnel_data: Any = _UNSET,
     merge_funnel_data: bool = False,
+    board: Optional[str] = None,
 ) -> Task:
     """Update semantic funnel coordinates on an existing task.
 
@@ -2605,8 +3138,11 @@ def update_task_funnel_fields(
         else:
             next_funnel_data = normalized
 
+    board_slug = _normalize_board_slug(board) or get_current_board()
     _validate_task_against_workflow(
-        None,
+        board_slug,
+        goal_id=next_goal,
+        workstream_id=next_workstream,
         stage_key=next_stage,
         action_key=next_action,
         lifecycle_status=current.status,
@@ -3746,6 +4282,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    board: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -3921,12 +4458,22 @@ def complete_task(
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
+    board_slug = _normalize_board_slug(board) or get_current_board()
+    _apply_completion_evidence_and_maybe_transition(
+        conn,
+        task_id,
+        metadata=metadata,
+        result=result,
+        summary=summary,
+        board=board_slug,
+    )
     return True
 
 
 # ---------------------------------------------------------------------------
 # Workspace / tmux cleanup
 # ---------------------------------------------------------------------------
+
 
 def _is_managed_scratch_path(p: Path) -> bool:
     """Return True iff *p* is a strict descendant of a kanban-managed scratch root.
@@ -4595,6 +5142,24 @@ def _dependency_gated_wake_status(conn: sqlite3.Connection, task_id: str, reques
     return "todo" if undone else "ready"
 
 
+def _watch_latest_inbound(
+    route: WatchRoute,
+    *,
+    payload: Optional[dict],
+    actor: Optional[str],
+    triggered_at: int,
+) -> dict[str, Any]:
+    inbound = {
+        "route_id": route.id,
+        "trigger_type": route.trigger_type,
+        "trigger_key": route.trigger_key,
+        "actor": actor,
+        "triggered_at": triggered_at,
+        "payload": payload,
+    }
+    return inbound
+
+
 def trigger_watch(
     conn: sqlite3.Connection,
     *,
@@ -4656,11 +5221,23 @@ def trigger_watch(
                         funnel_data = parsed_funnel
                 except Exception:
                     funnel_data = {}
+            latest_inbound = _watch_latest_inbound(
+                route,
+                payload=payload,
+                actor=actor,
+                triggered_at=now,
+            )
             funnel_data["substate"] = "triggered"
             funnel_data["last_meaningful_event"] = (
                 f"watch_triggered:{route.trigger_type}"
                 + (f":{route.trigger_key}" if route.trigger_key else "")
             )
+            funnel_data["latest_inbound"] = latest_inbound
+            if isinstance(funnel_data.get("conversation_state"), dict):
+                funnel_data["conversation_state"] = {
+                    **funnel_data["conversation_state"],
+                    "latest_message": latest_inbound,
+                }
             if isinstance(funnel_data.get("watch"), dict):
                 funnel_data["watch"] = {**funnel_data["watch"], "active": False, "triggered_at": now}
             task_upd = conn.execute(
@@ -4680,6 +5257,19 @@ def trigger_watch(
             if payload:
                 event_payload["payload"] = payload
             _append_event(conn, route.task_id, "watch_triggered", event_payload)
+            if new_status == "blocked" and task_upd.rowcount:
+                blocked_payload = {
+                    "reason": route.reason,
+                    "route_id": route.id,
+                    "trigger_type": route.trigger_type,
+                    "trigger_key": route.trigger_key,
+                    "actor": actor,
+                    "wake_status": new_status,
+                    "triggered_at": now,
+                }
+                if payload:
+                    blocked_payload["payload"] = payload
+                _append_event(conn, route.task_id, "blocked", blocked_payload)
             triggered_row = conn.execute("SELECT * FROM task_watch_routes WHERE id = ?", (route.id,)).fetchone()
             triggered.append(WatchRoute.from_row(triggered_row))
     return triggered
@@ -4699,6 +5289,11 @@ def transition_task_stage(
     task = get_task(conn, task_id)
     if task is None:
         raise ValueError(f"unknown task: {task_id}")
+    if task.status in {"done", "archived"}:
+        raise ValueError(
+            "cannot transition terminal task; create or transition a child card "
+            "for the next semantic stage"
+        )
     to_stage = _normalize_funnel_text(to_stage) or ""
     if not to_stage:
         raise ValueError("to_stage is required")
@@ -4720,6 +5315,15 @@ def transition_task_stage(
     missing = [item for item in required if item not in merged_evidence]
     if missing:
         raise ValueError("missing transition evidence: " + ", ".join(missing))
+    next_action = _normalize_funnel_text(action_key)
+    _validate_task_against_workflow(
+        board,
+        goal_id=task.goal_id,
+        workstream_id=task.workstream_id,
+        stage_key=to_stage,
+        action_key=next_action,
+        lifecycle_status=task.status,
+    )
     next_data = state["data"]
     if merged_evidence:
         next_data["transition_evidence"] = sorted(merged_evidence)
@@ -4729,7 +5333,7 @@ def transition_task_stage(
             "UPDATE tasks SET stage_key = ?, action_key = ?, funnel_data = ? WHERE id = ?",
             (
                 to_stage,
-                _normalize_funnel_text(action_key),
+                next_action,
                 json.dumps(next_data, ensure_ascii=False) if next_data else None,
                 task_id,
             ),
@@ -4741,7 +5345,7 @@ def transition_task_stage(
             {
                 "from_stage": current_stage,
                 "to_stage": to_stage,
-                "action_key": _normalize_funnel_text(action_key),
+                "action_key": next_action,
                 "evidence": sorted(provided),
                 "actor": actor,
             },
@@ -6352,6 +6956,22 @@ def dispatch_once(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    board_slug = _normalize_board_slug(board) or get_current_board()
+    dispatch_audit = audit_board_dispatcher_ownership(board_slug)
+    if dispatch_audit.get("status") == "critical":
+        _log.error(
+            "kanban dispatcher: %s on board %s: %s",
+            dispatch_audit.get("summary"),
+            board_slug,
+            dispatch_audit.get("dispatchers"),
+        )
+    elif dispatch_audit.get("status") == "warning":
+        _log.warning(
+            "kanban dispatcher: %s on board %s",
+            dispatch_audit.get("summary"),
+            board_slug,
+        )
+
     # Reap zombie children from previously spawned workers.
     # The gateway-embedded dispatcher is the parent of every worker spawned
     # via _default_spawn (start_new_session=True only detaches the
@@ -8005,6 +8625,89 @@ def build_funnel_read_model(
     stage_list.sort(
         key=lambda s: (s["goal_id"], s["workstream_id"], s["stage_key"], s["action_key"])
     )
+    workflow_def = read_board_metadata(board_slug).get("workflow")
+    workflow_stage_coverage: list[dict[str, Any]] = []
+    if isinstance(workflow_def, dict):  # schema-aware skeleton stages for optimizer gaps
+        counts_by_stage: dict[str, int] = {}
+        for stage_row in stage_list:
+            key = str(stage_row.get("stage_key") or "")
+            counts_by_stage[key] = int(counts_by_stage.get(key, 0)) + int(
+                stage_row.get("metrics", {}).get("total_cards", 0)
+            )
+        default_goal = _normalize_funnel_text(workflow_def.get("goal_id")) or "default"
+        present_nodes = {
+            (s["goal_id"], s["workstream_id"], s["stage_key"], s["action_key"])
+            for s in stage_list
+        }
+        for wf_stage in workflow_def.get("stages") or []:
+            if not isinstance(wf_stage, dict):
+                continue
+            stage_key = str(wf_stage.get("key") or "").strip()
+            if not stage_key:
+                continue
+            card_count = int(counts_by_stage.get(stage_key, 0))
+            workflow_stage_coverage.append({
+                "stage_key": stage_key,
+                "label": wf_stage.get("label"),
+                "card_count": card_count,
+                "gap": card_count == 0,
+            })
+            skeleton_key = (default_goal, "__workflow__", stage_key, "__none__")
+            if skeleton_key in present_nodes:
+                continue
+            stage_list.append({
+                "id": (
+                    f"goal={default_goal}|workstream=__workflow__|"
+                    f"stage={stage_key}|action=__none__"
+                ),
+                "goal_id": default_goal,
+                "workstream_id": "__workflow__",
+                "stage_key": stage_key,
+                "action_key": "__none__",
+                "semantic_source": "workflow_skeleton",
+                "counts_by_status": {},
+                "metrics": {
+                    "total_cards": 0,
+                    "waiting_cards": 0,
+                    "watching_cards": 0,
+                    "active_cards": 0,
+                    "blocked_cards": 0,
+                    "done_cards": 0,
+                    "failure_count": 0,
+                    "completed_count": 0,
+                    "artifact_count": 0,
+                    "cards_with_artifacts": 0,
+                    "cards_with_proof": 0,
+                    "cards_with_outcomes": 0,
+                    "avg_cycle_seconds": None,
+                },
+                "blockers": [],
+                "cards": [],
+                "cards_truncated": 0,
+                "entities": [],
+                "entities_truncated": 0,
+                "entity_metrics": {
+                    "total_entities": 0,
+                    "blocked_entities": 0,
+                    "terminal_entities": 0,
+                    "entities_with_next_action": 0,
+                    "entities_with_artifacts": 0,
+                    "entities_with_proof": 0,
+                    "entities_with_outcomes": 0,
+                    "artifact_count": 0,
+                    "by_type": {},
+                    "by_state": {},
+                    "by_stage": {},
+                    "by_next_action": {},
+                    "by_next_action_actor": {},
+                },
+                "entity_states": [],
+                "entity_next_actions": [],
+            })
+            present_nodes.add(skeleton_key)
+        stage_list.sort(
+            key=lambda s: (s["goal_id"], s["workstream_id"], s["stage_key"], s["action_key"])
+        )
     edges = sorted(edge_map.values(), key=lambda e: (e["from"], e["to"]))
     summary = {
         "total_cards": sum(summary_status.values()),
@@ -8043,6 +8746,9 @@ def build_funnel_read_model(
             s["entity_metrics"].get("entities_with_next_action", 0) for s in stage_list
         ),
     }
+    semantic_lint = kanban_semantic_diagnostics(
+        conn, board=board_slug, include_archived=include_archived,
+    )
     out = {
         "version": 1,
         "board": board_slug,
@@ -8058,6 +8764,12 @@ def build_funnel_read_model(
         "summary": summary,
         "stages": stage_list,
         "edges": edges,
+        "workflow_stage_coverage": workflow_stage_coverage,
+        "semantic_lint": {
+            "issue_count": semantic_lint.get("issue_count", 0),
+            "summary": semantic_lint.get("summary"),
+            "issues": semantic_lint.get("issues"),
+        },
     }
     if uncategorized:
         out["uncategorized"] = uncategorized

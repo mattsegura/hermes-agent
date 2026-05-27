@@ -1017,7 +1017,7 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
-    initial_status = args.get("initial_status") or "running"
+    initial_status = args.get("initial_status")
     skills = args.get("skills")
     if isinstance(skills, str):
         # Accept a single skill name as a string for convenience.
@@ -1058,7 +1058,8 @@ def _handle_create(args: dict, **kw) -> str:
                     if max_runtime_seconds is not None else None
                 ),
                 skills=skills,
-                initial_status=str(initial_status),
+                initial_status=str(initial_status) if initial_status is not None else None,
+                board=board,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
                 goal_id=args.get("goal"),

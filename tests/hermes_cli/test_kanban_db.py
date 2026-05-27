@@ -408,6 +408,12 @@ def test_task_watch_lifecycle_registers_route_and_trigger_wakes(kanban_home):
             workstream_id="seller-flow",
             stage_key="negotiate",
             action_key="wait-reply",
+            funnel_data={
+                "conversation_state": {
+                    "thread_id": "thread-1",
+                    "existing_field": "preserved",
+                },
+            },
         )
         assert kb.claim_task(conn, task_id) is not None
         claimed_task = kb.get_task(conn, task_id)
@@ -459,7 +465,26 @@ def test_task_watch_lifecycle_registers_route_and_trigger_wakes(kanban_home):
     assert triggered[0].active is False
     assert triggered[0].trigger_payload == {"message_id": "m-1"}
     assert woken_task.status == "ready"
+    latest_inbound = woken_task.funnel_data["latest_inbound"]
+    assert latest_inbound["route_id"] == route.id
+    assert latest_inbound["trigger_type"] == "inbound_event"
+    assert latest_inbound["trigger_key"] == "sms:lead-1"
+    assert latest_inbound["actor"] == "gateway"
+    assert latest_inbound["payload"] == {"message_id": "m-1"}
+    assert isinstance(latest_inbound["triggered_at"], int)
+    assert woken_task.funnel_data["conversation_state"]["thread_id"] == "thread-1"
+    assert woken_task.funnel_data["conversation_state"]["existing_field"] == "preserved"
+    assert (
+        woken_task.funnel_data["conversation_state"]["latest_message"]
+        == latest_inbound
+    )
     assert woken_model["summary"]["watching_cards"] == 0
+    woken_card = woken_model["stages"][0]["cards"][0]
+    assert woken_card["funnel_data"]["latest_inbound"] == latest_inbound
+    assert (
+        woken_card["funnel_data"]["conversation_state"]["latest_message"]
+        == latest_inbound
+    )
     assert any(event.kind == "watching" for event in events)
     assert any(event.kind == "watch_triggered" for event in events)
 
@@ -3661,3 +3686,549 @@ def test_maybe_emit_scratch_tip_skips_non_scratch_workspaces(kanban_home, caplog
             ).fetchall()
             assert "tip_scratch_workspace" not in [e["kind"] for e in events]
 
+
+def test_workflow_workstream_validation_on_create(kanban_home):
+    workflow = {
+        "id": "land-flow",
+        "goal_id": "close-deals",
+        "require_semantics": True,
+        "workstreams": [
+            {"key": "acquire", "stages": ["source", "qualify"]},
+            {"key": "convert", "stages": ["contact"]},
+        ],
+        "stages": [
+            {"key": "source", "actions": [{"key": "source_leads"}]},
+            {"key": "qualify", "actions": [{"key": "skip_trace"}]},
+            {"key": "contact", "actions": [{"key": "initial_outreach"}]},
+        ],
+    }
+    kb.create_board("ws-board", workflow=workflow)
+    with kb.connect(board="ws-board") as conn:
+        with pytest.raises(ValueError, match="workstream_id"):
+            kb.create_task(
+                conn,
+                title="missing workstream",
+                goal_id="close-deals",
+                stage_key="source",
+                action_key="source_leads",
+                board="ws-board",
+            )
+        with pytest.raises(ValueError, match="not allowed for workstream"):
+            kb.create_task(
+                conn,
+                title="wrong stage",
+                goal_id="close-deals",
+                workstream_id="acquire",
+                stage_key="contact",
+                action_key="initial_outreach",
+                board="ws-board",
+            )
+        tid = kb.create_task(
+            conn,
+            title="valid",
+            goal_id="close-deals",
+            workstream_id="acquire",
+            stage_key="source",
+            action_key="source_leads",
+            board="ws-board",
+        )
+    assert tid
+
+
+def test_complete_task_merges_evidence_without_auto_transitioning_terminal_card(kanban_home):
+    workflow = {
+        "id": "evidence-flow",
+        "stages": [
+            {
+                "key": "source",
+                "actions": [{"key": "source_leads", "output_schema": ["lead_batch_artifact"]}],
+                "exit_criteria": [
+                    {"transition": "qualify", "evidence_required": ["lead_batch_artifact"]}
+                ],
+            },
+            {"key": "qualify", "actions": [{"key": "skip_trace"}]},
+        ],
+    }
+    kb.create_board("evidence-board", workflow=workflow)
+    with kb.connect(board="evidence-board") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="build batch",
+            stage_key="source",
+            action_key="source_leads",
+            board="evidence-board",
+        )
+        kb.complete_task(
+            conn,
+            task_id,
+            summary="batch ready",
+            metadata={"lead_batch_artifact": "/tmp/batch.json"},
+            board="evidence-board",
+        )
+        updated = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert updated is not None
+    assert updated.stage_key == "source"
+    assert updated.action_key == "source_leads"
+    assert updated.status == "done"
+    assert updated.funnel_data is not None
+    assert "lead_batch_artifact" in updated.funnel_data.get("transition_evidence", [])
+    assert any(e.kind == "funnel_evidence_merged" for e in events)
+    assert not any(e.kind == "stage_transitioned" for e in events)
+
+
+def test_complete_task_output_schema_warn_is_soft(kanban_home):
+    workflow = {
+        "id": "schema-flow",
+        "stages": [
+            {
+                "key": "source",
+                "actions": [{"key": "source_leads", "output_schema": ["lead_batch_artifact"]}],
+            }
+        ],
+    }
+    kb.create_board("schema-board", workflow=workflow)
+    with kb.connect(board="schema-board") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="no artifact",
+            stage_key="source",
+            action_key="source_leads",
+            board="schema-board",
+        )
+        assert kb.complete_task(
+            conn, task_id, summary="done without artifact", board="schema-board",
+        )
+        events = kb.list_events(conn, task_id)
+
+    assert any(e.kind == "completion_output_schema_warn" for e in events)
+
+
+def test_kanban_semantic_diagnostics_flags_unknown_stage(kanban_home):
+    workflow = {
+        "id": "lint-flow",
+        "goal_id": "g1",
+        "workstreams": [{"key": "main", "stages": ["source"]}],
+        "stages": [{"key": "source", "actions": [{"key": "go"}]}],
+    }
+    kb.create_board("lint-board", workflow=workflow)
+    with kb.connect(board="lint-board") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="drifted",
+            goal_id="g1",
+            workstream_id="main",
+            stage_key="source",
+            action_key="go",
+            board="lint-board",
+        )
+        conn.execute(
+            "UPDATE tasks SET stage_key = ? WHERE id = ?",
+            ("lead_gen", task_id),
+        )
+        report = kb.kanban_semantic_diagnostics(conn, board="lint-board")
+
+    codes = {issue["code"] for issue in report["issues"]}
+    assert "unknown_stage" in codes
+
+
+def test_build_funnel_read_model_includes_workflow_skeleton_and_lint(kanban_home):
+    workflow = {
+        "id": "skeleton-flow",
+        "goal_id": "g1",
+        "stages": [
+            {"key": "source", "actions": [{"key": "go"}]},
+            {"key": "qualify", "actions": [{"key": "score"}]},
+        ],
+    }
+    kb.create_board("skeleton-board", workflow=workflow)
+    with kb.connect(board="skeleton-board") as conn:
+        kb.create_task(
+            conn,
+            title="only source",
+            goal_id="g1",
+            stage_key="source",
+            action_key="go",
+            board="skeleton-board",
+        )
+        model = kb.build_funnel_read_model(conn, board="skeleton-board")
+
+    coverage = {row["stage_key"]: row for row in model["workflow_stage_coverage"]}
+    assert coverage["source"]["card_count"] == 1
+    assert coverage["qualify"]["gap"] is True
+    skeleton_stages = [
+        s for s in model["stages"] if s.get("semantic_source") == "workflow_skeleton"
+    ]
+    assert any(s["stage_key"] == "qualify" for s in skeleton_stages)
+    assert "semantic_lint" in model
+
+
+def test_repair_orphan_task_runs_closes_stale_rows(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="done but open run", assignee="worker")
+        assert kb.claim_task(conn, task_id) is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                (int(__import__('time').time()), task_id),
+            )
+        repaired = kb.repair_orphan_task_runs(conn)
+        open_runs = conn.execute(
+            "SELECT COUNT(*) AS c FROM task_runs WHERE task_id = ? AND ended_at IS NULL",
+            (task_id,),
+        ).fetchone()["c"]
+
+    assert repaired
+    assert open_runs == 0
+
+
+def _land_runtime_workflow() -> dict:
+    return {
+        "id": "land-wholesale-source-to-close",
+        "goal_id": "close-deals",
+        "require_semantics": True,
+        "workstreams": ["seller-flow"],
+        "stages": [
+            {
+                "key": "source",
+                "actions": ["source_leads"],
+                "exit_criteria": [
+                    {"transition": "qualify", "evidence_required": ["sourced"]}
+                ],
+            },
+            {
+                "key": "qualify",
+                "actions": ["qualify_leads"],
+                "exit_criteria": [
+                    {"transition": "contact", "evidence_required": ["qualified"]}
+                ],
+            },
+            {
+                "key": "contact",
+                "actions": ["contact_seller"],
+                "exit_criteria": [
+                    {"transition": "negotiate", "evidence_required": ["contacted"]}
+                ],
+            },
+            {
+                "key": "negotiate",
+                "actions": ["negotiate_terms"],
+                "exit_criteria": [
+                    {"transition": "contract", "evidence_required": ["accepted"]}
+                ],
+            },
+            {
+                "key": "contract",
+                "actions": ["prepare_contract"],
+                "exit_criteria": [
+                    {"transition": "close", "evidence_required": ["signed"]}
+                ],
+            },
+            {"key": "close", "actions": ["close_deal"]},
+        ],
+    }
+
+
+def _workflow_violations(conn, *, board: str) -> list[str]:
+    violations: list[str] = []
+    for task in kb.list_tasks(conn, include_archived=True, limit=100):
+        try:
+            kb._validate_task_against_workflow(
+                board,
+                goal_id=task.goal_id,
+                workstream_id=task.workstream_id,
+                stage_key=task.stage_key,
+                action_key=task.action_key,
+                lifecycle_status=task.status,
+            )
+        except ValueError as exc:
+            violations.append(f"{task.id}: {exc}")
+    return violations
+
+
+def test_require_semantics_rejects_invalid_update_and_transition(kanban_home):
+    kb.create_board("strict-land", workflow=_land_runtime_workflow())
+    with kb.connect(board="strict-land") as conn:
+        with pytest.raises(ValueError, match="requires stage_key"):
+            kb.create_task(
+                conn,
+                title="missing semantics",
+                goal_id="close-deals",
+                workstream_id="seller-flow",
+                action_key="source_leads",
+                board="strict-land",
+            )
+        with pytest.raises(ValueError, match="workstream_id 'buyer-flow'"):
+            kb.create_task(
+                conn,
+                title="bad workstream",
+                goal_id="close-deals",
+                workstream_id="buyer-flow",
+                stage_key="source",
+                action_key="source_leads",
+                board="strict-land",
+            )
+        with pytest.raises(ValueError, match="action_key 'qualify_leads'"):
+            kb.create_task(
+                conn,
+                title="bad action",
+                goal_id="close-deals",
+                workstream_id="seller-flow",
+                stage_key="source",
+                action_key="qualify_leads",
+                board="strict-land",
+            )
+        task_id = kb.create_task(
+            conn,
+            title="source leads",
+            goal_id="close-deals",
+            workstream_id="seller-flow",
+            stage_key="source",
+            action_key="source_leads",
+            board="strict-land",
+        )
+
+        with pytest.raises(ValueError, match="workstream_id 'buyer-flow'"):
+            kb.update_task_funnel_fields(
+                conn,
+                task_id,
+                workstream_id="buyer-flow",
+                board="strict-land",
+            )
+        with pytest.raises(ValueError, match="action_key 'source_leads'"):
+            kb.update_task_funnel_fields(
+                conn,
+                task_id,
+                stage_key="qualify",
+                action_key="source_leads",
+                board="strict-land",
+            )
+        with pytest.raises(ValueError, match="action_key 'source_leads'"):
+            kb.transition_task_stage(
+                conn,
+                task_id,
+                to_stage="qualify",
+                evidence=["sourced"],
+                action_key="source_leads",
+                board="strict-land",
+            )
+
+        updated = kb.transition_task_stage(
+            conn,
+            task_id,
+            to_stage="qualify",
+            evidence=["sourced"],
+            action_key="qualify_leads",
+            board="strict-land",
+        )
+
+    assert updated.stage_key == "qualify"
+    assert updated.action_key == "qualify_leads"
+
+
+def test_completed_card_cannot_semantically_transition_to_next_stage(kanban_home):
+    kb.create_board("card-per-stage", workflow=_land_runtime_workflow())
+    with kb.connect(board="card-per-stage") as conn:
+        source = kb.create_task(
+            conn,
+            title="source leads",
+            goal_id="close-deals",
+            workstream_id="seller-flow",
+            stage_key="source",
+            action_key="source_leads",
+            board="card-per-stage",
+        )
+        assert kb.complete_task(conn, source, summary="Sourced lead list.", board="card-per-stage")
+        with pytest.raises(ValueError, match="cannot transition terminal task"):
+            kb.transition_task_stage(
+                conn,
+                source,
+                to_stage="qualify",
+                evidence=["sourced"],
+                action_key="qualify_leads",
+                board="card-per-stage",
+            )
+        completed = kb.get_task(conn, source)
+
+    assert completed is not None
+    assert completed.stage_key == "source"
+    assert completed.action_key == "source_leads"
+
+
+def test_kernel_board_root_task_defaults_todo_unless_explicit(kanban_home):
+    kb.create_board("mock-kernel", runtime="kernel")
+    with kb.connect(board="mock-kernel") as conn:
+        root = kb.create_task(conn, title="mock root", board="mock-kernel")
+        explicit = kb.create_task(
+            conn,
+            title="explicit root",
+            initial_status="running",
+            board="mock-kernel",
+        )
+        triage = kb.create_task(
+            conn,
+            title="triage root",
+            triage=True,
+            board="mock-kernel",
+        )
+        blocked = kb.create_task(
+            conn,
+            title="blocked root",
+            initial_status="blocked",
+            board="mock-kernel",
+        )
+        child = kb.create_task(conn, title="child", parents=[root], board="mock-kernel")
+
+        root_task = kb.get_task(conn, root)
+        explicit_task = kb.get_task(conn, explicit)
+        triage_task = kb.get_task(conn, triage)
+        blocked_task = kb.get_task(conn, blocked)
+        child_task = kb.get_task(conn, child)
+        assert root_task is not None and root_task.status == "todo"
+        assert explicit_task is not None and explicit_task.status == "ready"
+        assert triage_task is not None and triage_task.status == "triage"
+        assert blocked_task is not None and blocked_task.status == "blocked"
+        assert child_task is not None and child_task.status == "todo"
+
+
+def test_land_wholesaling_source_to_close_flow_keeps_semantic_lint_clean(kanban_home):
+    kb.create_board("land-flow", workflow=_land_runtime_workflow())
+    with kb.connect(board="land-flow") as conn:
+        source = kb.create_task(
+            conn,
+            title="Source county absentee-owner leads",
+            goal_id="close-deals",
+            workstream_id="seller-flow",
+            stage_key="source",
+            action_key="source_leads",
+            board="land-flow",
+        )
+        qualify = kb.create_task(
+            conn,
+            title="Qualify source leads",
+            goal_id="close-deals",
+            workstream_id="seller-flow",
+            stage_key="qualify",
+            action_key="qualify_leads",
+            parents=[source],
+            board="land-flow",
+        )
+        contact = kb.create_task(
+            conn,
+            title="Contact qualified sellers",
+            goal_id="close-deals",
+            workstream_id="seller-flow",
+            stage_key="contact",
+            action_key="contact_seller",
+            parents=[qualify],
+            board="land-flow",
+        )
+        negotiate = kb.create_task(
+            conn,
+            title="Negotiate accepted terms",
+            goal_id="close-deals",
+            workstream_id="seller-flow",
+            stage_key="negotiate",
+            action_key="negotiate_terms",
+            parents=[contact],
+            board="land-flow",
+        )
+        contract = kb.create_task(
+            conn,
+            title="Prepare seller contract",
+            goal_id="close-deals",
+            workstream_id="seller-flow",
+            stage_key="contract",
+            action_key="prepare_contract",
+            parents=[negotiate],
+            board="land-flow",
+        )
+        close = kb.create_task(
+            conn,
+            title="Close assignment",
+            goal_id="close-deals",
+            workstream_id="seller-flow",
+            stage_key="close",
+            action_key="close_deal",
+            parents=[contract],
+            board="land-flow",
+        )
+
+        assert kb.complete_task(conn, source, summary="Lead list sourced.", board="land-flow")
+        source_task = kb.get_task(conn, source)
+        qualify_task = kb.get_task(conn, qualify)
+        assert source_task is not None and source_task.stage_key == "source"
+        assert qualify_task is not None and qualify_task.status == "ready"
+
+        assert kb.complete_task(conn, qualify, summary="Three sellers qualified.", board="land-flow")
+        assert kb.claim_task(conn, contact) is not None
+        contact_task = kb.get_task(conn, contact)
+        assert contact_task is not None
+        contact_run = contact_task.current_run_id
+        kb.set_task_watching(
+            conn,
+            contact,
+            trigger_type="inbound_event",
+            trigger_key="sms:lead-1",
+            reason="Waiting for seller reply",
+            wake_status="ready",
+            expected_run_id=contact_run,
+        )
+        triggered = kb.trigger_watch(
+            conn,
+            trigger_type="inbound_event",
+            trigger_key="sms:lead-1",
+            payload={"message_id": "m-1"},
+            actor="mock-gateway",
+        )
+        assert [route.task_id for route in triggered] == [contact]
+        assert kb.complete_task(conn, contact, summary="Seller contacted.", board="land-flow")
+
+        assert kb.claim_task(conn, negotiate) is not None
+        negotiate_task = kb.get_task(conn, negotiate)
+        assert negotiate_task is not None
+        negotiate_run = negotiate_task.current_run_id
+        kb.set_task_watching(
+            conn,
+            negotiate,
+            trigger_type="inbound_event",
+            trigger_key="counter:lead-1",
+            reason="Waiting for counter signature",
+            wake_status="ready",
+            expected_run_id=negotiate_run,
+        )
+        kb.trigger_watch(
+            conn,
+            trigger_type="inbound_event",
+            trigger_key="counter:lead-1",
+            payload={"accepted": True},
+            actor="mock-gateway",
+        )
+        assert kb.complete_task(conn, negotiate, summary="Terms accepted.", board="land-flow")
+
+        contract_task = kb.get_task(conn, contract)
+        assert contract_task is not None and contract_task.status == "ready"
+        assert kb.block_task(conn, contract, reason="Need attorney template approval")
+        contract_task = kb.get_task(conn, contract)
+        assert contract_task is not None and contract_task.status == "blocked"
+        assert kb.unblock_task(conn, contract)
+        contract_task = kb.get_task(conn, contract)
+        assert contract_task is not None and contract_task.status == "ready"
+        assert kb.complete_task(conn, contract, summary="Contract signed.", board="land-flow")
+        close_task = kb.get_task(conn, close)
+        assert close_task is not None and close_task.status == "ready"
+        assert kb.complete_task(conn, close, summary="Assignment closed.", board="land-flow")
+
+        violations = _workflow_violations(conn, board="land-flow")
+        final_cards = {task.id: task for task in kb.list_tasks(conn, include_archived=True)}
+
+    assert violations == []
+    assert final_cards[source].stage_key == "source"
+    assert final_cards[source].action_key == "source_leads"
+    assert final_cards[qualify].stage_key == "qualify"
+    assert final_cards[contact].stage_key == "contact"
+    assert final_cards[negotiate].stage_key == "negotiate"
+    assert final_cards[contract].stage_key == "contract"
+    assert final_cards[close].stage_key == "close"
+    assert {task.status for task in final_cards.values()} == {"done"}

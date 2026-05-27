@@ -237,6 +237,18 @@ def test_cli_promote_single_json_stays_flat_object(kanban_home, capsys):
     assert payload["task_id"] == child and payload["promoted"] is True
 
 
+def test_cli_promote_json_dependency_failure_exits_1(kanban_home, capsys):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="c", parents=[parent])
+    rc = kb_cli._cmd_promote(_promote_ns(child, as_json=True))
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["task_id"] == child
+    assert payload["promoted"] is False
+    assert "unsatisfied parent dependencies" in payload["error"]
+
+
 def test_cli_promote_dedupes_duplicate_ids(kanban_home, capsys):
     """Same id in positional + --ids must only attempt the promotion once."""
     with kb.connect() as conn:

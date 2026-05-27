@@ -270,10 +270,10 @@ class TestBoardCRUD:
         raw = json.loads(kb.board_metadata_path("plain").read_text(encoding="utf-8"))
 
         assert meta["objective"] is None
-        assert meta["runtime"] is None
+        assert meta["runtime"]["mode"] == "kernel"
         assert meta["workflow"] is None
         assert "objective" not in raw
-        assert "runtime" not in raw
+        assert raw["runtime"]["mode"] == "kernel"
         assert "workflow" not in raw
 
     def test_create_kernel_board_can_store_custom_workflow(self, fresh_home):
@@ -282,10 +282,10 @@ class TestBoardCRUD:
         raw = json.loads(kb.board_metadata_path("plain-flow").read_text(encoding="utf-8"))
 
         assert meta["objective"] is None
-        assert meta["runtime"] is None
+        assert meta["runtime"]["mode"] == "kernel"
         assert [s["key"] for s in meta["workflow"]["stages"]] == ["intake", "deliver"]
         assert "objective" not in raw
-        assert "runtime" not in raw
+        assert raw["runtime"]["mode"] == "kernel"
         assert raw["workflow"]["id"] == "custom"
 
     def test_remove_archive(self, fresh_home):
@@ -570,7 +570,7 @@ class TestCLI:
         board_json = tmp_path / "kanban" / "boards" / "plain" / "board.json"
         raw = json.loads(board_json.read_text(encoding="utf-8"))
         assert "objective" not in raw
-        assert "runtime" not in raw
+        assert raw["runtime"]["mode"] == "kernel"
         assert "workflow" not in raw
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):
