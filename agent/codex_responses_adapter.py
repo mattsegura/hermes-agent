@@ -738,21 +738,29 @@ def _preflight_codex_api_kwargs(
             )
 
     store = api_kwargs.get("store", False)
-    if store is not False:
-        raise ValueError("Codex Responses contract requires 'store' to be false.")
+    if not isinstance(store, bool):
+        raise ValueError("Codex Responses request 'store' must be a boolean.")
+
+    previous_response_id = api_kwargs.get("previous_response_id")
+    if previous_response_id is not None:
+        if not isinstance(previous_response_id, str) or not previous_response_id.strip():
+            raise ValueError("Codex Responses request 'previous_response_id' must be a non-empty string.")
+        previous_response_id = previous_response_id.strip()
 
     allowed_keys = {
         "model", "instructions", "input", "tools", "store",
         "reasoning", "include", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
-        "extra_headers", "extra_body", "timeout",
+        "extra_headers", "extra_body", "timeout", "previous_response_id",
     }
     normalized: Dict[str, Any] = {
         "model": model,
         "instructions": instructions,
         "input": normalized_input,
-        "store": False,
+        "store": store,
     }
+    if previous_response_id:
+        normalized["previous_response_id"] = previous_response_id
     if normalized_tools is not None:
         normalized["tools"] = normalized_tools
 

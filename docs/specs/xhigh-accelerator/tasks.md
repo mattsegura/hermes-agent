@@ -22,14 +22,14 @@
 
 ## Phase 2 — Stateful Codex Responses replay
 
-- [ ] Add disabled-by-default config for `performance.responses_state.enabled` and stateless fallback behavior.
-- [ ] Teach the Codex Responses transport to support opt-in `store: true` plus `previous_response_id` while preserving the current `store: false` path.
-- [ ] Add a state-chain compatibility fingerprint covering model, provider, reasoning config, stable instructions/system prompt, tool schema, and session branch.
-- [ ] On follow-up tool-loop calls, send only new delta input items when state is valid; reset state and send a full request when the fingerprint changes.
-- [ ] On provider rejection, missing state, or expired state, mark the chain invalid and retry the current turn through the existing stateless full-replay path.
-- [ ] Extend telemetry with stateful replay usage, fallback reason, state reset reason, previous-response usage, full-vs-delta request size, and stateless retry count.
-- [ ] Add unit tests for disabled path compatibility, successful stateful chaining, state reset, and fallback to stateless on 400/404-style failures.
-- [ ] Add a tiny live/manual smoke test plan before local enablement.
+- [x] Add disabled-by-default config for `performance.responses_state.enabled` and stateless fallback behavior.
+- [x] Teach the Codex Responses transport to support opt-in `store: true` plus `previous_response_id` while preserving the current `store: false` path.
+- [x] Add a state-chain compatibility fingerprint covering model, provider, reasoning config, stable instructions/system prompt, tool schema, and session branch.
+- [x] On follow-up tool-loop calls, send only new delta input items when state is valid; reset state and send a full request when the fingerprint changes.
+- [x] On provider rejection, missing state, or expired state, mark the chain invalid and retry the current turn through the existing stateless full-replay path.
+- [x] Extend telemetry with stateful replay usage, fallback reason, state reset reason, previous-response usage, full-vs-delta request size, and stateless retry count.
+- [x] Add unit tests for disabled path compatibility, successful stateful chaining, state reset, and fallback to stateless on 400/404-style failures.
+- [x] Add a tiny live/manual smoke test plan before local enablement: in an isolated profile, enable `performance.responses_state.enabled`, run a two-iteration Codex Responses tool turn, confirm first payload uses `store: true`, second payload uses `previous_response_id` with only `function_call_output`, then disable immediately if any stateful fallback appears in `turn_performance`.
 
 ## Phase 3 — Tool batch attribution
 

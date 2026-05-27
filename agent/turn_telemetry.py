@@ -80,6 +80,18 @@ class TurnTelemetry:
                 "read_tokens": 0,
                 "write_tokens": 0,
             },
+            "responses_state": {
+                "enabled": False,
+                "used": False,
+                "previous_response_id_used": False,
+                "fallback_reason": None,
+                "reset_reason": None,
+                "full_input_items": None,
+                "delta_input_items": None,
+                "full_input_chars": None,
+                "delta_input_chars": None,
+                "stateless_retry_count": 0,
+            },
         }
 
     def _now(self) -> float:
@@ -164,11 +176,33 @@ class TurnTelemetry:
 
         self._guard("record_usage", _record)
 
+    def record_responses_state(self, **values: Any) -> None:
+        def _record() -> None:
+            state = self._summary.setdefault("responses_state", {})
+            for key, value in values.items():
+                if key in {
+                    "full_input_items",
+                    "delta_input_items",
+                    "full_input_chars",
+                    "delta_input_chars",
+                    "stateless_retry_count",
+                }:
+                    state[key] = _safe_int(value)
+                elif key in {"enabled", "used", "previous_response_id_used"}:
+                    state[key] = bool(value)
+                elif key in {"fallback_reason", "reset_reason"}:
+                    state[key] = str(value) if value is not None else None
+                else:
+                    state[key] = _json_safe(value)
+
+        self._guard("record_responses_state", _record)
+
     def summary(self) -> Dict[str, Any]:
         try:
             data = dict(self._summary)
             data["request"] = dict(self._summary.get("request") or {})
             data["cache"] = dict(self._summary.get("cache") or {})
+            data["responses_state"] = dict(self._summary.get("responses_state") or {})
             data["turn_total_ms"] = _safe_float_ms(self._now() - self._started_at)
             return _json_safe(data)
         except Exception:

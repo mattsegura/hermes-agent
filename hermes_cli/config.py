@@ -878,6 +878,10 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "log_turn_summary": True,
         },
+        "responses_state": {
+            "enabled": False,
+            "fallback_to_stateless": True,
+        },
     },
 
     "compression": {

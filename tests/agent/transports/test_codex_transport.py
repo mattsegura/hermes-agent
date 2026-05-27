@@ -53,6 +53,37 @@ class TestCodexBuildKwargs:
         assert kw["instructions"] == "You are helpful."
         assert "input" in kw
         assert kw["store"] is False
+        assert "previous_response_id" not in kw
+
+    def test_opt_in_stateful_kwargs(self, transport):
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+        ]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            responses_store=True,
+            previous_response_id="resp_123",
+        )
+
+        assert kw["store"] is True
+        assert kw["previous_response_id"] == "resp_123"
+
+    def test_preflight_accepts_stateful_responses_fields(self, transport):
+        kw = {
+            "model": "gpt-5.4",
+            "instructions": "You are helpful.",
+            "input": [{"role": "user", "content": "Hello"}],
+            "store": True,
+            "previous_response_id": "resp_123",
+        }
+
+        normalized = transport.preflight_kwargs(kw)
+
+        assert normalized["store"] is True
+        assert normalized["previous_response_id"] == "resp_123"
 
     def test_system_extracted_from_messages(self, transport):
         messages = [

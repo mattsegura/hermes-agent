@@ -62,6 +62,7 @@ from agent.nous_rate_guard import (
 )
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
+from agent.responses_state import ResponsesStateReplay, compatibility_fingerprint
 from agent.retry_utils import jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
 from agent.turn_telemetry import TurnTelemetry
@@ -149,6 +150,29 @@ def _build_turn_telemetry() -> TurnTelemetry:
     except Exception:
         logger.debug("turn telemetry config load failed", exc_info=True)
         return TurnTelemetry(enabled=False, log_turn_summary=False)
+
+
+def _build_responses_state_replay() -> ResponsesStateReplay:
+    """Load opt-in Responses state replay config defensively."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        perf_cfg = cfg.get("performance") if isinstance(cfg, dict) else {}
+        state_cfg = (
+            perf_cfg.get("responses_state")
+            if isinstance(perf_cfg, dict)
+            else {}
+        )
+        if not isinstance(state_cfg, dict):
+            state_cfg = {}
+        return ResponsesStateReplay(
+            enabled=state_cfg.get("enabled", False),
+            fallback_to_stateless=state_cfg.get("fallback_to_stateless", True),
+        )
+    except Exception:
+        logger.debug("responses state config load failed", exc_info=True)
+        return ResponsesStateReplay(enabled=False, fallback_to_stateless=True)
 
 
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
@@ -368,6 +392,14 @@ def run_conversation(
     agent._persist_user_message_override = persist_user_message
     # Generate unique task_id if not provided to isolate VMs between concurrent tasks
     effective_task_id = task_id or str(uuid.uuid4())
+    responses_state_replay = _build_responses_state_replay()
+    agent._responses_state_replay = responses_state_replay
+    turn_telemetry.record_responses_state(
+        enabled=responses_state_replay.enabled,
+        used=False,
+        previous_response_id_used=False,
+        stateless_retry_count=0,
+    )
     # Expose the active task_id so tools running mid-turn (e.g. delegate_task
     # in delegate_tool.py) can identify this agent for the cross-agent file
     # state registry.  Set BEFORE any tool dispatch so snapshots taken at
@@ -1124,6 +1156,22 @@ def run_conversation(
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
                     api_kwargs = agent._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
+                    if responses_state_replay.enabled:
+                        _responses_state_fingerprint = compatibility_fingerprint(
+                            api_kwargs,
+                            provider=getattr(agent, "provider", "") or "",
+                            base_url=getattr(agent, "base_url", "") or "",
+                            session_id=getattr(agent, "session_id", "") or "",
+                            branch_id=effective_task_id,
+                        )
+                        api_kwargs = responses_state_replay.prepare(
+                            api_kwargs,
+                            fingerprint=_responses_state_fingerprint,
+                            telemetry=turn_telemetry,
+                        )
+                        api_kwargs = agent._get_transport().preflight_kwargs(
+                            api_kwargs, allow_stream=False
+                        )
 
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -1833,6 +1881,9 @@ def run_conversation(
                             f"({hit_pct:.0f}% hit, {written:,} written)"
                         )
                 
+                if agent.api_mode == "codex_responses":
+                    responses_state_replay.record_response(response, turn_telemetry)
+
                 has_retried_429 = False  # Reset on success
                 # Clear Nous rate limit state on successful request —
                 # proves the limit has reset and other sessions can
@@ -2119,6 +2170,15 @@ def run_conversation(
 
                 status_code = getattr(api_error, "status_code", None)
                 error_context = agent._extract_api_error_context(api_error)
+
+                if (
+                    agent.api_mode == "codex_responses"
+                    and responses_state_replay.handle_error(api_error, turn_telemetry)
+                ):
+                    agent._emit_status(
+                        "↻ Responses state replay rejected — retrying stateless full replay"
+                    )
+                    continue
 
                 # ── Classify the error for structured recovery decisions ──
                 _compressor = getattr(agent, "context_compressor", None)

@@ -144,6 +144,17 @@ class ResponsesApiTransport(ProviderTransport):
         if request_overrides:
             kwargs.update(request_overrides)
 
+        # Stateful Responses replay is opt-in.  The default/full-replay
+        # contract remains store=False and never carries previous_response_id.
+        if params.get("responses_store") is True:
+            kwargs["store"] = True
+            previous_response_id = params.get("previous_response_id")
+            if isinstance(previous_response_id, str) and previous_response_id.strip():
+                kwargs["previous_response_id"] = previous_response_id.strip()
+        else:
+            kwargs["store"] = False
+            kwargs.pop("previous_response_id", None)
+
         # Forward per-request timeout to the SDK so OpenAI/Anthropic clients
         # honor it.  Without this, ``providers.<id>.request_timeout_seconds``
         # is silently dropped on the main agent Codex path while the
