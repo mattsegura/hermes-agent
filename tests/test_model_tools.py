@@ -40,6 +40,17 @@ class TestHandleFunctionCall:
         assert len(parsed["error"]) > 0
         assert "error" in parsed["error"].lower() or "failed" in parsed["error"].lower()
 
+    def test_kanban_approach_gate_blocks_before_dispatch(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_gate")
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+
+        with patch("model_tools.registry.dispatch") as mock_dispatch:
+            result = json.loads(handle_function_call("send_message", {"channel": "sms"}))
+
+        assert "APPROACH GATE" in result["error"]
+        mock_dispatch.assert_not_called()
+
     def test_tool_hooks_receive_session_and_tool_call_ids(self):
         with (
             patch("model_tools.registry.dispatch", return_value='{"ok":true}'),

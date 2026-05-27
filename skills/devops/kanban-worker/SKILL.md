@@ -141,6 +141,28 @@ kanban_block(reason="Rate limit key choice: IP (simple, NAT-unsafe) or user_id (
 
 The block message is what appears in the dashboard / gateway notifier. The comment is the deeper context a human reads when they open the task.
 
+## Healthy waiting with `kanban_watch`
+
+Use `kanban_watch` when the task is healthy but cannot make progress until a future event arrives. Do **not** use `kanban_block` for this: blocked means human input or an error path, while watching means the system should wake the card automatically when the declared trigger fires.
+
+Good watch cases:
+
+- waiting for an inbound SMS/email/webhook reply
+- waiting for a timer or scheduled follow-up
+- waiting for another system to publish a known event
+- parking a long-running goal until a measurable external signal changes
+
+```python
+kanban_watch(
+    trigger_type="inbound_event",
+    trigger_key="sms:+15551234567",
+    reason="waiting for seller reply",
+    payload={"entity": "lead:123", "next_action": "analyze reply and continue negotiation"},
+)
+```
+
+When an orchestrator or event bridge calls `kanban_trigger` with the matching route, the task wakes back to `ready` (or `todo` if open parents still gate it) and the next run sees the trigger event in the task history.
+
 ## Heartbeats worth sending
 
 Good heartbeats name progress: `"epoch 12/50, loss 0.31"`, `"scanned 1.2M/2.4M rows"`, `"uploaded 47/120 videos"`.
@@ -170,6 +192,7 @@ You can configure the gateway to receive cross-profile Kanban task notifications
 - Modify files outside `$HERMES_KANBAN_WORKSPACE` unless the task body says to.
 - Create follow-up tasks assigned to yourself — assign to the right specialist.
 - Complete a task you didn't actually finish. Block it instead.
+- Block a healthy wait. Use `kanban_watch` when the system knows what event should wake the task.
 
 ## Pitfalls
 
@@ -185,6 +208,9 @@ Every tool has a CLI equivalent for human operators and scripts:
 - `kanban_show` ↔ `hermes kanban show <id> --json`
 - `kanban_complete` ↔ `hermes kanban complete <id> --summary "..." --metadata '{...}'`
 - `kanban_block` ↔ `hermes kanban block <id> "reason"`
+- `kanban_watch` ↔ `hermes kanban wait <id> --trigger-type <type> [--trigger-key <key>]`
+- `kanban_trigger` ↔ `hermes kanban trigger --trigger-type <type> [--trigger-key <key>]`
+- `kanban_transition` ↔ `hermes kanban transition <id> <stage> --evidence <key>`
 - `kanban_create` ↔ `hermes kanban create "title" --assignee <profile> [--parent <id>]`
 - etc.
 

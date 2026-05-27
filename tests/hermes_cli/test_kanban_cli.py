@@ -158,6 +158,29 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
 
 
+def test_run_slash_wait_trigger_cycle(kanban_home):
+    out = kc.run_slash("create 'wait for reply' --assignee alice")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m
+    tid = m.group(1)
+
+    wait = kc.run_slash(
+        f"wait {tid} --trigger-type webhook --trigger-key reply:lead-1 "
+        "--reason 'Waiting for reply'"
+    )
+    assert f"Watching {tid} via webhook:reply:lead-1 -> ready" in wait
+    show = kc.run_slash(f"show {tid}")
+    assert "status:    watching" in show
+    assert "Watch routes" in show
+    assert "webhook:reply:lead-1" in show
+
+    triggered = kc.run_slash("trigger --trigger-type webhook --trigger-key reply:lead-1")
+    assert f"Triggered watch route" in triggered
+    show_after = kc.run_slash(f"show {tid}")
+    assert "status:    ready" in show_after
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)

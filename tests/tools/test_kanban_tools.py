@@ -55,7 +55,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_complete", "kanban_block", "kanban_watch", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -84,6 +84,7 @@ def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_pat
     assert "kanban_show" in names
     assert "kanban_complete" in names
     assert "kanban_block" in names
+    assert "kanban_watch" in names
     assert "kanban_list" not in names
 
 
@@ -111,10 +112,12 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
     assert {
         "kanban_list",
         "kanban_funnel",
+        "kanban_trigger",
+        "kanban_transition",
         "kanban_unblock",
     }.isdisjoint(kanban), (
         f"Board-routing tools leaked into worker schema: "
-        f"{kanban & {'kanban_list', 'kanban_funnel', 'kanban_unblock'}}"
+        f"{kanban & {'kanban_list', 'kanban_funnel', 'kanban_trigger', 'kanban_transition', 'kanban_unblock'}}"
     )
 
 
@@ -137,7 +140,9 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     expected = {
         "kanban_list",
         "kanban_funnel",
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_trigger",
+        "kanban_transition",
+        "kanban_show", "kanban_complete", "kanban_block", "kanban_watch", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock",
     }
@@ -274,6 +279,104 @@ def test_funnel_returns_semantic_read_model(monkeypatch, worker_env):
     }
     assert d["stages"][0]["entities_truncated"] == 1
     assert len(d["stages"][0]["entities"]) == 1
+
+
+def test_watch_and_trigger_handlers(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    watch_out = kt._handle_watch({
+        "trigger_type": "webhook",
+        "trigger_key": "reply:lead-1",
+        "reason": "Waiting for webhook reply",
+        "payload": {"lead_id": "lead-1"},
+    })
+    watched = json.loads(watch_out)
+    assert watched["ok"] is True
+    assert watched["route"]["trigger_type"] == "webhook"
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "watching"
+    finally:
+        conn.close()
+
+    worker_trigger = kt._handle_trigger({"trigger_type": "webhook"})
+    assert "orchestrator-only" in json.loads(worker_trigger).get("error", "")
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    trigger_out = kt._handle_trigger({
+        "trigger_type": "webhook",
+        "trigger_key": "reply:lead-1",
+        "payload": {"message_id": "m-1"},
+    })
+    triggered = json.loads(trigger_out)
+    assert triggered["ok"] is True
+    assert triggered["count"] == 1
+    assert triggered["routes"][0]["active"] is False
+    assert triggered["routes"][0]["trigger_payload"] == {"message_id": "m-1"}
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "ready"
+    finally:
+        conn.close()
+
+
+def test_transition_handler_enforces_workflow_evidence(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    workflow = {
+        "id": "generic-flow",
+        "stages": [
+            {
+                "key": "intake",
+                "actions": ["capture"],
+                "exit_criteria": [
+                    {"transition": "execute", "evidence_required": ["brief"]}
+                ],
+            },
+            {"key": "execute", "actions": ["dispatch"]},
+        ],
+    }
+    kb.create_board("tool-flow", workflow=workflow)
+    conn = kb.connect(board="tool-flow")
+    try:
+        tid = kb.create_task(
+            conn,
+            title="move through workflow",
+            assignee="planner",
+            stage_key="intake",
+            action_key="capture",
+            board="tool-flow",
+        )
+    finally:
+        conn.close()
+
+    missing = kt._handle_transition({
+        "board": "tool-flow",
+        "task_id": tid,
+        "to_stage": "execute",
+        "evidence": [],
+    })
+    assert "missing transition evidence: brief" in json.loads(missing).get("error", "")
+
+    ok = json.loads(kt._handle_transition({
+        "board": "tool-flow",
+        "task_id": tid,
+        "to_stage": "execute",
+        "evidence": ["brief"],
+        "action": "dispatch",
+    }))
+    assert ok["ok"] is True
+    assert ok["task"]["stage_key"] == "execute"
+    assert ok["task"]["action_key"] == "dispatch"
 
 
 def test_list_rejects_invalid_status(monkeypatch, worker_env):

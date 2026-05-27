@@ -64,8 +64,8 @@ _HERMES_CORE_TOOLS = [
     # spawned as a kanban worker (HERMES_KANBAN_TASK env set) or the current
     # profile explicitly enables the kanban toolset. Gated via check_fn in
     # tools/kanban_tools.py.
-    "kanban_show", "kanban_list",
-    "kanban_complete", "kanban_block", "kanban_heartbeat",
+    "kanban_show", "kanban_list", "kanban_funnel",
+    "kanban_complete", "kanban_block", "kanban_watch", "kanban_trigger", "kanban_transition", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
@@ -260,8 +260,8 @@ TOOLSETS = {
             "orchestrators) list, unblock, and fan out tasks."
         ),
         "tools": [
-            "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
-            "kanban_heartbeat", "kanban_comment",
+            "kanban_show", "kanban_list", "kanban_funnel", "kanban_complete", "kanban_block",
+            "kanban_watch", "kanban_trigger", "kanban_transition", "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock",
         ],

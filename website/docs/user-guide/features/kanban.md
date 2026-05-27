@@ -14,7 +14,7 @@ Hermes Kanban is a durable task board, shared across all your Hermes profiles, t
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
-- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
+- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_funnel`, `kanban_complete`, `kanban_block`, `kanban_watch`, `kanban_trigger`, `kanban_transition`, `kanban_heartbeat`, `kanban_comment`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with task-scoped lifecycle tools already in its schema; orchestrator profiles can also enable the broader `kanban` toolset explicitly. The model reads, routes, watches, wakes, and transitions tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
@@ -59,7 +59,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
-- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
+- **Task** — a row with title, optional body, one assignee (a profile name), lifecycle status (`triage | todo | scheduled | ready | running | watching | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation), and optional semantic funnel coordinates (`goal_id`, `workstream_id`, `stage_key`, `action_key`, `funnel_data`).
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
@@ -68,6 +68,76 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
+
+## Lifecycle status vs. semantic workflow funnel
+
+Kanban now separates two ideas that used to be easy to blur:
+
+- **Lifecycle status** is the scheduler state: `todo`, `ready`, `running`, `watching`, `blocked`, `done`, etc. The dispatcher only uses this layer plus task links and assignees. This keeps execution safe and generic.
+- **Semantic workflow/funnel state** is the optimizer's map of the actual goal: goal → workstream → stage → action, with structured `funnel_data` for substate, entity signals, expected events, and evidence. This layer is descriptive and queryable; it does not force every board into the same columns.
+
+That means a board can keep normal columns while still exposing rich end-to-end work shape. Example: a land pipeline, inbox triage board, coding board, or household chores board can all define their own semantic stages without adding hardcoded statuses to the kernel.
+
+A board-level workflow schema lives in `board.json` and is intentionally generic:
+
+```json
+{
+  "id": "deal-flow",
+  "stages": [
+    {
+      "key": "intake",
+      "actions": ["qualify", "research"],
+      "allowed_lifecycle_states": ["todo", "ready", "running", "watching"],
+      "exit_criteria": [
+        {"transition": "execute", "evidence_required": ["qualified"]}
+      ]
+    },
+    {"key": "execute", "actions": ["dispatch", "follow_up"]}
+  ]
+}
+```
+
+CLI setup:
+
+```bash
+hermes kanban boards create land --workflow @workflow.json
+hermes kanban boards workflow show land --json
+hermes kanban boards workflow set land @workflow.json
+hermes kanban create "Research parcel" \
+  --goal close-deals \
+  --workstream acquisition \
+  --stage intake \
+  --action research \
+  --funnel-data '{"entity":"parcel:123"}'
+```
+
+The optimizer/orchestrator reads the board through `kanban_funnel`, not by scraping columns. It sees stage counts, entities, cards, waiting routes, lifecycle states, blockers, and evidence gaps in one read-model.
+
+### Healthy waiting: `watching` is not `blocked`
+
+Use `blocked` only when human input or an unavailable dependency is required. Use `watching` when the task is healthy but should not consume a worker until an event arrives: reply received, timer matured, webhook fired, dependency changed, or manual wake.
+
+```bash
+hermes kanban wait t_abc \
+  --trigger-type inbound_event \
+  --trigger-key sms:+15551234567 \
+  --reason "waiting for seller reply"
+
+hermes kanban trigger \
+  --trigger-type inbound_event \
+  --trigger-key sms:+15551234567 \
+  --payload '{"from":"+15551234567","body":"sounds good"}'
+```
+
+Workers use `kanban_watch`; orchestrators or event bridges use `kanban_trigger`. Triggering a watched card wakes it back to `ready` unless open parent dependencies require `todo`.
+
+### Evidence-gated transitions
+
+When a workflow stage declares `exit_criteria`, `kanban_transition` / `hermes kanban transition` refuses to move the card until the required evidence keys are present. Evidence is stored in `funnel_data.transition_evidence`, so future optimizer reads can distinguish "stuck" from "missing proof".
+
+```bash
+hermes kanban transition t_abc execute --evidence qualified --action dispatch
+```
 
 ## Boards (multi-project)
 
@@ -235,15 +305,19 @@ hermes kanban block    t_abc "need input" --ids t_def t_hij
 
 | Tool | Purpose | Required params |
 |---|---|---|
-| `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
+| `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, watch routes, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
+| `kanban_funnel` | Return the semantic funnel read-model: stages, actions, cards, entities, waiting routes, blockers, evidence, and counts. Intended for optimizers/orchestrators. | — |
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
 | `kanban_block` | Escalate for human input with a `reason`. | `reason` |
+| `kanban_watch` | Park the current task in healthy `watching` state and register the future trigger that should wake it. | `trigger_type` |
+| `kanban_trigger` | Wake active watch routes by route id, task id, or trigger type/key. Intended for orchestrators/event bridges. | one of `route_id`, `task_id`, or `trigger_type` |
+| `kanban_transition` | Move a card between semantic workflow stages after evidence validation. | `task_id`, `to_stage` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
-| `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. | `title`, `assignee` |
+| `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, funnel coordinates, etc. | `title`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. | `parent_id`, `child_id` |
-| `kanban_unblock` | (Orchestrators) move a blocked task back to `ready`. | `task_id` |
+| `kanban_unblock` | (Orchestrators) move a blocked/scheduled/watching task back to `ready` or dependency-gated `todo`. | `task_id` |
 
 A typical worker turn looks like:
 
@@ -280,7 +354,7 @@ kanban_create(
 kanban_complete(summary="decomposed into 2 research tasks + 1 writer; linked dependencies")
 ```
 
-The "(Orchestrators)" tools — `kanban_list`, `kanban_create`, `kanban_link`, `kanban_unblock`, and `kanban_comment` on foreign tasks — are available through the same toolset; the convention (enforced by the `kanban-orchestrator` skill) is that worker profiles don't fan out or route unrelated work, and orchestrator profiles don't execute implementation work. Dispatcher-spawned workers are still task-scoped for destructive lifecycle operations and cannot mutate unrelated tasks.
+The "(Orchestrators)" tools — `kanban_list`, `kanban_funnel`, `kanban_trigger`, `kanban_transition`, `kanban_create`, `kanban_link`, `kanban_unblock`, and `kanban_comment` on foreign tasks — are available through the same toolset; the convention (enforced by the `kanban-orchestrator` skill) is that worker profiles don't fan out or route unrelated work, and orchestrator profiles don't execute implementation work. Dispatcher-spawned workers are still task-scoped for destructive lifecycle operations and cannot mutate unrelated tasks.
 
 ### Why tools instead of shelling to `hermes kanban`
 
@@ -450,7 +524,7 @@ hermes dashboard        # "Kanban" tab appears in the nav, after "Skills"
 
 ### What the plugin gives you
 
-- A **Kanban** tab showing one column per status: `triage`, `todo`, `ready`, `running`, `blocked`, `done` (plus `archived` when the toggle is on).
+- A **Kanban** tab showing one column per lifecycle status: `triage`, `todo`, `scheduled`, `ready`, `running`, `watching`, `blocked`, `review`, `done` (plus `archived` when the toggle is on).
   - `triage` is the parking column for rough ideas. By default (`kanban.auto_decompose: true`), the dispatcher auto-runs the **decomposer** on tasks that land here — the orchestrator profile reads the rough idea, looks at your profile roster (with descriptions), and fans the task out into a small graph of child tasks routed to the best-fit specialists. The original task stays alive as the parent of every child so the orchestrator wakes back up to judge completion when everything finishes. Flip the **Orchestration: Auto/Manual** pill at the top of the page (or set `kanban.auto_decompose: false`) to switch to manual mode, where triage tasks stay put until you click **⚗ Decompose** on a card or run `hermes kanban decompose <id>`. For tasks that don't need fan-out (or for setups without an orchestrator profile), the **✨ Specify** button does a single-task spec rewrite (title + body with goal, approach, acceptance criteria) via the same LLM machinery. See [Auto vs Manual orchestration](#auto-vs-manual-orchestration) below.
 - Cards show the task id, title, priority badge, tenant tag, assigned profile, comment/link counts, a **progress pill** (`N/M` children done when the task has dependents), and "created N ago". A per-card checkbox enables multi-select.
 - **Per-profile lanes inside Running** — toolbar checkbox toggles sub-grouping of the Running column by assignee.

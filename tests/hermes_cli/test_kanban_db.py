@@ -398,6 +398,128 @@ def test_funnel_read_model_aggregates_compound_entities(kanban_home):
     assert stage["cards"][0]["signals"]["entity_count"] == 2
 
 
+def test_task_watch_lifecycle_registers_route_and_trigger_wakes(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="wait for seller reply",
+            assignee="negotiator",
+            goal_id="close-deal",
+            workstream_id="seller-flow",
+            stage_key="negotiate",
+            action_key="wait-reply",
+        )
+        assert kb.claim_task(conn, task_id) is not None
+        claimed_task = kb.get_task(conn, task_id)
+        assert claimed_task is not None
+        run_id = claimed_task.current_run_id
+
+        route = kb.set_task_watching(
+            conn,
+            task_id,
+            trigger_type="inbound-event",
+            trigger_key="sms:lead-1",
+            reason="Waiting for seller SMS reply",
+            payload={"lead_id": "lead-1"},
+            wake_status="ready",
+            created_by="negotiator",
+            expected_run_id=run_id,
+        )
+        watching_task = kb.get_task(conn, task_id)
+        routes = kb.list_watch_routes(conn, task_id)
+        watching_model = kb.build_funnel_read_model(conn, board="default")
+
+        triggered = kb.trigger_watch(
+            conn,
+            trigger_type="inbound_event",
+            trigger_key="sms:lead-1",
+            payload={"message_id": "m-1"},
+            actor="gateway",
+        )
+        woken_task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+        woken_model = kb.build_funnel_read_model(conn, board="default")
+
+    assert route is not None
+    assert watching_task is not None
+    assert woken_task is not None
+    assert route.trigger_type == "inbound_event"
+    assert route.trigger_key == "sms:lead-1"
+    assert watching_task.status == "watching"
+    assert watching_task.claim_lock is None
+    assert watching_task.current_run_id is None
+    assert routes[0].active is True
+    assert watching_model["summary"]["watching_cards"] == 1
+    stage = watching_model["stages"][0]
+    assert stage["metrics"]["watching_cards"] == 1
+    assert stage["cards"][0]["runtime"]["waiting_reason"] == "Waiting for seller SMS reply"
+    assert stage["cards"][0]["watch_routes"][0]["trigger_type"] == "inbound_event"
+
+    assert len(triggered) == 1
+    assert triggered[0].active is False
+    assert triggered[0].trigger_payload == {"message_id": "m-1"}
+    assert woken_task.status == "ready"
+    assert woken_model["summary"]["watching_cards"] == 0
+    assert any(event.kind == "watching" for event in events)
+    assert any(event.kind == "watch_triggered" for event in events)
+
+
+def test_transition_task_stage_requires_workflow_evidence(kanban_home):
+    workflow = {
+        "id": "seller-flow",
+        "stages": [
+            {
+                "key": "intake",
+                "actions": ["capture"],
+                "exit_criteria": [
+                    {"transition": "execute", "evidence_required": ["brief"]}
+                ],
+            },
+            {"key": "execute", "actions": ["dispatch"]},
+        ],
+    }
+    kb.create_board("flow-board", workflow=workflow)
+    with kb.connect(board="flow-board") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="capture owner intent",
+            assignee="planner",
+            stage_key="intake",
+            action_key="capture",
+            board="flow-board",
+        )
+        with pytest.raises(ValueError, match="missing transition evidence: brief"):
+            kb.transition_task_stage(
+                conn,
+                task_id,
+                to_stage="execute",
+                evidence=[],
+                board="flow-board",
+            )
+        updated = kb.transition_task_stage(
+            conn,
+            task_id,
+            to_stage="execute",
+            evidence=["brief"],
+            action_key="dispatch",
+            actor="optimizer",
+            board="flow-board",
+        )
+        events = kb.list_events(conn, task_id)
+        model = kb.build_funnel_read_model(conn, board="flow-board")
+
+    assert updated.stage_key == "execute"
+    assert updated.action_key == "dispatch"
+    assert updated.funnel_data is not None
+    assert updated.funnel_data["transition_evidence"] == ["brief"]
+    assert events[-1].kind == "stage_transitioned"
+    assert isinstance(events[-1].payload, dict)
+    assert events[-1].payload["from_stage"] == "intake"
+    assert events[-1].payload["to_stage"] == "execute"
+    assert model["workflow"]["id"] == "seller-flow"
+    assert model["stages"][0]["stage_key"] == "execute"
+
+
 def test_branch_name_requires_worktree_workspace(kanban_home):
     with kb.connect() as conn, pytest.raises(ValueError, match="worktree"):
         kb.create_task(

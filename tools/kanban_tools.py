@@ -382,8 +382,8 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     if os.environ.get("HERMES_KANBAN_TASK"):
         return tool_error(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
-            "must use kanban_complete, kanban_block, kanban_heartbeat, or "
-            "kanban_comment for their assigned task."
+            "must use kanban_complete, kanban_block, kanban_watch, "
+            "kanban_heartbeat, or kanban_comment for their assigned task."
         )
     return None
 
@@ -412,6 +412,10 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "stage_key": getattr(task, "stage_key", None),
         "action_key": getattr(task, "action_key", None),
         "funnel_data": getattr(task, "funnel_data", None),
+        "watch_routes": [
+            kb.watch_route_to_dict(route)
+            for route in kb.list_watch_routes(conn, task.id, active=True)
+        ],
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -462,6 +466,10 @@ def _handle_show(args: dict, **kw) -> str:
                     "stage_key": getattr(t, "stage_key", None),
                     "action_key": getattr(t, "action_key", None),
                     "funnel_data": getattr(t, "funnel_data", None),
+                    "watch_routes": [
+                        kb.watch_route_to_dict(route)
+                        for route in kb.list_watch_routes(conn, t.id, active=True)
+                    ],
                 }
 
             def _run_dict(r):
@@ -763,7 +771,7 @@ def _handle_block(args: dict, **kw) -> str:
             if not ok:
                 return tool_error(
                     f"could not block {tid} (unknown id or not in "
-                    f"running/ready)"
+                    f"running/ready/watching)"
                 )
             # Notify optimizer: create a micro-card so it reacts in real-time
             _notify_optimizer_of_block(kb, conn, tid, reason, board)
@@ -776,6 +784,112 @@ def _handle_block(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_block failed")
         return tool_error(f"kanban_block: {e}")
+
+
+def _handle_watch(args: dict, **kw) -> str:
+    """Park the current task in healthy waiting until a trigger wakes it."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    trigger_type = args.get("trigger_type")
+    if not trigger_type:
+        return tool_error("trigger_type is required")
+    payload = args.get("payload")
+    if payload is not None and not isinstance(payload, dict):
+        return tool_error(f"payload must be an object/dict, got {type(payload).__name__}")
+    wake_status = str(args.get("wake_status") or "ready")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            route = kb.set_task_watching(
+                conn,
+                tid,
+                trigger_type=trigger_type,
+                trigger_key=args.get("trigger_key"),
+                reason=args.get("reason"),
+                payload=payload,
+                wake_status=wake_status,
+                created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                expected_run_id=_worker_run_id(tid),
+            )
+            if route is None:
+                return tool_error(f"could not watch {tid} (unknown id or incompatible status)")
+            return _ok(task_id=tid, route=kb.watch_route_to_dict(route))
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_watch: {e}")
+    except Exception as e:
+        logger.exception("kanban_watch failed")
+        return tool_error(f"kanban_watch: {e}")
+
+
+def _handle_trigger(args: dict, **kw) -> str:
+    """Wake active watch routes by id, task id, or trigger type/key."""
+    guard = _require_orchestrator_tool("kanban_trigger")
+    if guard:
+        return guard
+    payload = args.get("payload")
+    if payload is not None and not isinstance(payload, dict):
+        return tool_error(f"payload must be an object/dict, got {type(payload).__name__}")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            routes = kb.trigger_watch(
+                conn,
+                route_id=args.get("route_id"),
+                task_id=args.get("task_id"),
+                trigger_type=args.get("trigger_type"),
+                trigger_key=args.get("trigger_key"),
+                payload=payload,
+                actor=os.environ.get("HERMES_PROFILE") or "orchestrator",
+            )
+            return _ok(routes=[kb.watch_route_to_dict(route) for route in routes], count=len(routes))
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_trigger: {e}")
+    except Exception as e:
+        logger.exception("kanban_trigger failed")
+        return tool_error(f"kanban_trigger: {e}")
+
+
+def _handle_transition(args: dict, **kw) -> str:
+    """Move a card between semantic workflow stages after evidence validation."""
+    guard = _require_orchestrator_tool("kanban_transition")
+    if guard:
+        return guard
+    task_id = args.get("task_id")
+    to_stage = args.get("to_stage")
+    if not task_id or not to_stage:
+        return tool_error("task_id and to_stage are required")
+    evidence = args.get("evidence")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.transition_task_stage(
+                conn,
+                task_id,
+                to_stage=to_stage,
+                evidence=evidence,
+                action_key=args.get("action"),
+                actor=os.environ.get("HERMES_PROFILE") or "orchestrator",
+                board=board,
+            )
+            return _ok(task=_task_summary_dict(kb, conn, task))
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_transition: {e}")
+    except Exception as e:
+        logger.exception("kanban_transition failed")
+        return tool_error(f"kanban_transition: {e}")
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
@@ -1089,8 +1203,8 @@ KANBAN_LIST_SCHEMA = {
             "status": {
                 "type": "string",
                 "enum": [
-                    "triage", "todo", "ready", "running",
-                    "blocked", "done", "archived",
+                    "triage", "todo", "scheduled", "ready", "running",
+                    "watching", "blocked", "review", "done", "archived",
                 ],
                 "description": "Optional task status filter.",
             },
@@ -1269,6 +1383,104 @@ KANBAN_BLOCK_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": ["reason"],
+    },
+}
+
+KANBAN_WATCH_SCHEMA = {
+    "name": "kanban_watch",
+    "description": (
+        "Park your current task in healthy watching state until a future "
+        "event wakes it. Use this instead of blocking when no human decision "
+        "is needed and the right next step is to wait for an inbound event, "
+        "timer, dependency, webhook, or other route. The task leaves the "
+        "running claim, records a watch route, and will resume as the chosen "
+        "wake_status when kanban_trigger fires."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "trigger_type": {
+                "type": "string",
+                "description": (
+                    "Route family that wakes the task, e.g. inbound_event, "
+                    "timer, dependency, webhook, or manual. Use stable "
+                    "machine-readable keys, not prose."
+                ),
+            },
+            "trigger_key": {
+                "type": "string",
+                "description": "Optional route key/channel/id used to match the future event.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Human-readable waiting reason shown in the funnel/UI.",
+            },
+            "wake_status": {
+                "type": "string",
+                "enum": ["ready", "todo", "blocked", "review"],
+                "description": "Lifecycle status to set after the route fires. Defaults to ready.",
+            },
+            "payload": {
+                "type": "object",
+                "description": "Optional structured watch metadata for matching/routing.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["trigger_type"],
+    },
+}
+
+KANBAN_TRIGGER_SCHEMA = {
+    "name": "kanban_trigger",
+    "description": (
+        "Wake active watch routes by route id, task id, or trigger_type/key. "
+        "This is the event ingress surface for orchestrators/optimizers: "
+        "when an inbound event, timer, dependency, or webhook arrives, call "
+        "this to move matching watching cards back into executable lifecycle "
+        "state. Orchestrator-only — task workers do not see this tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "route_id": {"type": "integer", "description": "Specific watch route id to trigger."},
+            "task_id": {"type": "string", "description": "Wake active routes for a specific task."},
+            "trigger_type": {"type": "string", "description": "Route family to match."},
+            "trigger_key": {"type": "string", "description": "Optional route key/channel/id to match."},
+            "payload": {"type": "object", "description": "Structured event payload recorded on the route/event."},
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
+KANBAN_TRANSITION_SCHEMA = {
+    "name": "kanban_transition",
+    "description": (
+        "Move a card to another semantic workflow stage after evidence "
+        "validation. If the board workflow declares exit criteria, every "
+        "required evidence key must be present before the transition is "
+        "accepted. This changes semantic stage/action fields only; lifecycle "
+        "dispatch still runs through status/assignee/dependencies. "
+        "Orchestrator-only — task workers do not see this tool."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Task to move."},
+            "to_stage": {"type": "string", "description": "Target workflow stage key."},
+            "evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Evidence keys proving the transition. Required keys come from board workflow exit_criteria.",
+            },
+            "action": {"type": "string", "description": "Optional new semantic action key in the target stage."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "to_stage"],
     },
 }
 
@@ -1562,6 +1774,33 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_watch",
+    toolset="kanban",
+    schema=KANBAN_WATCH_SCHEMA,
+    handler=_handle_watch,
+    check_fn=_check_kanban_mode,
+    emoji="👀",
+)
+
+registry.register(
+    name="kanban_trigger",
+    toolset="kanban",
+    schema=KANBAN_TRIGGER_SCHEMA,
+    handler=_handle_trigger,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🔔",
+)
+
+registry.register(
+    name="kanban_transition",
+    toolset="kanban",
+    schema=KANBAN_TRANSITION_SCHEMA,
+    handler=_handle_transition,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🧭",
 )
 
 registry.register(

@@ -36,6 +36,7 @@ _STATUS_ICONS = {
     "todo":     "◻",
     "ready":    "▶",
     "running":  "●",
+    "watching": "◌",
     "scheduled":"⏱",
     "blocked":  "⊘",
     "done":     "✓",
@@ -102,6 +103,11 @@ def _parse_json_object_flag(raw: Optional[str], flag_name: str) -> tuple[Optiona
     text = str(raw).strip()
     if not text:
         return None, None
+    if text.startswith("@"):
+        try:
+            text = Path(text[1:]).expanduser().read_text(encoding="utf-8")
+        except OSError as exc:
+            return None, f"{flag_name}: could not read {text[1:]!r}: {exc}"
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -285,6 +291,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Switch to the new board after creating it")
     b_create.add_argument("--default-workdir", default=None,
                           help="Default workspace path for tasks created on this board")
+    b_create.add_argument("--workflow", default=None,
+                          help="JSON object or @file path defining semantic workflow stages")
 
     b_rm = boards_sub.add_parser(
         "rm", aliases=["remove", "delete"],
@@ -320,6 +328,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("slug")
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
+
+    b_workflow = boards_sub.add_parser(
+        "workflow",
+        help="Show or update a board's semantic workflow schema",
+    )
+    b_workflow_sub = b_workflow.add_subparsers(dest="workflow_action")
+    bw_show = b_workflow_sub.add_parser("show", help="Print board workflow JSON")
+    bw_show.add_argument("slug", nargs="?", default=None,
+                         help="Board slug (defaults to current board)")
+    bw_show.add_argument("--json", action="store_true")
+    bw_set = b_workflow_sub.add_parser("set", help="Set workflow from JSON or @file")
+    bw_set.add_argument("slug")
+    bw_set.add_argument("workflow", help="JSON object or @/path/to/workflow.json")
+    bw_clear = b_workflow_sub.add_parser("clear", help="Clear workflow schema")
+    bw_clear.add_argument("slug")
 
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
@@ -577,7 +600,51 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_schedule.add_argument("--ids", nargs="+", default=None,
                             help="Additional task ids to schedule with the same reason (bulk mode)")
 
-    p_unblock = sub.add_parser("unblock", help="Return one or more blocked/scheduled tasks to ready")
+    p_wait = sub.add_parser(
+        "wait",
+        help="Park a task in healthy watching state until a trigger fires",
+    )
+    p_wait.add_argument("task_id")
+    p_wait.add_argument("--trigger-type", required=True,
+                        help="Wake route type: inbound_event, timer, dependency, webhook, manual, etc.")
+    p_wait.add_argument("--trigger-key", default=None,
+                        help="Optional route key/channel/id used to match the future event")
+    p_wait.add_argument("--reason", default=None,
+                        help="Human-readable waiting reason shown in funnel/UI")
+    p_wait.add_argument("--wake-status", default="ready",
+                        choices=["ready", "todo", "blocked", "review"],
+                        help="Lifecycle status to set when triggered (default: ready)")
+    p_wait.add_argument("--payload", default=None,
+                        help="Optional JSON object with structured watch metadata")
+    p_wait.add_argument("--json", action="store_true")
+
+    p_trigger = sub.add_parser(
+        "trigger",
+        help="Trigger active watch routes and wake matching cards",
+    )
+    p_trigger.add_argument("--route-id", type=int, default=None)
+    p_trigger.add_argument("--task-id", default=None)
+    p_trigger.add_argument("--trigger-type", default=None)
+    p_trigger.add_argument("--trigger-key", default=None)
+    p_trigger.add_argument("--payload", default=None,
+                           help="Optional JSON object describing the event that fired")
+    p_trigger.add_argument("--actor", default=None)
+    p_trigger.add_argument("--json", action="store_true")
+
+    p_transition = sub.add_parser(
+        "transition",
+        help="Move a card to another semantic workflow stage after evidence validation",
+    )
+    p_transition.add_argument("task_id")
+    p_transition.add_argument("to_stage")
+    p_transition.add_argument("--evidence", action="append", default=[],
+                              help="Evidence key proving the transition (repeatable)")
+    p_transition.add_argument("--action", default=None,
+                              help="New semantic action key in the target stage")
+    p_transition.add_argument("--actor", default=None)
+    p_transition.add_argument("--json", action="store_true")
+
+    p_unblock = sub.add_parser("unblock", help="Return one or more blocked/scheduled/watching tasks to ready")
     p_unblock.add_argument("task_ids", nargs="+")
 
     p_promote = sub.add_parser(
@@ -996,6 +1063,9 @@ def kanban_command(args: argparse.Namespace) -> int:
         "edit":     _cmd_edit,
         "block":    _cmd_block,
         "schedule": _cmd_schedule,
+        "wait":     _cmd_wait,
+        "trigger":  _cmd_trigger,
+        "transition": _cmd_transition,
         "unblock":  _cmd_unblock,
         "promote":  _cmd_promote,
         "archive":  _cmd_archive,
@@ -1078,6 +1148,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "workflow":
+        return _cmd_boards_workflow(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1142,6 +1214,10 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
         print("kanban boards create: slug is required", file=sys.stderr)
         return 2
     already = kb.board_exists(normed) and normed != kb.DEFAULT_BOARD
+    workflow, workflow_error = _parse_json_object_flag(getattr(args, "workflow", None), "--workflow")
+    if workflow_error:
+        print(f"kanban boards create: {workflow_error}", file=sys.stderr)
+        return 2
     meta = kb.create_board(
         normed,
         name=args.name,
@@ -1149,6 +1225,7 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
         icon=args.icon,
         color=args.color,
         default_workdir=args.default_workdir,
+        workflow=workflow,
     )
     verb = "already exists" if already else "created"
     print(f"Board {meta['slug']!r} {verb}.")
@@ -1251,6 +1328,42 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
     else:
         print(f"Board {normed!r} default workdir cleared.")
     return 0
+
+
+def _cmd_boards_workflow(args: argparse.Namespace) -> int:
+    sub = getattr(args, "workflow_action", None) or "show"
+    slug = getattr(args, "slug", None) or kb.get_current_board()
+    try:
+        normed = kb._normalize_board_slug(slug)
+    except ValueError as exc:
+        print(f"kanban boards workflow: {exc}", file=sys.stderr)
+        return 2
+    if not normed or not kb.board_exists(normed):
+        print(f"kanban boards workflow: board {slug!r} does not exist", file=sys.stderr)
+        return 1
+    if sub == "show":
+        workflow = kb.read_board_metadata(normed).get("workflow")
+        if getattr(args, "json", False):
+            print(json.dumps(workflow, indent=2, ensure_ascii=False))
+        elif workflow:
+            print(json.dumps(workflow, indent=2, ensure_ascii=False))
+        else:
+            print(f"Board {normed!r} has no workflow schema.")
+        return 0
+    if sub == "set":
+        workflow, error = _parse_json_object_flag(getattr(args, "workflow", None), "workflow")
+        if error:
+            print(f"kanban boards workflow set: {error}", file=sys.stderr)
+            return 2
+        meta = kb.write_board_metadata(normed, workflow=workflow)
+        print(f"Board {normed!r} workflow set to {meta['workflow'].get('id')!r}.")
+        return 0
+    if sub == "clear":
+        kb.write_board_metadata(normed, workflow=None)
+        print(f"Board {normed!r} workflow cleared.")
+        return 0
+    print(f"kanban boards workflow: unknown action {sub!r}", file=sys.stderr)
+    return 2
 
 
 # ---------------------------------------------------------------------------
@@ -1532,6 +1645,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        watch_routes = kb.list_watch_routes(conn, args.task_id)
         # Workers hand off via ``task_runs.summary`` (kanban-worker skill);
         # ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
@@ -1544,6 +1658,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
+            "watch_routes": [kb.watch_route_to_dict(route) for route in watch_routes],
             "comments": [
                 {"author": c.author, "body": c.body, "created_at": c.created_at}
                 for c in comments
@@ -1641,6 +1756,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  parents:   {', '.join(parents)}")
     if children:
         print(f"  children:  {', '.join(children)}")
+    if watch_routes:
+        print()
+        print(f"Watch routes ({len(watch_routes)}):")
+        for route in watch_routes:
+            state = "active" if route.active else "inactive"
+            key = f":{route.trigger_key}" if route.trigger_key else ""
+            print(
+                f"  #{route.id} {state} {route.trigger_type}{key} -> {route.wake_status}"
+                + (f" — {route.reason}" if route.reason else "")
+            )
     if task.body:
         print()
         print("Body:")
@@ -2051,6 +2176,78 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_wait(args: argparse.Namespace) -> int:
+    payload, payload_error = _parse_json_object_flag(getattr(args, "payload", None), "--payload")
+    if payload_error:
+        print(f"kanban wait: {payload_error}", file=sys.stderr)
+        return 2
+    with kb.connect() as conn:
+        route = kb.set_task_watching(
+            conn,
+            args.task_id,
+            trigger_type=args.trigger_type,
+            trigger_key=args.trigger_key,
+            reason=args.reason,
+            payload=payload,
+            wake_status=args.wake_status,
+            created_by=_profile_author(),
+            expected_run_id=_worker_run_id_for(args.task_id),
+        )
+    if route is None:
+        print(f"cannot watch {args.task_id} (unknown task or incompatible status)", file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(kb.watch_route_to_dict(route), indent=2, ensure_ascii=False))
+    else:
+        key = f":{route.trigger_key}" if route.trigger_key else ""
+        print(f"Watching {route.task_id} via {route.trigger_type}{key} -> {route.wake_status}")
+    return 0
+
+
+def _cmd_trigger(args: argparse.Namespace) -> int:
+    payload, payload_error = _parse_json_object_flag(getattr(args, "payload", None), "--payload")
+    if payload_error:
+        print(f"kanban trigger: {payload_error}", file=sys.stderr)
+        return 2
+    with kb.connect() as conn:
+        routes = kb.trigger_watch(
+            conn,
+            route_id=getattr(args, "route_id", None),
+            task_id=getattr(args, "task_id", None),
+            trigger_type=getattr(args, "trigger_type", None),
+            trigger_key=getattr(args, "trigger_key", None),
+            payload=payload,
+            actor=getattr(args, "actor", None) or _profile_author(),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps([kb.watch_route_to_dict(route) for route in routes], indent=2, ensure_ascii=False))
+    else:
+        if not routes:
+            print("No active watch routes matched.")
+        for route in routes:
+            print(f"Triggered watch route #{route.id} for {route.task_id}")
+    return 0
+
+
+def _cmd_transition(args: argparse.Namespace) -> int:
+    evidence = list(getattr(args, "evidence", None) or [])
+    with kb.connect() as conn:
+        task = kb.transition_task_stage(
+            conn,
+            args.task_id,
+            to_stage=args.to_stage,
+            evidence=evidence,
+            action_key=getattr(args, "action", None),
+            actor=getattr(args, "actor", None) or _profile_author(),
+            board=getattr(args, "board", None),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+    else:
+        print(f"Transitioned {task.id} to stage={task.stage_key}" + (f" action={task.action_key}" if task.action_key else ""))
+    return 0
+
+
 def _cmd_unblock(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     if not ids:
@@ -2061,7 +2258,7 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         for tid in ids:
             if not kb.unblock_task(conn, tid):
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                print(f"cannot unblock {tid} (not blocked/scheduled/watching?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}")
     return 0 if not failed else 1
@@ -2413,7 +2610,7 @@ def _cmd_stats(args: argparse.Namespace) -> int:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
         return 0
     print("By status:")
-    for k in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
+    for k in ("triage", "todo", "scheduled", "ready", "running", "watching", "blocked", "review", "done"):
         print(f"  {k:8s}  {stats['by_status'].get(k, 0)}")
     if stats["by_assignee"]:
         print("\nBy assignee:")

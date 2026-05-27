@@ -97,7 +97,13 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "running", "watching",
+    "blocked", "review", "done", "archived",
+}
+# New cards should not be born in ``watching`` because a healthy watching
+# card needs an active task_watch_routes row. Use set_task_watching()/
+# ``hermes kanban wait``/``kanban_watch`` after creation or during a run.
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -397,6 +403,127 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+def _workflow_list_keys(items: Any, *, field: str) -> list[dict]:
+    """Normalize workflow lists that may contain strings or object rows."""
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        raise ValueError(f"workflow.{field} must be a list")
+    out: list[dict] = []
+    seen: set[str] = set()
+    for idx, item in enumerate(items):
+        if isinstance(item, str):
+            key = item.strip()
+            row: dict[str, Any] = {"key": key}
+        elif isinstance(item, dict):
+            row = dict(item)
+            key = str(row.get("key") or row.get("id") or "").strip()
+            row["key"] = key
+        else:
+            raise ValueError(f"workflow.{field}[{idx}] must be a string or object")
+        if not key:
+            raise ValueError(f"workflow.{field}[{idx}].key is required")
+        if key in seen:
+            raise ValueError(f"workflow.{field} contains duplicate key {key!r}")
+        seen.add(key)
+        out.append(row)
+    return out
+
+
+def normalize_workflow_definition(workflow: Optional[Any]) -> Optional[dict]:
+    """Validate and normalize a board-level semantic workflow definition.
+
+    The workflow is deliberately generic: board authors define stage keys,
+    substates, actions, triggers, and exit evidence. The kernel enforces
+    shape and declared stage/action references, not any domain vocabulary.
+    """
+    if workflow is None:
+        return None
+    if isinstance(workflow, str):
+        stripped = workflow.strip()
+        if not stripped:
+            return None
+        try:
+            workflow = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"workflow must be a JSON object: {exc}") from exc
+    if not isinstance(workflow, dict):
+        raise ValueError(f"workflow must be an object/dict, got {type(workflow).__name__}")
+    out = dict(workflow)
+    out["id"] = str(out.get("id") or "workflow").strip() or "workflow"
+    stages = _workflow_list_keys(out.get("stages"), field="stages")
+    if not stages:
+        raise ValueError("workflow.stages must contain at least one stage")
+    stage_keys = {stage["key"] for stage in stages}
+    normalized_stages: list[dict] = []
+    for stage in stages:
+        row = dict(stage)
+        if "label" in row and row["label"] is not None:
+            row["label"] = str(row["label"])
+        if "allowed_lifecycle_states" in row:
+            states = row.get("allowed_lifecycle_states") or []
+            if not isinstance(states, list):
+                raise ValueError(
+                    f"workflow stage {row['key']!r} allowed_lifecycle_states must be a list"
+                )
+            bad = [str(s) for s in states if str(s) not in VALID_STATUSES]
+            if bad:
+                raise ValueError(
+                    f"workflow stage {row['key']!r} has invalid lifecycle states: "
+                    + ", ".join(bad)
+                )
+            row["allowed_lifecycle_states"] = [str(s) for s in states]
+        row["substates"] = _workflow_list_keys(row.get("substates"), field=f"stages.{row['key']}.substates")
+        row["actions"] = _workflow_list_keys(row.get("actions"), field=f"stages.{row['key']}.actions")
+        triggers = row.get("triggers") or []
+        if not isinstance(triggers, list):
+            raise ValueError(f"workflow stage {row['key']!r} triggers must be a list")
+        row["triggers"] = [dict(t) if isinstance(t, dict) else {"type": str(t)} for t in triggers]
+        exits = row.get("exit_criteria") or []
+        if not isinstance(exits, list):
+            raise ValueError(f"workflow stage {row['key']!r} exit_criteria must be a list")
+        normalized_exits: list[dict] = []
+        for idx, item in enumerate(exits):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"workflow stage {row['key']!r} exit_criteria[{idx}] must be an object"
+                )
+            exit_row = dict(item)
+            transition = str(exit_row.get("transition") or exit_row.get("to") or "").strip()
+            if not transition:
+                raise ValueError(
+                    f"workflow stage {row['key']!r} exit_criteria[{idx}].transition is required"
+                )
+            if transition not in stage_keys:
+                raise ValueError(
+                    f"workflow stage {row['key']!r} exits to unknown stage {transition!r}"
+                )
+            evidence = exit_row.get("evidence_required") or []
+            if isinstance(evidence, str):
+                evidence = [evidence]
+            if not isinstance(evidence, list):
+                raise ValueError(
+                    f"workflow stage {row['key']!r} exit_criteria[{idx}].evidence_required must be a list"
+                )
+            exit_row["transition"] = transition
+            exit_row["evidence_required"] = [str(e).strip() for e in evidence if str(e).strip()]
+            normalized_exits.append(exit_row)
+        row["exit_criteria"] = normalized_exits
+        normalized_stages.append(row)
+    out["stages"] = normalized_stages
+    return out
+
+
+def _workflow_stage_map(workflow: Optional[dict]) -> dict[str, dict]:
+    if not isinstance(workflow, dict):
+        return {}
+    return {
+        str(stage.get("key")): stage
+        for stage in workflow.get("stages") or []
+        if isinstance(stage, dict) and stage.get("key")
+    }
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """Return ``board.json`` contents (or synthesized defaults).
 
@@ -413,6 +540,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "icon": "",
         "color": "",
         "default_workdir": None,
+        "workflow": None,
         "created_at": None,
         "archived": False,
     }
@@ -424,8 +552,10 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 # Never let the metadata file claim a different slug than
                 # its directory — trust the filesystem.
                 raw["slug"] = slug
+                if raw.get("workflow") is not None:
+                    raw["workflow"] = normalize_workflow_definition(raw.get("workflow"))
                 meta.update(raw)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, ValueError):
         pass
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
@@ -440,6 +570,7 @@ def write_board_metadata(
     color: Optional[str] = None,
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
+    workflow: Any = _UNSET,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -463,6 +594,8 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
+    if workflow is not _UNSET:
+        meta["workflow"] = normalize_workflow_definition(workflow)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -483,6 +616,7 @@ def create_board(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
+    workflow: Optional[Any] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -500,6 +634,7 @@ def create_board(
         icon=icon,
         color=color,
         default_workdir=default_workdir,
+        workflow=workflow if workflow is not None else _UNSET,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
@@ -829,6 +964,57 @@ class Event:
     run_id: Optional[int] = None
 
 
+@dataclass
+class WatchRoute:
+    """Event route that wakes a task parked in the healthy ``watching`` state."""
+
+    id: int
+    task_id: str
+    trigger_type: str
+    trigger_key: Optional[str]
+    wake_status: str
+    reason: Optional[str]
+    payload: Optional[dict]
+    active: bool
+    created_by: Optional[str]
+    created_at: int
+    triggered_at: Optional[int]
+    trigger_payload: Optional[dict]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "WatchRoute":
+        payload = None
+        if row["payload"]:
+            try:
+                parsed = json.loads(row["payload"])
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except Exception:
+                payload = None
+        trigger_payload = None
+        if row["trigger_payload"]:
+            try:
+                parsed = json.loads(row["trigger_payload"])
+                if isinstance(parsed, dict):
+                    trigger_payload = parsed
+            except Exception:
+                trigger_payload = None
+        return cls(
+            id=int(row["id"]),
+            task_id=row["task_id"],
+            trigger_type=row["trigger_type"],
+            trigger_key=row["trigger_key"],
+            wake_status=row["wake_status"],
+            reason=row["reason"],
+            payload=payload,
+            active=bool(row["active"]),
+            created_by=row["created_by"],
+            created_at=int(row["created_at"]),
+            triggered_at=(int(row["triggered_at"]) if row["triggered_at"] is not None else None),
+            trigger_payload=trigger_payload,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -969,6 +1155,24 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Event-driven wake routes for cards in the healthy waiting state.
+-- A route is active while the card is ``status='watching'`` and becomes
+-- inactive once a matching event/timer/dependency/manual trigger wakes it.
+CREATE TABLE IF NOT EXISTS task_watch_routes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id         TEXT NOT NULL,
+    trigger_type    TEXT NOT NULL,
+    trigger_key     TEXT,
+    wake_status     TEXT NOT NULL DEFAULT 'ready',
+    reason          TEXT,
+    payload         TEXT,
+    active          INTEGER NOT NULL DEFAULT 1,
+    created_by      TEXT,
+    created_at      INTEGER NOT NULL,
+    triggered_at    INTEGER,
+    trigger_payload TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -978,6 +1182,8 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_watch_task            ON task_watch_routes(task_id, active);
+CREATE INDEX IF NOT EXISTS idx_watch_trigger         ON task_watch_routes(trigger_type, trigger_key, active);
 """
 
 
@@ -1825,6 +2031,65 @@ def _normalize_funnel_data(value: Optional[Any]) -> Optional[dict]:
     return value
 
 
+def _validate_task_against_workflow(
+    board: Optional[str],
+    *,
+    stage_key: Optional[str],
+    action_key: Optional[str] = None,
+    lifecycle_status: Optional[str] = None,
+) -> None:
+    """Validate declared semantic fields against the board workflow when set."""
+    workflow = read_board_metadata(board).get("workflow")
+    if not isinstance(workflow, dict):
+        return
+    stages = _workflow_stage_map(workflow)
+    if workflow.get("require_semantics") and not stage_key:
+        raise ValueError("board workflow requires stage_key/--stage on tasks")
+    if not stage_key:
+        return
+    if stage_key not in stages:
+        raise ValueError(
+            f"stage_key {stage_key!r} is not defined in board workflow "
+            f"{workflow.get('id')!r}"
+        )
+    stage = stages[stage_key]
+    allowed = stage.get("allowed_lifecycle_states") or []
+    if lifecycle_status and allowed and lifecycle_status not in allowed:
+        raise ValueError(
+            f"workflow stage {stage_key!r} does not allow lifecycle status "
+            f"{lifecycle_status!r}"
+        )
+    if action_key:
+        actions = {str(a.get("key")) for a in stage.get("actions") or [] if isinstance(a, dict)}
+        if actions and action_key not in actions:
+            raise ValueError(
+                f"action_key {action_key!r} is not defined for workflow stage {stage_key!r}"
+            )
+
+
+def _evidence_keys(evidence: Optional[Any]) -> set[str]:
+    """Normalize evidence provided by callers/metadata into comparable keys."""
+    if evidence is None:
+        return set()
+    if isinstance(evidence, dict):
+        return {str(k).strip() for k, v in evidence.items() if str(k).strip() and v}
+    if isinstance(evidence, str):
+        return {evidence.strip()} if evidence.strip() else set()
+    if isinstance(evidence, (list, tuple, set)):
+        return {str(item).strip() for item in evidence if str(item).strip()}
+    return {str(evidence).strip()} if str(evidence).strip() else set()
+
+
+def _funnel_transition_state(data: Optional[dict]) -> dict:
+    if isinstance(data, dict):
+        existing = data.get("transition_evidence")
+        return {
+            "evidence": set(data.get("transition_evidence", []) if isinstance(existing, list) else []),
+            "data": dict(data),
+        }
+    return {"evidence": set(), "data": {}}
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2023,6 +2288,13 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
+                _validate_task_against_workflow(
+                    board,
+                    stage_key=stage_key,
+                    action_key=action_key,
+                    lifecycle_status=task_status,
+                )
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -2144,6 +2416,13 @@ def update_task_funnel_fields(
             next_funnel_data = {**current.funnel_data, **normalized}
         else:
             next_funnel_data = normalized
+
+    _validate_task_against_workflow(
+        None,
+        stage_key=next_stage,
+        action_key=next_action,
+        lifecycle_status=current.status,
+    )
 
     with write_txn(conn):
         row = conn.execute(
@@ -3349,7 +3628,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'watching')
                 """,
                 (result, now, task_id),
             )
@@ -3364,13 +3643,18 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'watching')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
+        conn.execute(
+            "UPDATE task_watch_routes SET active = 0, triggered_at = COALESCE(triggered_at, ?) "
+            "WHERE task_id = ? AND active = 1",
+            (now, task_id),
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -3773,7 +4057,7 @@ def block_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'watching')
                 """,
                 (task_id,),
             )
@@ -3786,13 +4070,18 @@ def block_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'watching')
                    AND current_run_id = ?
                 """,
                 (task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
+        conn.execute(
+            "UPDATE task_watch_routes SET active = 0, triggered_at = COALESCE(triggered_at, ?) "
+            "WHERE task_id = ? AND active = 1",
+            (int(time.time()), task_id),
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="blocked", status="blocked",
@@ -3882,7 +4171,7 @@ def promote_task(
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Transition ``blocked``/``scheduled`` -> ready or todo.
+    """Transition ``blocked``/``scheduled``/``watching`` -> ready or todo.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -3894,7 +4183,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled', 'watching')",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -3909,12 +4198,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        # Re-gate on parent completion before flipping 'blocked' back to
-        # 'ready'. Unconditionally setting status='ready' here bypasses the
-        # parent-completion invariant (the dispatcher trusts that column);
-        # if parents are still in progress the task must wait in 'todo'
-        # until recompute_ready picks it up. RCA: Bug 2 at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        # Re-gate on parent completion before flipping back to 'ready'.
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
@@ -3925,16 +4209,359 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "WHERE id = ? AND status IN ('blocked', 'scheduled', 'watching')",
             (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
+        conn.execute(
+            "UPDATE task_watch_routes SET active = 0, triggered_at = COALESCE(triggered_at, ?) "
+            "WHERE task_id = ? AND active = 1",
+            (now, task_id),
+        )
         _append_event(
             conn, task_id, "unblocked",
             {"status": new_status} if new_status != "ready" else None,
         )
         return True
+
+
+def _normalize_watch_payload(value: Optional[Any], *, field: str) -> Optional[dict]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            value = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{field} must be a JSON object: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be a JSON object/dict, got {type(value).__name__}")
+    return value
+
+
+def _normalize_trigger_type(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not text:
+        raise ValueError("trigger_type is required")
+    if not re.match(r"^[a-z0-9_:.]+$", text):
+        raise ValueError("trigger_type may contain only letters, digits, _, :, and .")
+    return text
+
+
+def list_watch_routes(
+    conn: sqlite3.Connection,
+    task_id: Optional[str] = None,
+    *,
+    active: Optional[bool] = None,
+) -> list[WatchRoute]:
+    query = "SELECT * FROM task_watch_routes WHERE 1=1"
+    params: list[Any] = []
+    if task_id is not None:
+        query += " AND task_id = ?"
+        params.append(task_id)
+    if active is not None:
+        query += " AND active = ?"
+        params.append(1 if active else 0)
+    query += " ORDER BY active DESC, created_at DESC, id DESC"
+    return [WatchRoute.from_row(row) for row in conn.execute(query, tuple(params)).fetchall()]
+
+
+def watch_route_to_dict(route: WatchRoute) -> dict[str, Any]:
+    return {
+        "id": route.id,
+        "task_id": route.task_id,
+        "trigger_type": route.trigger_type,
+        "trigger_key": route.trigger_key,
+        "wake_status": route.wake_status,
+        "reason": route.reason,
+        "payload": route.payload,
+        "active": route.active,
+        "created_by": route.created_by,
+        "created_at": route.created_at,
+        "triggered_at": route.triggered_at,
+        "trigger_payload": route.trigger_payload,
+    }
+
+
+def set_task_watching(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    trigger_type: str,
+    trigger_key: Optional[str] = None,
+    reason: Optional[str] = None,
+    payload: Optional[dict] = None,
+    wake_status: str = "ready",
+    created_by: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> Optional[WatchRoute]:
+    """Park a task in healthy waiting and register the event that wakes it."""
+    trigger_type = _normalize_trigger_type(trigger_type)
+    trigger_key = _normalize_funnel_text(trigger_key)
+    payload = _normalize_watch_payload(payload, field="payload")
+    if wake_status not in {"ready", "todo", "blocked", "review"}:
+        raise ValueError("wake_status must be one of ['blocked', 'ready', 'review', 'todo']")
+    now = int(time.time())
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT current_run_id, funnel_data, assignee FROM tasks "
+            "WHERE id = ? AND status IN ('running', 'ready', 'todo', 'scheduled', 'blocked', 'watching')",
+            (task_id,),
+        ).fetchone()
+        if existing is None:
+            return None
+        current_run_id = existing["current_run_id"]
+        if expected_run_id is not None and (
+            current_run_id is None or int(current_run_id) != int(expected_run_id)
+        ):
+            return None
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="watching",
+            status="watching",
+            summary=reason,
+            metadata={
+                "watch": {
+                    "trigger_type": trigger_type,
+                    "trigger_key": trigger_key,
+                    "wake_status": wake_status,
+                },
+                **({"watch_payload": payload} if payload else {}),
+            },
+        )
+        conn.execute(
+            "UPDATE task_watch_routes SET active = 0, triggered_at = COALESCE(triggered_at, ?) "
+            "WHERE task_id = ? AND active = 1",
+            (now, task_id),
+        )
+        funnel_data: dict[str, Any] = {}
+        if existing["funnel_data"]:
+            try:
+                parsed_funnel = json.loads(existing["funnel_data"])
+                if isinstance(parsed_funnel, dict):
+                    funnel_data = parsed_funnel
+            except Exception:
+                funnel_data = {}
+        funnel_data.setdefault("substate", "watching")
+        funnel_data["next_expected_event"] = (
+            f"{trigger_type}:{trigger_key}" if trigger_key else trigger_type
+        )
+        funnel_data["watch"] = {
+            "trigger_type": trigger_type,
+            "trigger_key": trigger_key,
+            "wake_status": wake_status,
+        }
+        funnel_data["owner"] = existing["assignee"]
+        if reason:
+            funnel_data["last_meaningful_event"] = reason
+        conn.execute(
+            "UPDATE tasks SET status = 'watching', claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, current_run_id = NULL, funnel_data = ? WHERE id = ?",
+            (json.dumps(funnel_data, ensure_ascii=False), task_id),
+        )
+        cur = conn.execute(
+            """
+            INSERT INTO task_watch_routes (
+                task_id, trigger_type, trigger_key, wake_status, reason,
+                payload, active, created_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                task_id,
+                trigger_type,
+                trigger_key,
+                wake_status,
+                reason,
+                json.dumps(payload, ensure_ascii=False) if payload else None,
+                created_by,
+                now,
+            ),
+        )
+        route_id = int(cur.lastrowid)
+        event_payload = {
+            "route_id": route_id,
+            "trigger_type": trigger_type,
+            "trigger_key": trigger_key,
+            "wake_status": wake_status,
+            "reason": reason,
+        }
+        if payload:
+            event_payload["payload"] = payload
+        _append_event(conn, task_id, "watching", event_payload, run_id=run_id)
+        row = conn.execute("SELECT * FROM task_watch_routes WHERE id = ?", (route_id,)).fetchone()
+        return WatchRoute.from_row(row)
+
+
+def _dependency_gated_wake_status(conn: sqlite3.Connection, task_id: str, requested: str) -> str:
+    if requested != "ready":
+        return requested
+    undone = conn.execute(
+        "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return "todo" if undone else "ready"
+
+
+def trigger_watch(
+    conn: sqlite3.Connection,
+    *,
+    route_id: Optional[int] = None,
+    task_id: Optional[str] = None,
+    trigger_type: Optional[str] = None,
+    trigger_key: Optional[str] = None,
+    payload: Optional[dict] = None,
+    actor: Optional[str] = None,
+) -> list[WatchRoute]:
+    """Wake active watch routes by id, task id, or trigger type/key."""
+    payload = _normalize_watch_payload(payload, field="payload")
+    where = ["active = 1"]
+    params: list[Any] = []
+    if route_id is not None:
+        where.append("id = ?")
+        params.append(int(route_id))
+    if task_id is not None:
+        where.append("task_id = ?")
+        params.append(task_id)
+    if trigger_type is not None:
+        where.append("trigger_type = ?")
+        params.append(_normalize_trigger_type(trigger_type))
+    if trigger_key is not None:
+        where.append("trigger_key = ?")
+        params.append(_normalize_funnel_text(trigger_key))
+    if route_id is None and task_id is None and trigger_type is None:
+        raise ValueError("route_id, task_id, or trigger_type is required")
+    now = int(time.time())
+    triggered: list[WatchRoute] = []
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT * FROM task_watch_routes WHERE " + " AND ".join(where) + " ORDER BY id",
+            tuple(params),
+        ).fetchall()
+        for row in rows:
+            route = WatchRoute.from_row(row)
+            new_status = _dependency_gated_wake_status(conn, route.task_id, route.wake_status)
+            upd = conn.execute(
+                "UPDATE task_watch_routes SET active = 0, triggered_at = ?, trigger_payload = ? "
+                "WHERE id = ? AND active = 1",
+                (
+                    now,
+                    json.dumps(payload, ensure_ascii=False) if payload else None,
+                    route.id,
+                ),
+            )
+            if upd.rowcount != 1:
+                continue
+            task_row = conn.execute(
+                "SELECT funnel_data FROM tasks WHERE id = ?",
+                (route.task_id,),
+            ).fetchone()
+            funnel_data: dict[str, Any] = {}
+            if task_row and task_row["funnel_data"]:
+                try:
+                    parsed_funnel = json.loads(task_row["funnel_data"])
+                    if isinstance(parsed_funnel, dict):
+                        funnel_data = parsed_funnel
+                except Exception:
+                    funnel_data = {}
+            funnel_data["substate"] = "triggered"
+            funnel_data["last_meaningful_event"] = (
+                f"watch_triggered:{route.trigger_type}"
+                + (f":{route.trigger_key}" if route.trigger_key else "")
+            )
+            if isinstance(funnel_data.get("watch"), dict):
+                funnel_data["watch"] = {**funnel_data["watch"], "active": False, "triggered_at": now}
+            task_upd = conn.execute(
+                "UPDATE tasks SET status = ?, current_run_id = NULL, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, funnel_data = ? "
+                "WHERE id = ? AND status = 'watching'",
+                (new_status, json.dumps(funnel_data, ensure_ascii=False), route.task_id),
+            )
+            event_payload = {
+                "route_id": route.id,
+                "trigger_type": route.trigger_type,
+                "trigger_key": route.trigger_key,
+                "wake_status": new_status,
+                "actor": actor,
+                "task_status_changed": bool(task_upd.rowcount),
+            }
+            if payload:
+                event_payload["payload"] = payload
+            _append_event(conn, route.task_id, "watch_triggered", event_payload)
+            triggered_row = conn.execute("SELECT * FROM task_watch_routes WHERE id = ?", (route.id,)).fetchone()
+            triggered.append(WatchRoute.from_row(triggered_row))
+    return triggered
+
+
+def transition_task_stage(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    to_stage: str,
+    evidence: Optional[Any] = None,
+    action_key: Optional[str] = None,
+    actor: Optional[str] = None,
+    board: Optional[str] = None,
+) -> Task:
+    """Move a card to another semantic workflow stage after evidence validation."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError(f"unknown task: {task_id}")
+    to_stage = _normalize_funnel_text(to_stage) or ""
+    if not to_stage:
+        raise ValueError("to_stage is required")
+    workflow = read_board_metadata(board).get("workflow")
+    stages = _workflow_stage_map(workflow if isinstance(workflow, dict) else None)
+    if stages and to_stage not in stages:
+        raise ValueError(f"target stage {to_stage!r} is not defined in board workflow")
+    current_stage = task.stage_key
+    required: list[str] = []
+    if stages and current_stage in stages:
+        exits = stages[current_stage].get("exit_criteria") or []
+        matching = [e for e in exits if isinstance(e, dict) and e.get("transition") == to_stage]
+        if not matching:
+            raise ValueError(f"workflow has no transition from {current_stage!r} to {to_stage!r}")
+        required = list(matching[0].get("evidence_required") or [])
+    provided = _evidence_keys(evidence)
+    state = _funnel_transition_state(task.funnel_data)
+    merged_evidence = {str(e) for e in state["evidence"]} | provided
+    missing = [item for item in required if item not in merged_evidence]
+    if missing:
+        raise ValueError("missing transition evidence: " + ", ".join(missing))
+    next_data = state["data"]
+    if merged_evidence:
+        next_data["transition_evidence"] = sorted(merged_evidence)
+    next_data["missing_evidence"] = []
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET stage_key = ?, action_key = ?, funnel_data = ? WHERE id = ?",
+            (
+                to_stage,
+                _normalize_funnel_text(action_key),
+                json.dumps(next_data, ensure_ascii=False) if next_data else None,
+                task_id,
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "stage_transitioned",
+            {
+                "from_stage": current_stage,
+                "to_stage": to_stage,
+                "action_key": _normalize_funnel_text(action_key),
+                "evidence": sorted(provided),
+                "actor": actor,
+            },
+        )
+    updated = get_task(conn, task_id)
+    if updated is None:
+        raise ValueError(f"unknown task after transition: {task_id}")
+    return updated
 
 
 def specify_triage_task(
@@ -6500,7 +7127,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 # Funnel read-model helpers
 # ---------------------------------------------------------------------------
 
-_FUNNEL_WAITING_STATUSES = {"triage", "todo", "scheduled", "review"}
+_FUNNEL_WAITING_STATUSES = {"triage", "todo", "scheduled", "watching", "review"}
 _FUNNEL_ACTIVE_STATUSES = {"ready", "running"}
 _FUNNEL_FAILURE_OUTCOMES = {
     "crashed", "timed_out", "spawn_failed", "gave_up", "failed"
@@ -6743,15 +7370,17 @@ def _funnel_cycle_seconds(task: Task, runs: list[Run]) -> Optional[int]:
 
 
 def _funnel_latest_blocker(task: Task, events: list[Event]) -> Optional[dict]:
-    if task.status not in {"blocked", "scheduled"}:
+    if task.status not in {"blocked", "scheduled", "watching"}:
         return None
+    event_kinds = {"blocked", "scheduled", "watching", "watch_triggered", "gave_up", "spawn_auto_blocked"}
     for event in reversed(events):
-        if event.kind not in {"blocked", "scheduled", "gave_up", "spawn_auto_blocked"}:
+        if event.kind not in event_kinds:
             continue
         payload = event.payload if isinstance(event.payload, dict) else {}
         reason = (
             payload.get("reason") or payload.get("error") or
-            payload.get("message") or payload.get("summary")
+            payload.get("message") or payload.get("summary") or
+            payload.get("trigger_type") or payload.get("wake_status")
         )
         return {
             "task_id": task.id,
@@ -6874,6 +7503,9 @@ def build_funnel_read_model(
     links = conn.execute(
         "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
     ).fetchall()
+    watch_routes_by_task: dict[str, list[dict]] = {}
+    for route in list_watch_routes(conn, active=True):
+        watch_routes_by_task.setdefault(route.task_id, []).append(watch_route_to_dict(route))
     parents_by_child: dict[str, list[str]] = {}
     children_by_parent: dict[str, list[str]] = {}
     for link in links:
@@ -6907,6 +7539,7 @@ def build_funnel_read_model(
                 "metrics": {
                     "total_cards": 0,
                     "waiting_cards": 0,
+                    "watching_cards": 0,
                     "active_cards": 0,
                     "blocked_cards": 0,
                     "done_cards": 0,
@@ -6956,6 +7589,7 @@ def build_funnel_read_model(
         latest_run = runs[-1] if runs else None
         parents = parents_by_child.get(task.id, [])
         children = children_by_parent.get(task.id, [])
+        watch_routes = watch_routes_by_task.get(task.id, [])
 
         status_counts = stage["counts_by_status"]
         status_counts[task.status] = int(status_counts.get(task.status, 0)) + 1
@@ -6968,6 +7602,8 @@ def build_funnel_read_model(
         metrics["total_cards"] += 1
         if task.status in _FUNNEL_WAITING_STATUSES:
             metrics["waiting_cards"] += 1
+        if task.status == "watching":
+            metrics["watching_cards"] += 1
         if task.status in _FUNNEL_ACTIVE_STATUSES:
             metrics["active_cards"] += 1
         if task.status == "blocked":
@@ -7019,6 +7655,15 @@ def build_funnel_read_model(
             ),
             "parents": parents,
             "children": children,
+            "watch_routes": watch_routes,
+            "runtime": {
+                "lifecycle_status": task.status,
+                "waiting_reason": watch_routes[0].get("reason") if watch_routes else None,
+                "next_expected_event": (
+                    watch_routes[0].get("trigger_type") if watch_routes else None
+                ),
+                "owner": task.assignee,
+            },
             "semantic": node,
             "funnel_data": task.funnel_data,
             "signals": {
@@ -7191,6 +7836,7 @@ def build_funnel_read_model(
             count for status, count in summary_status.items()
             if status in _FUNNEL_WAITING_STATUSES
         ),
+        "watching_cards": summary_status.get("watching", 0),
         "blocked_cards": summary_status.get("blocked", 0),
         "done_cards": summary_status.get("done", 0),
         "entity_count": sum(
@@ -7212,6 +7858,7 @@ def build_funnel_read_model(
     out = {
         "version": 1,
         "board": board_slug,
+        "workflow": read_board_metadata(board_slug).get("workflow"),
         "generated_at": int(time.time()),
         "include_archived": include_archived,
         "filters": {

@@ -771,6 +771,32 @@ def handle_function_call(
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
 
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            try:
+                from agent.approach_gate import check_approach_gate
+
+                approach_block_message = check_approach_gate(function_name, function_args)
+                if approach_block_message is not None:
+                    return json.dumps({"error": approach_block_message}, ensure_ascii=False)
+            except Exception as _approach_gate_err:
+                logger.debug("kanban approach gate error: %s", _approach_gate_err)
+
+        # Action gate — hard approval system for irreversible actions.
+        # Fires for ALL sessions (not just kanban workers). Returns an error
+        # string if the action is blocked/denied/timed-out, None if allowed.
+        try:
+            from agent.action_gate import check_action_gate
+
+            action_gate_result = check_action_gate(
+                function_name, function_args,
+                session_id=session_id,
+                task_id=task_id,
+            )
+            if action_gate_result is not None:
+                return json.dumps({"error": action_gate_result}, ensure_ascii=False)
+        except Exception as _action_gate_err:
+            logger.debug("action gate error: %s", _action_gate_err)
+
         # Check plugin hooks for a block directive (unless caller already
         # checked — e.g. run_agent._invoke_tool passes skip=True to
         # avoid double-firing the hook).
