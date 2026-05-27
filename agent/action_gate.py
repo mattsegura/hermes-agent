@@ -46,7 +46,10 @@ _log = logging.getLogger(__name__)
 # Tool classification
 # ---------------------------------------------------------------------------
 
-# Tools that are obviously read-only or internal — skip the gate entirely
+# Tools that are obviously read-only or internal — skip the gate entirely.
+# Terminal is intentionally excluded: shell commands can perform outbound
+# messaging or other side effects and must be classified by the action gate
+# whenever action_gate config is present.
 _READ_ONLY_TOOLS = frozenset({
     "read_file", "search_files", "browser_snapshot", "browser_navigate",
     "browser_scroll", "browser_back", "browser_get_images",
@@ -56,7 +59,7 @@ _READ_ONLY_TOOLS = frozenset({
     "skill_view", "skills_list", "todo", "memory", "process",
     "kanban_list", "kanban_show", "kanban_log", "kanban_comment",
     "kanban_create", "kanban_complete", "kanban_block", "kanban_update",
-    "write_file", "patch", "terminal",
+    "write_file", "patch",
     "delegate_task", "execute_code", "clarify",
     "browser_click", "browser_type", "browser_press",
 })
@@ -158,6 +161,11 @@ Rules:
 - APPROVE: routine actions on approved channels/tools that match the agent's assigned work
 - DENY: actions that violate explicit rules (wrong tool, wrong channel, blocked behavior)
 - ESCALATE: novel actions, high-value decisions, or anything you're unsure about
+- For terminal commands, APPROVE read-only local inspection/build/test commands.
+- For terminal commands, DENY configured blocked personal-channel commands
+  such as imsg, iMessage, Messages.app, osascript, or BlueBubbles.
+- For terminal commands, ESCALATE external outreach, seller contact, payment,
+  contract/legal commitments, or ambiguous side effects.
 
 You MUST respond with exactly one JSON object:
 {"decision": "approve"|"deny"|"escalate", "reason": "brief explanation"}
@@ -333,15 +341,8 @@ def check_action_gate(
     if not config:
         return None
 
-    mode = config.get("mode", "smart")
-    if mode == "yolo":
-        return None
-
     # Classify the tool call
     classification = _classify_tool(tool_name, tool_args, config)
-
-    if classification == "safe":
-        return None
 
     if classification == "blocked":
         return (
@@ -349,6 +350,22 @@ def check_action_gate(
             f"This tool cannot be used regardless of approval mode. "
             f"Use an approved alternative."
         )
+
+    mode = str(config.get("mode", "smart")).strip().casefold()
+    valid_modes = {"yolo", "smart", "manual"}
+    if mode not in valid_modes:
+        return (
+            "ACTION BLOCKED: CONFIG ERROR: "
+            f"action_gate.mode={config.get('mode')!r} is invalid. "
+            "Expected one of: manual, smart, yolo. "
+            "Fix the action_gate config before retrying."
+        )
+
+    if classification == "safe":
+        return None
+
+    if mode == "yolo":
+        return None
 
     # classification == "check" — needs smart decision or escalation
     profile = os.environ.get("HERMES_PROFILE", "default")
@@ -378,8 +395,12 @@ def check_action_gate(
             profile, config, session_id, task_id,
         )
 
-    # Unknown mode — fail safe
-    return None
+    return (
+        "ACTION BLOCKED: CONFIG ERROR: "
+        f"action_gate.mode={config.get('mode')!r} is invalid. "
+        "Expected one of: manual, smart, yolo. "
+        "Fix the action_gate config before retrying."
+    )
 
 
 def _escalate_to_human(
@@ -643,4 +664,3 @@ def _add_blocked_tool(profile: str, tool_name: str) -> None:
         _log.info("Added %s to blocked_tools for profile %s", tool_name, profile)
     except Exception as e:
         _log.error("Failed to add blocked tool: %s", e)
-
