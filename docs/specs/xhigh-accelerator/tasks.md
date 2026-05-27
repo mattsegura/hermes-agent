@@ -20,7 +20,18 @@
 - [x] Add unit tests for telemetry summary shape and failure isolation.
 - [x] Run focused tests for telemetry and conversation loop.
 
-## Phase 2 — Tool batch attribution
+## Phase 2 — Stateful Codex Responses replay
+
+- [ ] Add disabled-by-default config for `performance.responses_state.enabled` and stateless fallback behavior.
+- [ ] Teach the Codex Responses transport to support opt-in `store: true` plus `previous_response_id` while preserving the current `store: false` path.
+- [ ] Add a state-chain compatibility fingerprint covering model, provider, reasoning config, stable instructions/system prompt, tool schema, and session branch.
+- [ ] On follow-up tool-loop calls, send only new delta input items when state is valid; reset state and send a full request when the fingerprint changes.
+- [ ] On provider rejection, missing state, or expired state, mark the chain invalid and retry the current turn through the existing stateless full-replay path.
+- [ ] Extend telemetry with stateful replay usage, fallback reason, state reset reason, previous-response usage, full-vs-delta request size, and stateless retry count.
+- [ ] Add unit tests for disabled path compatibility, successful stateful chaining, state reset, and fallback to stateless on 400/404-style failures.
+- [ ] Add a tiny live/manual smoke test plan before local enablement.
+
+## Phase 3 — Tool batch attribution
 
 - [ ] Wrap `agent._execute_tool_calls(...)` from the main loop with telemetry batch start/end.
 - [ ] Record individual tool duration and success/failure in `agent/tool_executor.py` for both sequential and concurrent paths.
@@ -28,7 +39,7 @@
 - [ ] Add tests for sequential and concurrent tool timing with mocked tools.
 - [ ] Run focused tool-executor tests.
 
-## Phase 3 — Context prefetch core, disabled by default
+## Phase 4 — Context prefetch core, disabled by default
 
 - [ ] Add `agent/context_prefetch.py` with packet builder, budgets, and source-provider interface.
 - [ ] Add config defaults for `context_prefetch.enabled`, total budget, per-source budgets, and initial sources.
@@ -37,22 +48,23 @@
 - [ ] Report prefetch duration and packet size in telemetry.
 - [ ] Add tests proving disabled path injects nothing and enabled path injects bounded source-labeled text.
 
-## Phase 4 — Initial source providers
+## Phase 5 — Initial source providers
 
 - [ ] Implement skill-card provider using existing `agent.skill_utils` helpers; inject compact cards, not full skill bodies, unless explicitly configured.
 - [ ] Implement sanitized Hermes profile/config summary provider using allowlisted keys only: model/provider/api_mode/reasoning/service_tier/display.streaming/toolsets/disabled_toolsets/compression/browser.engine.
 - [ ] Preserve existing `pre_llm_call` plugin hook and include plugin-provided context inside the same budgeted packet or as a separately timed contributor.
 - [ ] Add tests for secret redaction/allowlisting and deterministic skill-card ordering.
 
-## Phase 5 — Local rollout and measurement
+## Phase 6 — Local rollout and measurement
 
 - [ ] Enable telemetry locally in Matthew's default profile.
+- [ ] Enable stateful Responses replay locally only after focused tests and a small live smoke pass.
 - [ ] Enable context prefetch locally after focused tests pass.
 - [ ] Re-run the golden prompt set.
 - [ ] Compare wall time, model-call count, tool-call count, and final quality against baseline.
 - [ ] If quality regresses, disable prefetch and keep telemetry only; use telemetry to identify safer sources.
 
-## Phase 6 — Optional UX/reporting
+## Phase 7 — Optional UX/reporting
 
 - [ ] Add a read-only `/perf` or `hermes insights --performance` view if JSON logs are useful but inconvenient.
 - [ ] Consider a profile-local wiki prefetch provider for Matthew's environment only, implemented as a plugin/source provider rather than hardcoded core behavior.
