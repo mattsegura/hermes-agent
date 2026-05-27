@@ -494,6 +494,120 @@ def _compute_tool_definitions(
 # so if something slips through, the LLM sees a sensible message.
 _AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
+_DUPLICATE_ADVISORY_TOOLS = {
+    "read_file",
+    "search_files",
+    "skill_view",
+    "wiki_search",
+}
+_DUPLICATE_ADVISORY_TTL_SECONDS = 180
+_DUPLICATE_ADVISORY_MAX_ENTRIES = 128
+_duplicate_advisory_lock = threading.Lock()
+_duplicate_advisory_state: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = {}
+_TERMINAL_READ_ONLY_PROBE_RE = re.compile(
+    r"^\s*(?:"
+    r"pwd\b|"
+    r"git\s+(?:status\b|rev-parse\b|branch\b|diff\b|log\b|show\b|remote\b)|"
+    r"ls\b|find\b|rg\b|grep\b|cat\b|head\b|tail\b|wc\b|ps\b|pgrep\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _reset_duplicate_tool_advisory_state() -> None:
+    """Clear duplicate advisory state. Intended for tests and session resets."""
+    with _duplicate_advisory_lock:
+        _duplicate_advisory_state.clear()
+
+
+def _duplicate_scope_key(task_id: Optional[str], session_id: Optional[str]) -> Optional[str]:
+    return session_id or task_id
+
+
+def _is_duplicate_advisory_candidate(tool_name: str, args: Dict[str, Any]) -> bool:
+    if tool_name in _DUPLICATE_ADVISORY_TOOLS:
+        return True
+    if tool_name != "terminal":
+        return False
+    command = args.get("command") if isinstance(args, dict) else None
+    return isinstance(command, str) and bool(_TERMINAL_READ_ONLY_PROBE_RE.match(command))
+
+
+def _canonical_tool_args(args: Dict[str, Any]) -> str:
+    try:
+        return json.dumps(args or {}, sort_keys=True, separators=(",", ":"), default=str)
+    except TypeError:
+        return repr(args)
+
+
+def _record_duplicate_tool_advisory(
+    tool_name: str,
+    args: Dict[str, Any],
+    *,
+    task_id: Optional[str],
+    session_id: Optional[str],
+) -> Optional[str]:
+    """Return a concise advisory for repeated read-only probes.
+
+    This is intentionally advisory-only. It never suppresses a tool call or
+    assumes repeated reads are wrong; it just exposes exact duplicate probes at
+    the central dispatch seam so the model can collapse avoidable round trips.
+    """
+    if not _is_duplicate_advisory_candidate(tool_name, args):
+        return None
+
+    now = time.monotonic()
+    scope = _duplicate_scope_key(task_id, session_id)
+    if scope is None:
+        return None
+    fingerprint = (tool_name, _canonical_tool_args(args))
+    with _duplicate_advisory_lock:
+        scope_state = _duplicate_advisory_state.setdefault(scope, {})
+        stale = [
+            key for key, value in scope_state.items()
+            if now - value.get("last_seen", now) > _DUPLICATE_ADVISORY_TTL_SECONDS
+        ]
+        for key in stale:
+            scope_state.pop(key, None)
+
+        previous = scope_state.get(fingerprint)
+        if previous is None:
+            scope_state[fingerprint] = {"count": 1, "last_seen": now}
+            if len(scope_state) > _DUPLICATE_ADVISORY_MAX_ENTRIES:
+                oldest_key = min(
+                    scope_state,
+                    key=lambda item: scope_state[item].get("last_seen", now),
+                )
+                scope_state.pop(oldest_key, None)
+            return None
+
+        previous["count"] = int(previous.get("count", 1)) + 1
+        previous["last_seen"] = now
+        return (
+            f"Duplicate read-only probe: exact {tool_name} call seen "
+            f"{previous['count']} times recently in this session. Reuse earlier "
+            "results or batch repo/search/read preflight with workspace_preflight "
+            "when the data does not need to be refreshed."
+        )
+
+
+def _append_tool_advisory(result: str, advisory: Optional[str]) -> str:
+    if not advisory:
+        return result
+    try:
+        parsed = json.loads(result)
+    except Exception:
+        return f"{result}\n\n[Advisory: {advisory}]"
+
+    if isinstance(parsed, dict):
+        existing = parsed.get("_advisories")
+        if isinstance(existing, list):
+            existing.append(advisory)
+        else:
+            parsed["_advisories"] = [advisory]
+        return json.dumps(parsed, ensure_ascii=False)
+
+    return f"{result}\n\n[Advisory: {advisory}]"
 
 
 # =========================================================================
@@ -912,7 +1026,13 @@ def handle_function_call(
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
 
-        return result
+        duplicate_advisory = _record_duplicate_tool_advisory(
+            function_name,
+            function_args,
+            task_id=task_id,
+            session_id=session_id,
+        )
+        return _append_tool_advisory(result, duplicate_advisory)
 
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
