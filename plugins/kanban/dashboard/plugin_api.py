@@ -1744,6 +1744,15 @@ class CreateBoardBody(BaseModel):
     icon: Optional[str] = None
     color: Optional[str] = None
     switch: bool = False
+    runtime: str = "goal"
+    objective: Optional[str] = None
+    success: list[str] = Field(default_factory=list)
+    constraint: list[str] = Field(default_factory=list)
+    dispatcher_profile: Optional[str] = None
+    ceo_profile: Optional[str] = None
+    optimizer_profile: Optional[str] = None
+    worker_profile: Optional[str] = None
+    workflow: Optional[dict] = None
 
 
 class RenameBoardBody(BaseModel):
@@ -1793,6 +1802,18 @@ def create_board_endpoint(payload: CreateBoardBody):
             description=payload.description,
             icon=payload.icon,
             color=payload.color,
+            runtime=payload.runtime,
+            objective=payload.objective,
+            success=payload.success,
+            constraints=payload.constraint,
+            dispatcher_profile=(
+                payload.dispatcher_profile
+                or (None if payload.runtime == "kernel" else _active_profile_name())
+            ),
+            ceo_profile=payload.ceo_profile,
+            optimizer_profile=payload.optimizer_profile,
+            worker_profile=payload.worker_profile,
+            workflow=payload.workflow,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

@@ -3602,6 +3602,171 @@ def test_gateway_dispatcher_watcher_env_truthy_uses_config(monkeypatch):
     )
 
 
+def test_gateway_dispatcher_respects_board_runtime_owner(monkeypatch, tmp_path):
+    """Gateway dispatches only boards owned by its active profile."""
+    import asyncio
+
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    monkeypatch.setattr(GatewayRunner, "_active_profile_name", lambda self: "default")
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [
+            {
+                "slug": "owned",
+                "runtime": {"dispatcher": {"profile": "default"}},
+            },
+            {
+                "slug": "other",
+                "runtime": {"dispatcher": {"profile": "operator"}},
+            },
+            {"slug": "unowned"},
+        ],
+    )
+    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: tmp_path / f"{board}.db")
+
+    dispatched: list[str] = []
+
+    class FakeConn:
+        def close(self):
+            return None
+
+    def _dispatch_once(conn, **kwargs):
+        dispatched.append(kwargs["board"])
+        return SimpleNamespace(
+            spawned=[],
+            reclaimed=0,
+            crashed=[],
+            timed_out=[],
+            promoted=0,
+            auto_blocked=[],
+        )
+
+    monkeypatch.setattr(_kb, "connect", lambda board=None: FakeConn())
+    monkeypatch.setattr(_kb, "dispatch_once", _dispatch_once)
+    monkeypatch.setattr(_kb, "has_spawnable_ready", lambda conn: False)
+    monkeypatch.setattr(_kb, "has_spawnable_review", lambda conn: False)
+
+    calls = {"to_thread": 0}
+
+    async def _to_thread(fn, *args, **kwargs):
+        calls["to_thread"] += 1
+        result = fn(*args, **kwargs)
+        if calls["to_thread"] >= 2:
+            runner._running = False
+        return result
+
+    async def _sleep(_delay):
+        return None
+
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+
+    asyncio.run(asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=3.0))
+
+    assert dispatched == ["owned"]
+
+
+def test_gateway_dispatcher_config_allowlist_overrides_runtime_owner(
+    monkeypatch, tmp_path
+):
+    """kanban.dispatch_boards can opt specific boards into this gateway."""
+    import asyncio
+
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    monkeypatch.setattr(GatewayRunner, "_active_profile_name", lambda self: "default")
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
+                "dispatch_boards": ["other"],
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [
+            {
+                "slug": "owned",
+                "runtime": {"dispatcher": {"profile": "default"}},
+            },
+            {
+                "slug": "other",
+                "runtime": {"dispatcher": {"profile": "operator"}},
+            },
+            {"slug": "unowned"},
+        ],
+    )
+    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: tmp_path / f"{board}.db")
+
+    dispatched: list[str] = []
+
+    class FakeConn:
+        def close(self):
+            return None
+
+    def _dispatch_once(conn, **kwargs):
+        dispatched.append(kwargs["board"])
+        return SimpleNamespace(
+            spawned=[],
+            reclaimed=0,
+            crashed=[],
+            timed_out=[],
+            promoted=0,
+            auto_blocked=[],
+        )
+
+    monkeypatch.setattr(_kb, "connect", lambda board=None: FakeConn())
+    monkeypatch.setattr(_kb, "dispatch_once", _dispatch_once)
+    monkeypatch.setattr(_kb, "has_spawnable_ready", lambda conn: False)
+    monkeypatch.setattr(_kb, "has_spawnable_review", lambda conn: False)
+
+    calls = {"to_thread": 0}
+
+    async def _to_thread(fn, *args, **kwargs):
+        calls["to_thread"] += 1
+        result = fn(*args, **kwargs)
+        if calls["to_thread"] >= 2:
+            runner._running = False
+        return result
+
+    async def _sleep(_delay):
+        return None
+
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+
+    asyncio.run(asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=3.0))
+
+    assert dispatched == ["owned", "other"]
+
+
 def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     monkeypatch, tmp_path, caplog
 ):
@@ -3626,6 +3791,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
             "kanban": {
                 "dispatch_in_gateway": True,
                 "dispatch_interval_seconds": 1,
+                "dispatch_boards": "*",
             }
         },
     )

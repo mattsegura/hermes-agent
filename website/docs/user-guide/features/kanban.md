@@ -55,10 +55,9 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 ## Core concepts
 
 - **Board** — a standalone queue of tasks with its own SQLite DB, workspaces
-  directory, and dispatcher loop. A single install can have many boards
-  (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
-  below. Single-project users stay on the `default` board and never see the
-  word "board" outside this docs section.
+  directory, and current-model `board.json` metadata. A single install can
+  have many boards (e.g. one per project, repo, or domain); see
+  [Boards (multi-project)](#boards-multi-project) below.
 - **Task** — a row with title, optional body, one assignee (a profile name), lifecycle status (`triage | todo | scheduled | ready | running | watching | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation), and optional semantic funnel coordinates (`goal_id`, `workstream_id`, `stage_key`, `action_key`, `funnel_data`).
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
@@ -66,7 +65,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design, so the dir is wiped the moment the worker (or `hermes kanban complete <id>`) marks the task done. If you want to keep the worker's output, use `worktree:` or `dir:<path>` instead. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
-- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
+- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). A gateway dispatches only boards owned by its active profile via `board.json` `runtime.dispatcher.profile`, or boards explicitly listed in `kanban.dispatch_boards` (or `*`). Boards without dispatcher ownership are safe-idle/unowned: readable and migratable, but not spawned by the gateway. Workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
 ## Lifecycle status vs. semantic workflow funnel
@@ -78,28 +77,53 @@ Kanban now separates two ideas that used to be easy to blur:
 
 That means a board can keep normal columns while still exposing rich end-to-end work shape. Example: a land pipeline, inbox triage board, coding board, or household chores board can all define their own semantic stages without adding hardcoded statuses to the kernel.
 
-A board-level workflow schema lives in `board.json` and is intentionally generic:
+New boards default to an objective-first `goal` runtime scaffold. The default
+semantic workflow stages are deliberately generic and separate from lifecycle
+statuses:
+
+`intake -> plan -> execute -> verify -> deliver -> improve`
+
+A board-level workflow schema lives in `board.json` alongside `objective` and
+`runtime` metadata:
 
 ```json
 {
-  "id": "deal-flow",
-  "stages": [
-    {
-      "key": "intake",
-      "actions": ["qualify", "research"],
-      "allowed_lifecycle_states": ["todo", "ready", "running", "watching"],
-      "exit_criteria": [
-        {"transition": "execute", "evidence_required": ["qualified"]}
-      ]
-    },
-    {"key": "execute", "actions": ["dispatch", "follow_up"]}
-  ]
+  "objective": {
+    "statement": "Launch the support inbox workflow",
+    "success": ["handoff verified"],
+    "constraints": ["no customer data leaves the board workspace"]
+  },
+  "runtime": {
+    "mode": "goal",
+    "dispatcher": {"profile": "default"},
+    "profiles": {"ceo": "ceo", "optimizer": "optimizer", "worker": "worker"}
+  },
+  "workflow": {
+    "id": "objective-first-v1",
+    "stages": [
+      {"key": "intake"},
+      {"key": "plan"},
+      {"key": "execute"},
+      {"key": "verify"},
+      {"key": "deliver"},
+      {"key": "improve"}
+    ]
+  }
 }
 ```
 
 CLI setup:
 
 ```bash
+hermes kanban boards create support-inbox \
+  --objective "Launch the support inbox workflow" \
+  --success "handoff verified" \
+  --constraint "no customer data leaves the board workspace" \
+  --dispatcher-profile default \
+  --ceo-profile ceo \
+  --optimizer-profile optimizer \
+  --worker-profile worker
+hermes kanban boards create isolated --runtime kernel
 hermes kanban boards create land --workflow @workflow.json
 hermes kanban boards workflow show land --json
 hermes kanban boards workflow set land @workflow.json
@@ -260,6 +284,7 @@ up on the next tick (60s by default).
 kanban:
   dispatch_in_gateway: true        # default
   dispatch_interval_seconds: 60    # default
+  dispatch_boards: []              # default: use board runtime ownership
 ```
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
@@ -267,7 +292,9 @@ for debugging. Standard gateway supervision applies: run `hermes gateway
 start` directly, or wire the gateway up as a systemd user unit (see the
 gateway docs). Without a running gateway, `ready` tasks stay where they are
 until one comes up — `hermes kanban create` warns about this at creation
-time.
+time. To run a gateway as an admin dispatcher for specific boards, set
+`kanban.dispatch_boards: ["board-a", "board-b"]`; reserve
+`dispatch_boards: "*"` for tightly controlled admin hosts.
 
 Running `hermes kanban daemon` as a separate process is **deprecated**;
 use the gateway. If you truly cannot run the gateway (headless host

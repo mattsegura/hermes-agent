@@ -159,6 +159,8 @@ _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
 # ---------------------------------------------------------------------------
 
 DEFAULT_BOARD = "default"
+VALID_RUNTIME_MODES = {"kernel", "goal", "company"}
+DEFAULT_SEMANTIC_STAGES = ("intake", "plan", "execute", "verify", "deliver", "improve")
 
 # Slug validator: lowercase alphanumerics, digits, hyphens; 1–64 chars.
 # Strict enough to stop traversal (`..`) and embedded path separators, loose
@@ -403,6 +405,130 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+def default_semantic_workflow() -> dict:
+    """Return the generic objective-first workflow scaffold for new boards."""
+    stages: list[dict[str, Any]] = []
+    for idx, key in enumerate(DEFAULT_SEMANTIC_STAGES):
+        stage: dict[str, Any] = {
+            "key": key,
+            "label": key.replace("_", " ").title(),
+            "substates": [],
+            "actions": [],
+            "triggers": [],
+            "exit_criteria": [],
+        }
+        if idx + 1 < len(DEFAULT_SEMANTIC_STAGES):
+            stage["exit_criteria"].append({
+                "transition": DEFAULT_SEMANTIC_STAGES[idx + 1],
+                "evidence_required": [],
+            })
+        stages.append(stage)
+    return {
+        "id": "objective-first-v1",
+        "stages": stages,
+    }
+
+
+def normalize_runtime_mode(runtime: Optional[str]) -> str:
+    """Validate a board runtime mode."""
+    mode = str(runtime or "goal").strip().lower()
+    if mode not in VALID_RUNTIME_MODES:
+        raise ValueError(
+            "runtime must be one of: " + ", ".join(sorted(VALID_RUNTIME_MODES))
+        )
+    return mode
+
+
+def _string_list(values: Optional[Iterable[str]]) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def normalize_objective_metadata(objective: Optional[Any]) -> Optional[dict]:
+    """Validate and normalize board-level objective metadata."""
+    if objective is None:
+        return None
+    if isinstance(objective, str):
+        return {
+            "statement": objective.strip(),
+            "success": [],
+            "constraints": [],
+        }
+    if not isinstance(objective, dict):
+        raise ValueError("objective must be a string or object")
+    out = dict(objective)
+    out["statement"] = str(out.get("statement") or out.get("objective") or "").strip()
+    out["success"] = _string_list(out.get("success") or out.get("success_criteria"))
+    out["constraints"] = _string_list(out.get("constraints"))
+    return out
+
+
+def build_objective_metadata(
+    *,
+    statement: Optional[str],
+    fallback_statement: str,
+    success: Optional[Iterable[str]] = None,
+    constraints: Optional[Iterable[str]] = None,
+) -> dict:
+    """Build the objective scaffold used by goal/company runtime boards."""
+    return {
+        "statement": str(statement or fallback_statement or "").strip(),
+        "success": _string_list(success),
+        "constraints": _string_list(constraints),
+    }
+
+
+def normalize_runtime_metadata(runtime: Optional[Any]) -> Optional[dict]:
+    """Validate and normalize board-level runtime metadata."""
+    if runtime is None:
+        return None
+    if isinstance(runtime, str):
+        runtime = {"mode": runtime}
+    if not isinstance(runtime, dict):
+        raise ValueError("runtime must be a string or object")
+    out = dict(runtime)
+    out["mode"] = normalize_runtime_mode(out.get("mode"))
+    dispatcher = out.get("dispatcher") or {}
+    if isinstance(dispatcher, str):
+        dispatcher = {"profile": dispatcher}
+    if not isinstance(dispatcher, dict):
+        raise ValueError("runtime.dispatcher must be an object")
+    dispatcher_profile = str(dispatcher.get("profile") or "").strip()
+    out["dispatcher"] = {"profile": dispatcher_profile or None}
+
+    profiles = out.get("profiles") or {}
+    if not isinstance(profiles, dict):
+        raise ValueError("runtime.profiles must be an object")
+    out["profiles"] = {
+        key: (str(profiles.get(key) or "").strip() or None)
+        for key in ("ceo", "optimizer", "worker")
+    }
+    return out
+
+
+def build_runtime_metadata(
+    *,
+    mode: str,
+    dispatcher_profile: Optional[str] = None,
+    ceo_profile: Optional[str] = None,
+    optimizer_profile: Optional[str] = None,
+    worker_profile: Optional[str] = None,
+) -> dict:
+    """Build normalized runtime metadata for a non-kernel board."""
+    return normalize_runtime_metadata({
+        "mode": mode,
+        "dispatcher": {"profile": dispatcher_profile},
+        "profiles": {
+            "ceo": ceo_profile,
+            "optimizer": optimizer_profile,
+            "worker": worker_profile,
+        },
+    }) or {}
+
+
 def _workflow_list_keys(items: Any, *, field: str) -> list[dict]:
     """Normalize workflow lists that may contain strings or object rows."""
     if items is None:
@@ -540,6 +666,8 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "icon": "",
         "color": "",
         "default_workdir": None,
+        "objective": None,
+        "runtime": None,
         "workflow": None,
         "created_at": None,
         "archived": False,
@@ -552,6 +680,10 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 # Never let the metadata file claim a different slug than
                 # its directory — trust the filesystem.
                 raw["slug"] = slug
+                if raw.get("objective") is not None:
+                    raw["objective"] = normalize_objective_metadata(raw.get("objective"))
+                if raw.get("runtime") is not None:
+                    raw["runtime"] = normalize_runtime_metadata(raw.get("runtime"))
                 if raw.get("workflow") is not None:
                     raw["workflow"] = normalize_workflow_definition(raw.get("workflow"))
                 meta.update(raw)
@@ -570,6 +702,8 @@ def write_board_metadata(
     color: Optional[str] = None,
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
+    objective: Any = _UNSET,
+    runtime: Any = _UNSET,
     workflow: Any = _UNSET,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
@@ -594,16 +728,34 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
+    if objective is not _UNSET:
+        if objective is None:
+            meta.pop("objective", None)
+        else:
+            meta["objective"] = normalize_objective_metadata(objective)
+    if runtime is not _UNSET:
+        if runtime is None:
+            meta.pop("runtime", None)
+        else:
+            meta["runtime"] = normalize_runtime_metadata(runtime)
     if workflow is not _UNSET:
-        meta["workflow"] = normalize_workflow_definition(workflow)
+        if workflow is None:
+            meta.pop("workflow", None)
+        else:
+            meta["workflow"] = normalize_workflow_definition(workflow)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
+    for optional_key in ("objective", "runtime", "workflow"):
+        if meta.get(optional_key) is None:
+            meta.pop(optional_key, None)
     path = board_metadata_path(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
+    for optional_key in ("objective", "runtime", "workflow"):
+        meta.setdefault(optional_key, None)
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
@@ -616,6 +768,14 @@ def create_board(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
+    runtime: Optional[str] = "goal",
+    objective: Optional[str] = None,
+    success: Optional[Iterable[str]] = None,
+    constraints: Optional[Iterable[str]] = None,
+    dispatcher_profile: Optional[str] = None,
+    ceo_profile: Optional[str] = None,
+    optimizer_profile: Optional[str] = None,
+    worker_profile: Optional[str] = None,
     workflow: Optional[Any] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
@@ -627,6 +787,32 @@ def create_board(
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
+    runtime_mode = normalize_runtime_mode(runtime)
+    fallback_objective = (
+        objective
+        or description
+        or name
+        or _default_board_display_name(normed)
+    )
+    if runtime_mode == "kernel":
+        objective_meta = None
+        runtime_meta = None
+        workflow_meta: Any = workflow if workflow is not None else None
+    else:
+        objective_meta = build_objective_metadata(
+            statement=objective,
+            fallback_statement=fallback_objective,
+            success=success,
+            constraints=constraints,
+        )
+        runtime_meta = build_runtime_metadata(
+            mode=runtime_mode,
+            dispatcher_profile=dispatcher_profile,
+            ceo_profile=ceo_profile,
+            optimizer_profile=optimizer_profile,
+            worker_profile=worker_profile,
+        )
+        workflow_meta = workflow if workflow is not None else default_semantic_workflow()
     meta = write_board_metadata(
         normed,
         name=name,
@@ -634,7 +820,9 @@ def create_board(
         icon=icon,
         color=color,
         default_workdir=default_workdir,
-        workflow=workflow if workflow is not None else _UNSET,
+        objective=objective_meta,
+        runtime=runtime_meta,
+        workflow=workflow_meta,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
@@ -645,9 +833,9 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
     """Enumerate all boards that exist on disk.
 
     Always includes ``default`` (even when the ``boards/default/``
-    metadata dir doesn't exist, because its DB is at the legacy path).
-    Other boards are discovered by scanning ``boards/`` for subdirectories
-    that either contain a ``kanban.db`` or a ``board.json``.
+    metadata dir doesn't exist, because its DB lives at the historical
+    top-level path). Other boards are discovered by scanning ``boards/``
+    for subdirectories that either contain a ``kanban.db`` or a ``board.json``.
 
     Returns a list of metadata dicts, sorted with ``default`` first and
     the rest alphabetically.
@@ -1824,7 +2012,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "funnel_data", "funnel_data TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
-    # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
+    # columns exist. Keeping them in SCHEMA_SQL breaks existing board DBs: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
     # ``CREATE INDEX`` over a missing column aborts initialization before the
     # additive ``ALTER TABLE`` migrations below can run. Re-running them here
@@ -3749,7 +3937,7 @@ def _is_managed_scratch_path(p: Path) -> bool:
 
     * ``HERMES_KANBAN_WORKSPACES_ROOT`` when set (worker-side override
       injected by the dispatcher).
-    * ``<kanban_home>/kanban/workspaces`` — legacy default-board scratch root.
+    * ``<kanban_home>/kanban/workspaces`` — default-board compatibility scratch root.
     * ``<kanban_home>/kanban/boards/<slug>/workspaces`` for each board slug
       that currently exists on disk.
 

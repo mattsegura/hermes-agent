@@ -1625,6 +1625,11 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Board dispatcher ownership is explicit. By default, a gateway only
+        # dispatches boards whose board.json runtime.dispatcher.profile matches
+        # the active profile. Set to ["slug-a", "slug-b"] or "*" to override
+        # board ownership for controlled migrations/admin hosts.
+        "dispatch_boards": [],
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

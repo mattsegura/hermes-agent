@@ -5404,6 +5404,69 @@ class GatewayRunner:
         bad_ticks = 0
         last_warn_at = 0
         disabled_corrupt_boards: dict[str, tuple[str, int | None, int | None]] = {}
+        dispatcher_profile = self._active_profile_name()
+
+        def _configured_dispatch_boards() -> tuple[bool, set[str]]:
+            raw = kanban_cfg.get("dispatch_boards", [])
+            if raw == "*":
+                return True, set()
+            if isinstance(raw, str):
+                values = [item.strip() for item in raw.split(",") if item.strip()]
+            elif isinstance(raw, (list, tuple, set)):
+                values = [str(item).strip() for item in raw if str(item).strip()]
+            else:
+                values = []
+            if "*" in values:
+                return True, set()
+            allowed: set[str] = set()
+            for value in values:
+                try:
+                    normed = _kb._normalize_board_slug(value)
+                except Exception:
+                    logger.warning(
+                        "kanban dispatcher: ignoring invalid kanban.dispatch_boards entry %r",
+                        value,
+                    )
+                    continue
+                if normed:
+                    allowed.add(normed)
+            return False, allowed
+
+        dispatch_all_boards, dispatch_board_allowlist = _configured_dispatch_boards()
+
+        def _board_dispatch_owner(board_meta: dict) -> Optional[str]:
+            runtime = board_meta.get("runtime")
+            if not isinstance(runtime, dict):
+                return None
+            dispatcher = runtime.get("dispatcher")
+            if not isinstance(dispatcher, dict):
+                return None
+            owner = str(dispatcher.get("profile") or "").strip()
+            return owner or None
+
+        def _board_is_dispatchable(board_meta: dict) -> bool:
+            slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+            if dispatch_all_boards or slug in dispatch_board_allowlist:
+                return True
+            return _board_dispatch_owner(board_meta) == dispatcher_profile
+
+        def _dispatchable_boards() -> list[dict]:
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            selected: list[dict] = []
+            for board_meta in boards:
+                slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                if _board_is_dispatchable(board_meta):
+                    selected.append(board_meta)
+                else:
+                    logger.debug(
+                        "kanban dispatcher: board %s is safe-idle/unowned for profile %s",
+                        slug,
+                        dispatcher_profile,
+                    )
+            return selected
 
         def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
             path = _kb.kanban_db_path(slug)
@@ -5494,10 +5557,7 @@ class GatewayRunner:
             when users create a new board mid-run: no restart required,
             the next tick picks it up automatically.
             """
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            boards = _dispatchable_boards()
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
@@ -5516,10 +5576,7 @@ class GatewayRunner:
             here keeps the stuck-warn fire only on real failures (broken
             PATH, missing venv, credential loss for a real Hermes profile).
             """
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            boards = _dispatchable_boards()
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
@@ -5567,10 +5624,7 @@ class GatewayRunner:
                     "kanban auto-decompose: import failed (%s); skipping", exc,
                 )
                 return 0
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            boards = _dispatchable_boards()
             attempted = 0
             successes = 0
             for b in boards:

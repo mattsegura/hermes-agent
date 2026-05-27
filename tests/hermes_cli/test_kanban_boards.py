@@ -3,7 +3,7 @@
 Covers the pieces added when boards became a first-class concept:
 
 * Slug validation and normalisation.
-* Path resolution for ``default`` (legacy ``<root>/kanban.db``) vs
+* Path resolution for ``default`` (compat ``<root>/kanban.db``) vs
   named boards (``<root>/kanban/boards/<slug>/kanban.db``).
 * Current-board persistence via ``<root>/kanban/current`` and
   ``HERMES_KANBAN_BOARD`` env var.
@@ -104,7 +104,7 @@ class TestSlugValidation:
 # ---------------------------------------------------------------------------
 
 class TestPathResolution:
-    def test_default_board_legacy_path(self, fresh_home):
+    def test_default_board_compat_path(self, fresh_home):
         """The default board's DB lives at ``<root>/kanban.db`` for back-compat."""
         assert kb.kanban_db_path() == fresh_home / "kanban.db"
         assert kb.kanban_db_path(board="default") == fresh_home / "kanban.db"
@@ -241,6 +241,52 @@ class TestBoardCRUD:
         assert again["name"] == "Baz"
         assert again["description"] == "desc"
         assert again["icon"] == "📦"
+
+    def test_create_defaults_to_objective_first_goal_scaffold(self, fresh_home):
+        meta = kb.create_board(
+            "factory",
+            name="Factory",
+            objective="Ship the release",
+            success=["tests pass"],
+            constraints=["no downtime"],
+            dispatcher_profile="default",
+            worker_profile="builder",
+        )
+
+        assert meta["runtime"]["mode"] == "goal"
+        assert meta["runtime"]["dispatcher"]["profile"] == "default"
+        assert meta["runtime"]["profiles"]["worker"] == "builder"
+        assert meta["objective"] == {
+            "statement": "Ship the release",
+            "success": ["tests pass"],
+            "constraints": ["no downtime"],
+        }
+        assert [s["key"] for s in meta["workflow"]["stages"]] == [
+            "intake", "plan", "execute", "verify", "deliver", "improve",
+        ]
+
+    def test_create_kernel_board_writes_plain_metadata(self, fresh_home):
+        meta = kb.create_board("plain", runtime="kernel", name="Plain")
+        raw = json.loads(kb.board_metadata_path("plain").read_text(encoding="utf-8"))
+
+        assert meta["objective"] is None
+        assert meta["runtime"] is None
+        assert meta["workflow"] is None
+        assert "objective" not in raw
+        assert "runtime" not in raw
+        assert "workflow" not in raw
+
+    def test_create_kernel_board_can_store_custom_workflow(self, fresh_home):
+        workflow = {"id": "custom", "stages": ["intake", "deliver"]}
+        meta = kb.create_board("plain-flow", runtime="kernel", workflow=workflow)
+        raw = json.loads(kb.board_metadata_path("plain-flow").read_text(encoding="utf-8"))
+
+        assert meta["objective"] is None
+        assert meta["runtime"] is None
+        assert [s["key"] for s in meta["workflow"]["stages"]] == ["intake", "deliver"]
+        assert "objective" not in raw
+        assert "runtime" not in raw
+        assert raw["workflow"]["id"] == "custom"
 
     def test_remove_archive(self, fresh_home):
         kb.create_board("toremove")
@@ -423,13 +469,13 @@ class TestWorkerSpawnEnv:
         env = captured["env"]
         assert env["HERMES_KANBAN_BOARD"] == "spawntest"
         assert env["HERMES_KANBAN_TASK"] == "t_abc"
-        # DB path should match the per-board DB, not the legacy default.
+        # DB path should match the per-board DB, not the default board DB.
         expected_db = fresh_home / "kanban" / "boards" / "spawntest" / "kanban.db"
         assert env["HERMES_KANBAN_DB"] == str(expected_db)
         expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
 
-    def test_default_board_spawn_keeps_legacy_paths(self, fresh_home, monkeypatch):
+    def test_default_board_spawn_keeps_default_paths(self, fresh_home, monkeypatch):
         captured = {}
 
         class FakeProc:
@@ -507,6 +553,25 @@ class TestCLI:
         data = json.loads(r2.stdout)
         cur = [b for b in data if b["is_current"]][0]
         assert cur["slug"] == "myproj"
+        assert cur["runtime"]["mode"] == "goal"
+        assert cur["objective"]["statement"] == "My Project"
+        assert [s["key"] for s in cur["workflow"]["stages"]] == [
+            "intake", "plan", "execute", "verify", "deliver", "improve",
+        ]
+
+    def test_boards_create_kernel_plain_via_cli(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        result = _cli(["boards", "create", "plain", "--runtime", "kernel"], env_extra=env)
+        assert result.returncode == 0, result.stderr
+        assert "Runtime:" in result.stdout
+        assert "Objective:    (none)" in result.stdout
+        assert "Workflow:     (none)" in result.stdout
+
+        board_json = tmp_path / "kanban" / "boards" / "plain" / "board.json"
+        raw = json.loads(board_json.read_text(encoding="utf-8"))
+        assert "objective" not in raw
+        assert "runtime" not in raw
+        assert "workflow" not in raw
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}

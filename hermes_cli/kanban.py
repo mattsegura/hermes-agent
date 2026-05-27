@@ -291,6 +291,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Switch to the new board after creating it")
     b_create.add_argument("--default-workdir", default=None,
                           help="Default workspace path for tasks created on this board")
+    b_create.add_argument("--runtime", choices=sorted(kb.VALID_RUNTIME_MODES), default="goal",
+                          help="Board runtime mode (default: goal; kernel is isolated/plain)")
+    b_create.add_argument("--objective", default=None,
+                          help="Objective statement for goal/company runtime boards")
+    b_create.add_argument("--success", action="append", default=None,
+                          help="Success criterion for the board objective; repeatable")
+    b_create.add_argument("--constraint", action="append", default=None,
+                          help="Objective constraint; repeatable")
+    b_create.add_argument("--dispatcher-profile", default=None,
+                          help="Profile allowed to dispatch this board")
+    b_create.add_argument("--ceo-profile", default=None,
+                          help="CEO/orchestrator profile metadata for this board")
+    b_create.add_argument("--optimizer-profile", default=None,
+                          help="Optimizer profile metadata for this board")
+    b_create.add_argument("--worker-profile", default=None,
+                          help="Default worker profile metadata for this board")
     b_create.add_argument("--workflow", default=None,
                           help="JSON object or @file path defining semantic workflow stages")
 
@@ -1218,6 +1234,10 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
     if workflow_error:
         print(f"kanban boards create: {workflow_error}", file=sys.stderr)
         return 2
+    runtime = getattr(args, "runtime", "goal") or "goal"
+    dispatcher_profile = getattr(args, "dispatcher_profile", None)
+    if runtime != "kernel" and not dispatcher_profile:
+        dispatcher_profile = get_active_profile_name() or "default"
     meta = kb.create_board(
         normed,
         name=args.name,
@@ -1225,12 +1245,41 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
         icon=args.icon,
         color=args.color,
         default_workdir=args.default_workdir,
+        runtime=runtime,
+        objective=getattr(args, "objective", None),
+        success=getattr(args, "success", None),
+        constraints=getattr(args, "constraint", None),
+        dispatcher_profile=dispatcher_profile,
+        ceo_profile=getattr(args, "ceo_profile", None),
+        optimizer_profile=getattr(args, "optimizer_profile", None),
+        worker_profile=getattr(args, "worker_profile", None),
         workflow=workflow,
     )
     verb = "already exists" if already else "created"
     print(f"Board {meta['slug']!r} {verb}.")
     print(f"  Display name: {meta.get('name', '')}")
     print(f"  DB path:      {meta['db_path']}")
+    objective = meta.get("objective") or {}
+    runtime_meta = meta.get("runtime") or {}
+    workflow_meta = meta.get("workflow") or {}
+    dispatcher = (runtime_meta.get("dispatcher") or {}).get("profile")
+    profiles = runtime_meta.get("profiles") or {}
+    stage_keys = [
+        str(stage.get("key"))
+        for stage in workflow_meta.get("stages") or []
+        if isinstance(stage, dict) and stage.get("key")
+    ]
+    print(f"  Runtime:      {runtime_meta.get('mode') or runtime}")
+    print(f"  Objective:    {objective.get('statement') or '(none)'}")
+    print(f"  Workflow:     {' -> '.join(stage_keys) if stage_keys else '(none)'}")
+    print(f"  Dispatcher:   {dispatcher or '(unowned)'}")
+    profile_bits = [
+        f"{key}={value}"
+        for key, value in profiles.items()
+        if value
+    ]
+    if profile_bits:
+        print(f"  Profiles:     {', '.join(profile_bits)}")
     if getattr(args, "switch", False):
         kb.set_current_board(meta["slug"])
         print(f"  Switched to {meta['slug']!r}.")
