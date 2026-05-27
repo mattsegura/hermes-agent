@@ -505,6 +505,69 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source="official_docs_snapshot",
         pricing_version="minimax-pricing-2026-04",
     ),
+    # ── PackyAPI Claude models (discounted reseller) ───────────────────────
+    # Source: https://www.packyapi.com/pricing (aws-q tag, 4% off)
+    # Refresh: cron job packyapi-pricing-check runs weekly
+    (
+        "packyapi",
+        "claude-sonnet-4-6",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.90"),
+        output_cost_per_million=Decimal("4.50"),
+        cache_read_cost_per_million=Decimal("0.09"),
+        cache_write_cost_per_million=Decimal("1.125"),
+        source="official_docs_snapshot",
+        source_url="https://www.packyapi.com/pricing",
+        pricing_version="packyapi-aws-q-2026-05",
+    ),
+    (
+        "packyapi",
+        "claude-sonnet-4-6-20250414",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.90"),
+        output_cost_per_million=Decimal("4.50"),
+        cache_read_cost_per_million=Decimal("0.09"),
+        cache_write_cost_per_million=Decimal("1.125"),
+        source="official_docs_snapshot",
+        source_url="https://www.packyapi.com/pricing",
+        pricing_version="packyapi-aws-q-2026-05",
+    ),
+    (
+        "packyapi",
+        "claude-opus-4-7",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.50"),
+        output_cost_per_million=Decimal("7.50"),
+        cache_read_cost_per_million=Decimal("0.15"),
+        cache_write_cost_per_million=Decimal("1.875"),
+        source="official_docs_snapshot",
+        source_url="https://www.packyapi.com/pricing",
+        pricing_version="packyapi-aws-q-2026-05",
+    ),
+    (
+        "packyapi",
+        "claude-opus-4-6",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("1.50"),
+        output_cost_per_million=Decimal("7.50"),
+        cache_read_cost_per_million=Decimal("0.15"),
+        cache_write_cost_per_million=Decimal("1.875"),
+        source="official_docs_snapshot",
+        source_url="https://www.packyapi.com/pricing",
+        pricing_version="packyapi-aws-q-2026-05",
+    ),
+    (
+        "packyapi",
+        "claude-haiku-4-5-20251001",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.30"),
+        output_cost_per_million=Decimal("1.50"),
+        cache_read_cost_per_million=Decimal("0.03"),
+        cache_write_cost_per_million=Decimal("0.375"),
+        source="official_docs_snapshot",
+        source_url="https://www.packyapi.com/pricing",
+        pricing_version="packyapi-aws-q-2026-05",
+    ),
 }
 
 
@@ -548,6 +611,8 @@ def resolve_billing_route(
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    if provider_name == "packyapi" or base_url_host_matches(base_url or "", "packyapi.com"):
+        return BillingRoute(provider="packyapi", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"custom", "local"} or (base and "localhost" in base):
         return BillingRoute(provider=provider_name or "custom", model=model, base_url=base_url or "", billing_mode="unknown")
     return BillingRoute(provider=provider_name or "unknown", model=model.split("/")[-1] if model else "", base_url=base_url or "", billing_mode="unknown")
@@ -568,6 +633,79 @@ def _normalize_anthropic_model_name(model: str) -> str:
     # But preserve the rest of the name structure
     name = re.sub(r"(\d+)\.(\d+)", r"\1-\2", name)
     return name
+
+
+
+# PackyAPI dynamic pricing — fetched from /api/pricing, cached 24h
+import json as _json
+import threading as _threading
+import time as _time
+import urllib.request as _urllib_request
+from decimal import Decimal as _Decimal
+
+_PACKYAPI_CACHE: dict = {"data": None, "ts": 0}
+_PACKYAPI_CACHE_LOCK = _threading.Lock()
+_PACKYAPI_TTL = 86400  # 24h
+_BASE_UNIT = _Decimal("2.00")  # model_ratio is in units of $2/M
+
+
+def _fetch_packyapi_pricing() -> dict:
+    """Fetch PackyAPI pricing JSON. Returns parsed dict or {} on failure."""
+    global _PACKYAPI_CACHE
+    now = _time.time()
+    with _PACKYAPI_CACHE_LOCK:
+        if _PACKYAPI_CACHE["data"] is not None and (now - _PACKYAPI_CACHE["ts"]) < _PACKYAPI_TTL:
+            return _PACKYAPI_CACHE["data"]
+    try:
+        req = _urllib_request.Request(
+            "https://www.packyapi.com/api/pricing",
+            headers={"User-Agent": "Hermes-Pricing/1.0"}
+        )
+        with _urllib_request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        if data.get("success"):
+            with _PACKYAPI_CACHE_LOCK:
+                _PACKYAPI_CACHE = {"data": data, "ts": now}
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _packyapi_pricing_entry(route) -> Optional[PricingEntry]:
+    """Build a PricingEntry from PackyAPI's /api/pricing endpoint."""
+    data = _fetch_packyapi_pricing()
+    if not data:
+        return None
+    models = data.get("data", [])
+    group_ratios = data.get("group_ratio", {})
+    model_name = route.model
+    for m in models:
+        if m.get("model_name") == model_name:
+            # Find cheapest available group for this model
+            groups = m.get("enable_groups", [])
+            best_ratio = None
+            for g in groups:
+                ratio = group_ratios.get(g)
+                if ratio is not None and (best_ratio is None or ratio < best_ratio):
+                    best_ratio = ratio
+            if best_ratio is None:
+                return None
+            ratio_d = _Decimal(str(best_ratio))
+            mr = _Decimal(str(m.get("model_ratio", 0)))
+            cr = _Decimal(str(m.get("completion_ratio", 0)))
+            cache_r = _Decimal(str(m.get("cache_ratio", 0)))
+            cache_cr = _Decimal(str(m.get("cache_creation_ratio_5m", 0)))
+            return PricingEntry(
+                input_cost_per_million=mr * ratio_d * _BASE_UNIT,
+                output_cost_per_million=mr * cr * ratio_d * _BASE_UNIT,
+                cache_read_cost_per_million=mr * cache_r * ratio_d * _BASE_UNIT,
+                cache_write_cost_per_million=mr * cache_cr * ratio_d * _BASE_UNIT,
+                source="provider_pricing_api",
+                source_url="https://www.packyapi.com/api/pricing",
+                pricing_version="packyapi-dynamic",
+            )
+    return None
 
 
 def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]:
@@ -657,6 +795,12 @@ def get_pricing_entry(
         )
     if route.provider == "openrouter":
         return _openrouter_pricing_entry(route)
+    if route.provider == "packyapi":
+        # Try dynamic fetch first (24h cached), fall back to hardcoded
+        entry = _packyapi_pricing_entry(route)
+        if entry:
+            return entry
+        return _lookup_official_docs_pricing(route)
     if route.base_url:
         entry = _pricing_entry_from_metadata(
             fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""),

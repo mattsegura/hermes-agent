@@ -737,8 +737,16 @@ def build_anthropic_client(
         # don't follow Anthropic's sk-ant-* prefix convention and would be
         # misclassified as OAuth tokens.
         kwargs["api_key"] = api_key
+        _tp_headers = {}
         if common_betas:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+            _tp_headers["anthropic-beta"] = ",".join(common_betas)
+        # PackyAPI's Cloudflare WAF blocks the Anthropic SDK's default
+        # User-Agent ("Anthropic/Python X.Y.Z") with 403.  Override with a
+        # neutral UA so requests pass WAF inspection.
+        if "packyapi.com" in (normalized_base_url or "").lower():
+            _tp_headers["User-Agent"] = "Hermes/1.0"
+        if _tp_headers:
+            kwargs["default_headers"] = _tp_headers
     elif _is_oauth_token(api_key):
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
         # Anthropic routes OAuth requests based on user-agent and headers;

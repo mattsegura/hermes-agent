@@ -159,6 +159,56 @@ def test_gave_up_event_alone_does_not_make_block_sticky(kanban_home: Path) -> No
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_blocked_watch_wake_is_sticky_across_recompute(kanban_home: Path) -> None:
+    """A watch route that wakes into ``blocked`` is an intervention gate.
+
+    It must leave the same durable ``blocked`` audit signal as
+    ``kanban_block``; otherwise ``recompute_ready`` treats it like a
+    circuit-breaker block and silently promotes it back to ``ready``.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="wait for approval", assignee="operator")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        route = kb.set_task_watching(
+            conn,
+            tid,
+            trigger_type="approval",
+            trigger_key="request-1",
+            reason="Waiting for approval",
+            payload={"request_id": "request-1"},
+            wake_status="blocked",
+            created_by="operator",
+            expected_run_id=run_id,
+        )
+
+        triggered = kb.trigger_watch(
+            conn,
+            route_id=route.id,
+            payload={"decision": "needs_manual_review"},
+            actor="approval_gateway",
+        )
+
+        assert len(triggered) == 1
+        assert kb.get_task(conn, tid).status == "blocked"
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        events = kb.list_events(conn, tid)
+        blocked_events = [event for event in events if event.kind == "blocked"]
+        assert blocked_events
+        blocked_payload = blocked_events[-1].payload
+        assert blocked_payload["reason"] == "Waiting for approval"
+        assert blocked_payload["route_id"] == route.id
+        assert blocked_payload["trigger_type"] == "approval"
+        assert blocked_payload["trigger_key"] == "request-1"
+        assert blocked_payload["actor"] == "approval_gateway"
+        assert blocked_payload["payload"] == {"decision": "needs_manual_review"}
+        assert blocked_payload["triggered_at"] == triggered[0].triggered_at
+        assert any(event.kind == "watch_triggered" for event in events)
+
+
 # ---------------------------------------------------------------------------
 # unblock_task clears the sticky state
 # ---------------------------------------------------------------------------

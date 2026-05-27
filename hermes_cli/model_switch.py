@@ -1523,13 +1523,14 @@ def list_authenticated_providers(
             if not api_key:
                 key_env = str(ep_cfg.get("key_env", "") or "").strip()
                 api_key = os.environ.get(key_env, "").strip() if key_env else ""
+            api_mode = str(ep_cfg.get("api_mode", "") or "").strip()
             discover = ep_cfg.get("discover_models", True)
             if isinstance(discover, str):
                 discover = discover.lower() not in {"false", "no", "0"}
             if api_url and api_key and discover:
                 try:
                     from hermes_cli.models import fetch_api_models
-                    live_models = fetch_api_models(api_key, api_url)
+                    live_models = fetch_api_models(api_key, api_url, api_mode=api_mode or None)
                     if live_models:
                         models_list = live_models
                 except Exception:
@@ -1625,7 +1626,13 @@ def list_authenticated_providers(
                     "name": display_name,
                     "api_url": api_url,
                     "models": [],
+                    "api_mode": "",
                 }
+
+            # Carry api_mode from the first entry that sets it
+            entry_api_mode = (entry.get("api_mode") or "").strip()
+            if entry_api_mode and not groups[group_key].get("api_mode"):
+                groups[group_key]["api_mode"] = entry_api_mode
 
             # The singular ``model:`` field only holds the currently
             # active model. Hermes's own writer (main.py::_save_custom_provider)
@@ -1711,7 +1718,8 @@ def list_authenticated_providers(
                 try:
                     from hermes_cli.models import fetch_api_models
 
-                    live_models = fetch_api_models(api_key, api_url)
+                    grp_api_mode = grp.get("api_mode", "") or None
+                    live_models = fetch_api_models(api_key, api_url, api_mode=grp_api_mode)
                     if live_models:
                         grp["models"] = live_models
                         grp["total_models"] = len(live_models)

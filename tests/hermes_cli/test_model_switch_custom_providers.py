@@ -523,7 +523,7 @@ def test_custom_providers_uses_live_models_for_multi_model_endpoint(monkeypatch)
 
     calls = []
 
-    def fake_fetch_api_models(api_key, base_url):
+    def fake_fetch_api_models(api_key, base_url, **kwargs):
         calls.append((api_key, base_url))
         return ["gateway-model-a", "gateway-model-b", "gateway-model-c"]
 

@@ -11905,6 +11905,11 @@ class HermesCLI:
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+            # Expose the structured result to one-shot callers.  The human-facing
+            # `hermes chat -q` path calls chat() for display, but still needs the
+            # failure bit so automation wrappers (including the kanban dispatcher)
+            # do not mistake provider/API failures for a successful rc=0 run.
+            self._last_chat_result = result
 
             # Auto-generate session title after first exchange (non-blocking)
             if response and result and not result.get("failed") and not result.get("partial"):
@@ -15069,8 +15074,13 @@ def main(
             # Surface security advisories before the agent runs — short
             # banner, doesn't depend on the welcome banner being shown.
             cli._show_security_advisories()
-            cli.chat(query, images=single_query_images or None)
+            chat_response = cli.chat(query, images=single_query_images or None)
             cli._print_exit_summary()
+            chat_result = getattr(cli, "_last_chat_result", None)
+            if isinstance(chat_result, dict) and chat_result.get("failed"):
+                sys.exit(1)
+            if chat_response is None:
+                sys.exit(1)
         return
     
     # Run interactive mode

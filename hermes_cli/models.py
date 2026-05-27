@@ -3114,31 +3114,51 @@ def probe_api_models(
         candidates.append((alternate_base, True))
 
     tried: list[str] = []
-    headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
-    if api_key and api_mode == "anthropic_messages":
-        headers["x-api-key"] = api_key
-        headers["anthropic-version"] = "2023-06-01"
-    elif api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    if normalized.startswith(COPILOT_BASE_URL):
-        headers.update(copilot_default_headers())
+    is_third_party_anthropic = bool(
+        api_key
+        and api_mode == "anthropic_messages"
+        and "api.anthropic.com" not in normalized
+    )
+
+    def _build_headers(auth_method: str) -> dict[str, str]:
+        h: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
+        if api_key:
+            if auth_method == "x-api-key":
+                h["x-api-key"] = api_key
+                h["anthropic-version"] = "2023-06-01"
+            else:
+                h["Authorization"] = f"Bearer {api_key}"
+        if normalized.startswith(COPILOT_BASE_URL):
+            h.update(copilot_default_headers())
+        return h
+
+    # Third-party Anthropic-compatible providers (e.g. PackyAPI) often
+    # accept Bearer auth on /v1/models even though chat uses x-api-key.
+    # Try Bearer first, then fall back to x-api-key.
+    auth_methods = (
+        ["bearer", "x-api-key"] if is_third_party_anthropic
+        else ["x-api-key"] if (api_key and api_mode == "anthropic_messages")
+        else ["bearer"]
+    )
 
     for candidate_base, is_fallback in candidates:
         url = candidate_base.rstrip("/") + "/models"
+        for auth_method in auth_methods:
+            headers = _build_headers(auth_method)
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    data = json.loads(resp.read().decode())
+                    return {
+                        "models": [m.get("id", "") for m in data.get("data", [])],
+                        "probed_url": url,
+                        "resolved_base_url": candidate_base.rstrip("/"),
+                        "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,
+                        "used_fallback": is_fallback,
+                    }
+            except Exception:
+                continue
         tried.append(url)
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode())
-                return {
-                    "models": [m.get("id", "") for m in data.get("data", [])],
-                    "probed_url": url,
-                    "resolved_base_url": candidate_base.rstrip("/"),
-                    "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,
-                    "used_fallback": is_fallback,
-                }
-        except Exception:
-            continue
 
     return {
         "models": None,
