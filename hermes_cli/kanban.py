@@ -661,6 +661,51 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_transition.add_argument("--actor", default=None)
     p_transition.add_argument("--json", action="store_true")
 
+    # --- pixel ---
+    p_pixel = sub.add_parser(
+        "pixel",
+        help="Native Kanban Pixel goal, evidence, claims, and done gate",
+    )
+    pixel_sub = p_pixel.add_subparsers(dest="pixel_action")
+
+    px_brief = pixel_sub.add_parser("brief", help="Show native Pixel board brief")
+    px_brief.add_argument("--json", action="store_true")
+
+    px_goal = pixel_sub.add_parser("goal", help="Set native Pixel goal/success contract")
+    px_goal.add_argument("text")
+    px_goal.add_argument("--success", action="append", required=True)
+    px_goal.add_argument("--json", action="store_true")
+
+    px_stage = pixel_sub.add_parser("stage", help="Map a stage to its conversion event")
+    px_stage.add_argument("stage_key")
+    px_stage.add_argument("--event", required=True, dest="conversion_event")
+    px_stage.add_argument("--json", action="store_true")
+
+    px_event = pixel_sub.add_parser("event", help="Record typed Pixel evidence event")
+    px_event.add_argument("type")
+    px_event.add_argument("--stage", required=True, dest="stage_key")
+    px_event.add_argument("--task", default=None, dest="task_id")
+    px_event.add_argument("--status", required=True, choices=sorted(kb.PIXEL_EVENT_STATUSES))
+    px_event.add_argument("--evidence", required=True)
+    px_event.add_argument("--json", action="store_true")
+
+    px_claim = pixel_sub.add_parser("claim", help="Claim a Pixel lane/resource")
+    px_claim.add_argument("--lane", required=True, dest="lane_id")
+    px_claim.add_argument("--task", default=None, dest="task_id")
+    px_claim.add_argument("--agent", required=True, dest="agent_id")
+    px_claim.add_argument("--evidence", required=True)
+    px_claim.add_argument("--json", action="store_true")
+
+    px_release = pixel_sub.add_parser("release", help="Release a Pixel lane/resource claim")
+    px_release.add_argument("--claim", required=True, type=int, dest="claim_id")
+    px_release.add_argument("--agent", required=True, dest="agent_id")
+    px_release.add_argument("--evidence", required=True)
+    px_release.add_argument("--json", action="store_true")
+
+    px_done = pixel_sub.add_parser("done", help="Validate and close a task through Pixel done gate")
+    px_done.add_argument("task_id", nargs="?")
+    px_done.add_argument("--json", action="store_true")
+
     p_unblock = sub.add_parser("unblock", help="Return one or more blocked/scheduled/watching tasks to ready")
     p_unblock.add_argument("task_ids", nargs="+")
 
@@ -1083,6 +1128,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "wait":     _cmd_wait,
         "trigger":  _cmd_trigger,
         "transition": _cmd_transition,
+        "pixel":    _cmd_pixel,
         "unblock":  _cmd_unblock,
         "promote":  _cmd_promote,
         "archive":  _cmd_archive,
@@ -2102,6 +2148,136 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_pixel(args: argparse.Namespace) -> int:
+    action = getattr(args, "pixel_action", None) or "brief"
+    as_json = bool(getattr(args, "json", False))
+
+    if action == "brief":
+        with kb.connect() as conn:
+            brief = kb.pixel_brief(conn)
+        if as_json:
+            print(json.dumps(brief, indent=2, ensure_ascii=False))
+        else:
+            print(
+                f"Pixel board {brief['board']}: "
+                f"{'enabled' if brief.get('pixel_enabled') else 'disabled'}"
+            )
+            if brief.get("goal"):
+                print(f"Goal: {brief['goal']}")
+            print(f"Done gates: {len(brief.get('done_gates') or [])}")
+            blockers = brief.get("blockers") or []
+            if blockers:
+                print(f"Blockers: {len(blockers)}")
+        return 0
+
+    if action == "goal":
+        payload = kb.set_pixel_goal(args.board, args.text, args.success)
+        if as_json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            pixel = payload.get("pixel") or {}
+            print(
+                f"Pixel goal set for {payload.get('slug') or payload.get('name') or args.board or kb.get_current_board()}: "
+                f"{pixel.get('goal')}"
+            )
+        return 0
+
+    if action == "stage":
+        payload = kb.set_pixel_stage_event(args.board, args.stage_key, args.conversion_event)
+        if as_json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            stage = kb._normalize_funnel_text(args.stage_key)
+            event = kb._normalize_funnel_text(args.conversion_event)
+            print(f"Pixel stage mapped: {stage} -> {event}")
+        return 0
+
+    if action == "event":
+        with kb.connect() as conn:
+            event = kb.record_pixel_event(
+                conn,
+                event_type=args.type,
+                stage_key=args.stage_key,
+                status=args.status,
+                evidence=args.evidence,
+                task_id=args.task_id,
+            )
+        payload = kb.pixel_event_to_dict(event)
+        if as_json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(
+                f"Pixel event recorded: {payload['type']} "
+                f"({payload['status']}) for {payload.get('task_id') or 'board'}"
+            )
+        return 0
+
+    if action == "claim":
+        with kb.connect() as conn:
+            claim = kb.claim_pixel_lane(
+                conn,
+                lane_id=args.lane_id,
+                task_id=args.task_id,
+                agent_id=args.agent_id,
+                evidence=args.evidence,
+            )
+        payload = kb.pixel_claim_to_dict(claim)
+        if as_json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(f"Pixel claim {payload['id']} active on lane {payload['lane_id']}")
+        return 0
+
+    if action == "release":
+        with kb.connect() as conn:
+            claim = kb.release_pixel_claim(
+                conn,
+                claim_id=args.claim_id,
+                agent_id=args.agent_id,
+                evidence=args.evidence,
+            )
+        payload = kb.pixel_claim_to_dict(claim)
+        if as_json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(f"Pixel claim {payload['id']} released")
+        return 0
+
+    if action == "done":
+        with kb.connect() as conn:
+            task_id = getattr(args, "task_id", None)
+            if task_id:
+                verdict = kb.validate_pixel_done(conn, task_id)
+                if as_json:
+                    print(json.dumps(verdict, indent=2, ensure_ascii=False))
+                else:
+                    status = "pass" if verdict.get("ok") else "fail"
+                    print(f"Pixel done gate {status}: {task_id}")
+                    for blocker in verdict.get("blockers") or []:
+                        print(f"- {blocker.get('code')}: {blocker.get('message')}")
+                return 0 if verdict.get("ok") else 1
+
+            brief = kb.pixel_brief(conn)
+        if as_json:
+            print(json.dumps(brief, indent=2, ensure_ascii=False))
+        else:
+            gates = brief.get("done_gates") or []
+            passed = sum(1 for gate in gates if gate.get("ok"))
+            print(f"Pixel done gates: {passed}/{len(gates)} ok")
+            for gate in gates:
+                if not gate.get("ok"):
+                    codes = ", ".join(
+                        str(blocker.get("code"))
+                        for blocker in gate.get("blockers", [])
+                        if blocker.get("code")
+                    )
+                    print(f"- {gate.get('task_id')}: {codes or 'blocked'}")
+        return 0 if all(gate.get("ok") for gate in brief.get("done_gates", [])) else 1
+
+    print(f"kanban pixel: unknown action {action!r}", file=sys.stderr)
+    return 2
+
+
 def _worker_run_id_for(task_id: str) -> Optional[int]:
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return None
@@ -2145,13 +2321,32 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect() as conn:
         for tid in ids:
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except kb.PixelDoneGateError as exc:
+                failed.append(tid)
+                if getattr(args, "json", False):
+                    print(json.dumps(exc.verdict, indent=2, ensure_ascii=False))
+                else:
+                    blockers = exc.verdict.get("blockers") or []
+                    codes = ", ".join(
+                        str(blocker.get("code"))
+                        for blocker in blockers
+                        if blocker.get("code")
+                    )
+                    print(
+                        f"kanban: pixel done gate failed for {tid}: "
+                        f"{codes or 'blocked'}",
+                        file=sys.stderr,
+                    )
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:

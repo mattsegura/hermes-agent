@@ -1220,6 +1220,58 @@ class Event:
 
 
 @dataclass
+class PixelEvent:
+    id: int
+    event_type: str
+    stage_key: str
+    task_id: Optional[str]
+    status: str
+    evidence: str
+    created_at: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "PixelEvent":
+        return cls(
+            id=int(row["id"]),
+            event_type=row["event_type"],
+            stage_key=row["stage_key"],
+            task_id=row["task_id"],
+            status=row["status"],
+            evidence=row["evidence"],
+            created_at=int(row["created_at"]),
+        )
+
+
+@dataclass
+class PixelClaim:
+    id: int
+    lane_id: str
+    task_id: Optional[str]
+    agent_id: str
+    claim_token: str
+    evidence: str
+    active: bool
+    claimed_at: int
+    released_at: Optional[int]
+    release_evidence: Optional[str]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "PixelClaim":
+        return cls(
+            id=int(row["id"]),
+            lane_id=row["lane_id"],
+            task_id=row["task_id"],
+            agent_id=row["agent_id"],
+            claim_token=row["claim_token"],
+            evidence=row["evidence"],
+            active=bool(row["active"]),
+            claimed_at=int(row["claimed_at"]),
+            released_at=(int(row["released_at"]) if row["released_at"] is not None else None),
+            release_evidence=row["release_evidence"],
+        )
+
+
+@dataclass
 class WatchRoute:
     """Event route that wakes a task parked in the healthy ``watching`` state."""
 
@@ -1428,6 +1480,31 @@ CREATE TABLE IF NOT EXISTS task_watch_routes (
     trigger_payload TEXT
 );
 
+-- Native Kanban Pixel ledger. Pixel state intentionally lives in the board DB
+-- and board metadata, never in .humanless_pixel sidecars.
+CREATE TABLE IF NOT EXISTS kanban_pixel_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type  TEXT NOT NULL,
+    stage_key   TEXT NOT NULL,
+    task_id     TEXT,
+    status      TEXT NOT NULL,
+    evidence    TEXT NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS kanban_pixel_claims (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    lane_id          TEXT NOT NULL,
+    task_id          TEXT,
+    agent_id         TEXT NOT NULL,
+    claim_token      TEXT NOT NULL,
+    evidence         TEXT NOT NULL,
+    active           INTEGER NOT NULL DEFAULT 1,
+    claimed_at       INTEGER NOT NULL,
+    released_at      INTEGER,
+    release_evidence TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1439,6 +1516,9 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_watch_task            ON task_watch_routes(task_id, active);
 CREATE INDEX IF NOT EXISTS idx_watch_trigger         ON task_watch_routes(trigger_type, trigger_key, active);
+CREATE INDEX IF NOT EXISTS idx_pixel_events_stage    ON kanban_pixel_events(stage_key, event_type, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_pixel_events_task     ON kanban_pixel_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_pixel_claims_active   ON kanban_pixel_claims(active, lane_id, task_id);
 """
 
 
@@ -3467,6 +3547,548 @@ def list_events(conn: sqlite3.Connection, task_id: str) -> list[Event]:
     return out
 
 
+PIXEL_EVENT_STATUSES = {"pass", "fail", "info", "blocked"}
+
+
+def _pixel_config(board: Optional[str] = None) -> dict:
+    meta = read_board_metadata(board)
+    pixel = meta.get("pixel")
+    return dict(pixel) if isinstance(pixel, dict) else {}
+
+
+def is_pixel_enabled(board: Optional[str] = None) -> bool:
+    pixel = _pixel_config(board)
+    return bool(str(pixel.get("goal") or "").strip() and _string_list(pixel.get("success")))
+
+
+def set_pixel_goal(board: Optional[str], goal: str, success: Iterable[str]) -> dict:
+    """Enable Pixel on a board by writing the native goal/success contract."""
+    goal_text = str(goal or "").strip()
+    success_list = _string_list(success)
+    if not goal_text:
+        raise ValueError("pixel goal text is required")
+    if not success_list:
+        raise ValueError("at least one --success criterion is required")
+    slug = _normalize_board_slug(board) or get_current_board()
+    meta = read_board_metadata(slug)
+    pixel = dict(meta.get("pixel") or {})
+    pixel["goal"] = goal_text
+    pixel["success"] = success_list
+    meta.pop("db_path", None)
+    meta["pixel"] = pixel
+    if not meta.get("created_at"):
+        meta["created_at"] = int(time.time())
+    path = board_metadata_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    meta["db_path"] = str(kanban_db_path(slug))
+    return meta
+
+
+def set_pixel_stage_event(board: Optional[str], stage_key: str, conversion_event: str) -> dict:
+    """Configure the typed conversion event required to exit a Pixel stage."""
+    stage = _normalize_funnel_text(stage_key)
+    event = _normalize_funnel_text(conversion_event)
+    if not stage:
+        raise ValueError("stage_key is required")
+    if not event:
+        raise ValueError("conversion_event is required")
+    slug = _normalize_board_slug(board) or get_current_board()
+    meta = read_board_metadata(slug)
+    pixel = dict(meta.get("pixel") or {})
+    stages = dict(pixel.get("stages") or {})
+    stages[stage] = event
+    pixel["stages"] = stages
+    meta.pop("db_path", None)
+    meta["pixel"] = pixel
+    if not meta.get("created_at"):
+        meta["created_at"] = int(time.time())
+    path = board_metadata_path(slug)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    meta["db_path"] = str(kanban_db_path(slug))
+    return meta
+
+
+def record_pixel_event(
+    conn: sqlite3.Connection,
+    *,
+    event_type: str,
+    stage_key: str,
+    status: str,
+    evidence: str,
+    task_id: Optional[str] = None,
+) -> PixelEvent:
+    event = _normalize_funnel_text(event_type)
+    stage = _normalize_funnel_text(stage_key)
+    normalized_status = str(status or "").strip().lower()
+    evidence_text = str(evidence or "").strip()
+    if not event:
+        raise ValueError("pixel event type is required")
+    if not stage:
+        raise ValueError("pixel event stage_key is required")
+    if normalized_status not in PIXEL_EVENT_STATUSES:
+        raise ValueError("pixel event status must be one of: blocked, fail, info, pass")
+    if not evidence_text:
+        raise ValueError("pixel event evidence is required")
+    if task_id and get_task(conn, task_id) is None:
+        raise ValueError(f"unknown task: {task_id}")
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            INSERT INTO kanban_pixel_events
+                (event_type, stage_key, task_id, status, evidence, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (event, stage, task_id, normalized_status, evidence_text, now),
+        )
+        event_id = int(cur.lastrowid or 0)
+        if task_id:
+            _append_event(
+                conn,
+                task_id,
+                "pixel_event",
+                {
+                    "pixel_event_id": event_id,
+                    "event_type": event,
+                    "stage_key": stage,
+                    "status": normalized_status,
+                    "evidence": evidence_text,
+                },
+            )
+    row = conn.execute("SELECT * FROM kanban_pixel_events WHERE id = ?", (event_id,)).fetchone()
+    return PixelEvent.from_row(row)
+
+
+def list_pixel_events(
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str] = None,
+    limit: int = 20,
+) -> list[PixelEvent]:
+    params: list[Any] = []
+    query = "SELECT * FROM kanban_pixel_events WHERE 1=1"
+    if task_id is not None:
+        query += " AND (task_id = ? OR task_id IS NULL)"
+        params.append(task_id)
+    query += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(max(1, int(limit)))
+    return [PixelEvent.from_row(row) for row in conn.execute(query, params).fetchall()]
+
+
+def claim_pixel_lane(
+    conn: sqlite3.Connection,
+    *,
+    lane_id: str,
+    agent_id: str,
+    evidence: str,
+    task_id: Optional[str] = None,
+) -> PixelClaim:
+    lane = _normalize_funnel_text(lane_id)
+    agent = str(agent_id or "").strip()
+    evidence_text = str(evidence or "").strip()
+    if not lane:
+        raise ValueError("pixel claim lane_id is required")
+    if not agent:
+        raise ValueError("pixel claim agent_id is required")
+    if not evidence_text:
+        raise ValueError("pixel claim evidence is required")
+    if task_id and get_task(conn, task_id) is None:
+        raise ValueError(f"unknown task: {task_id}")
+    now = int(time.time())
+    token = secrets.token_hex(12)
+    with write_txn(conn):
+        conflict = conn.execute(
+            """
+            SELECT * FROM kanban_pixel_claims
+             WHERE active = 1 AND lane_id = ?
+             ORDER BY claimed_at DESC, id DESC LIMIT 1
+            """,
+            (lane,),
+        ).fetchone()
+        if conflict is not None:
+            raise ValueError(
+                f"pixel claim conflict on lane {lane!r}: active claim "
+                f"{conflict['id']} by {conflict['agent_id']}"
+            )
+        cur = conn.execute(
+            """
+            INSERT INTO kanban_pixel_claims
+                (lane_id, task_id, agent_id, claim_token, evidence, active, claimed_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?)
+            """,
+            (lane, task_id, agent, token, evidence_text, now),
+        )
+        claim_id = int(cur.lastrowid or 0)
+        if task_id:
+            _append_event(
+                conn,
+                task_id,
+                "pixel_claimed",
+                {
+                    "claim_id": claim_id,
+                    "lane_id": lane,
+                    "agent_id": agent,
+                    "evidence": evidence_text,
+                },
+            )
+    row = conn.execute("SELECT * FROM kanban_pixel_claims WHERE id = ?", (claim_id,)).fetchone()
+    return PixelClaim.from_row(row)
+
+
+def release_pixel_claim(
+    conn: sqlite3.Connection,
+    *,
+    claim_id: int,
+    agent_id: str,
+    evidence: str,
+) -> PixelClaim:
+    agent = str(agent_id or "").strip()
+    evidence_text = str(evidence or "").strip()
+    if not agent:
+        raise ValueError("pixel release agent_id is required")
+    if not evidence_text:
+        raise ValueError("pixel release evidence is required")
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM kanban_pixel_claims WHERE id = ? AND active = 1",
+            (int(claim_id),),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"active pixel claim {claim_id} not found")
+        if row["agent_id"] != agent:
+            raise ValueError(
+                f"pixel claim {claim_id} is owned by {row['agent_id']!r}, not {agent!r}"
+            )
+        conn.execute(
+            """
+            UPDATE kanban_pixel_claims
+               SET active = 0, released_at = ?, release_evidence = ?
+             WHERE id = ? AND active = 1
+            """,
+            (now, evidence_text, int(claim_id)),
+        )
+        if row["task_id"]:
+            _append_event(
+                conn,
+                row["task_id"],
+                "pixel_released",
+                {
+                    "claim_id": int(claim_id),
+                    "lane_id": row["lane_id"],
+                    "agent_id": agent,
+                    "evidence": evidence_text,
+                },
+            )
+    released = conn.execute("SELECT * FROM kanban_pixel_claims WHERE id = ?", (int(claim_id),)).fetchone()
+    return PixelClaim.from_row(released)
+
+
+def list_pixel_claims(
+    conn: sqlite3.Connection,
+    *,
+    active: Optional[bool] = None,
+    task_id: Optional[str] = None,
+) -> list[PixelClaim]:
+    query = "SELECT * FROM kanban_pixel_claims WHERE 1=1"
+    params: list[Any] = []
+    if active is not None:
+        query += " AND active = ?"
+        params.append(1 if active else 0)
+    if task_id is not None:
+        query += " AND (task_id = ? OR task_id IS NULL)"
+        params.append(task_id)
+    query += " ORDER BY active DESC, claimed_at DESC, id DESC"
+    return [PixelClaim.from_row(row) for row in conn.execute(query, params).fetchall()]
+
+
+def pixel_claim_to_dict(claim: PixelClaim) -> dict[str, Any]:
+    return {
+        "id": claim.id,
+        "lane_id": claim.lane_id,
+        "task_id": claim.task_id,
+        "agent_id": claim.agent_id,
+        "evidence": claim.evidence,
+        "active": claim.active,
+        "claimed_at": claim.claimed_at,
+        "released_at": claim.released_at,
+        "release_evidence": claim.release_evidence,
+    }
+
+
+def pixel_event_to_dict(event: PixelEvent) -> dict[str, Any]:
+    return {
+        "id": event.id,
+        "type": event.event_type,
+        "stage_key": event.stage_key,
+        "task_id": event.task_id,
+        "status": event.status,
+        "evidence": event.evidence,
+        "created_at": event.created_at,
+    }
+
+
+def _pixel_typed_evidence_keys(
+    *,
+    funnel_data: Optional[dict],
+    metadata: Optional[dict],
+    pixel_events: Iterable[PixelEvent],
+) -> set[str]:
+    keys: set[str] = set()
+
+    def add(value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for k, v in value.items():
+                if v:
+                    keys.add(str(k).strip())
+                    add(v)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                add(item)
+            return
+        text = str(value).strip()
+        if text:
+            keys.add(text)
+
+    if isinstance(funnel_data, dict):
+        add(funnel_data.get("transition_evidence"))
+        for field in ("proof", "proofs", "artifact", "artifacts", "outcome", "outcomes", "evidence"):
+            add(funnel_data.get(field))
+    if isinstance(metadata, dict):
+        for key, value in metadata.items():
+            key_text = str(key).strip()
+            if key_text and value and any(part in key_text for part in ("proof", "artifact", "outcome")):
+                keys.add(key_text)
+            if key_text in {
+                "proof", "proofs", "artifact", "artifacts",
+                "outcome", "outcomes", "evidence", "transition_evidence",
+            }:
+                add(value)
+    for event in pixel_events:
+        if event.status == "pass":
+            keys.add(event.event_type)
+            keys.add(event.evidence)
+    return {key for key in keys if key}
+
+
+def _pixel_open_required_variables(funnel_data: Optional[dict]) -> list[str]:
+    if not isinstance(funnel_data, dict):
+        return []
+    candidates: list[Any] = [
+        funnel_data.get("open_required_variables"),
+        funnel_data.get("required_variables_open"),
+        funnel_data.get("open_variables"),
+    ]
+    conversation_state = funnel_data.get("conversation_state")
+    if isinstance(conversation_state, dict):
+        candidates.extend([
+            conversation_state.get("open_required_variables"),
+            conversation_state.get("required_variables_open"),
+            conversation_state.get("open_variables"),
+        ])
+    out: list[str] = []
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            out.extend(str(k) for k, v in candidate.items() if v)
+        elif isinstance(candidate, (list, tuple, set)):
+            out.extend(str(item) for item in candidate if str(item).strip())
+        elif isinstance(candidate, str) and candidate.strip():
+            out.append(candidate.strip())
+    return sorted(set(out))
+
+
+def _pixel_requires_approval(pixel: dict, funnel_data: Optional[dict]) -> bool:
+    if pixel.get("approval_required") or pixel.get("owner_approval_required") or pixel.get("policy_approval_required"):
+        return True
+    if not isinstance(funnel_data, dict):
+        return False
+    if funnel_data.get("approval_required") or funnel_data.get("requires_approval"):
+        return True
+    authority = funnel_data.get("authority") or funnel_data.get("approval") or {}
+    return isinstance(authority, dict) and bool(
+        authority.get("requires_approval")
+        or authority.get("owner_approval_required")
+        or authority.get("policy_approval_required")
+    )
+
+
+def validate_pixel_done(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    metadata: Optional[dict] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return the native Pixel done-gate verdict for ``task_id``.
+
+    The verdict is machine-readable and fail-closed: Pixel-enabled boards must
+    satisfy their goal/success contract, typed conversion evidence, no open
+    missing evidence/variables/approval gates, and no active execution routes
+    or Pixel claims before a task may move to ``done``.
+    """
+    slug = _normalize_board_slug(board) or get_current_board()
+    pixel = _pixel_config(slug)
+    task = get_task(conn, task_id)
+    blockers: list[dict[str, Any]] = []
+    if task is None:
+        return {"ok": False, "task_id": task_id, "board": slug, "pixel_enabled": bool(pixel), "blockers": [{"code": "unknown_task", "message": f"unknown task: {task_id}"}]}
+
+    goal = str(pixel.get("goal") or "").strip()
+    success = _string_list(pixel.get("success"))
+    pixel_enabled = bool(goal and success)
+    if not pixel_enabled:
+        blockers.append({
+            "code": "missing_pixel_contract",
+            "message": "board has no native Pixel goal/success contract",
+        })
+
+    current_stage = task.stage_key or task.current_step_key
+    stage_events = dict(pixel.get("stages") or {}) if isinstance(pixel.get("stages"), dict) else {}
+    if stage_events and not current_stage:
+        blockers.append({
+            "code": "missing_current_stage",
+            "message": "task has no current Pixel stage",
+        })
+
+    pixel_events = list_pixel_events(conn, task_id=task_id, limit=100)
+    typed_keys = _pixel_typed_evidence_keys(
+        funnel_data=task.funnel_data,
+        metadata=metadata,
+        pixel_events=pixel_events,
+    )
+    required_evidence: set[str] = set()
+    if current_stage and stage_events.get(current_stage):
+        required_evidence.add(str(stage_events[current_stage]).strip())
+
+    workflow = read_board_metadata(slug).get("workflow")
+    if isinstance(workflow, dict) and current_stage:
+        stage = _workflow_stage_map(workflow).get(current_stage)
+        if isinstance(stage, dict):
+            for exit_row in stage.get("exit_criteria") or []:
+                if isinstance(exit_row, dict):
+                    required_evidence |= {
+                        str(item).strip()
+                        for item in exit_row.get("evidence_required") or []
+                        if str(item).strip()
+                    }
+
+    missing_required = sorted(key for key in required_evidence if key not in typed_keys)
+    if missing_required:
+        blockers.append({
+            "code": "missing_stage_conversion_evidence",
+            "message": "missing typed Pixel stage conversion evidence",
+            "stage_key": current_stage,
+            "missing": missing_required,
+        })
+
+    if isinstance(task.funnel_data, dict):
+        missing_evidence = task.funnel_data.get("missing_evidence")
+        if isinstance(missing_evidence, dict):
+            missing_evidence = [k for k, v in missing_evidence.items() if v]
+        if isinstance(missing_evidence, (list, tuple, set)) and any(str(item).strip() for item in missing_evidence):
+            blockers.append({
+                "code": "funnel_missing_evidence",
+                "message": "funnel_data.missing_evidence is not empty",
+                "missing": [str(item) for item in missing_evidence if str(item).strip()],
+            })
+
+    open_vars = _pixel_open_required_variables(task.funnel_data)
+    if open_vars:
+        blockers.append({
+            "code": "open_required_variables",
+            "message": "required conversation variables are still open",
+            "variables": open_vars,
+        })
+
+    if _pixel_requires_approval(pixel, task.funnel_data):
+        approval_keys = {"approval", "owner_approval", "policy_approval"}
+        has_approval = bool(approval_keys & typed_keys)
+        if not has_approval:
+            blockers.append({
+                "code": "missing_approval_evidence",
+                "message": "owner/policy approval is required but no approval evidence exists",
+            })
+
+    if task.status == "blocked":
+        blockers.append({"code": "task_blocked", "message": "task status is blocked"})
+
+    active_routes = list_watch_routes(conn, task_id=task_id, active=True)
+    if active_routes:
+        blockers.append({
+            "code": "active_watch_routes",
+            "message": "task has active watch routes",
+            "routes": [watch_route_to_dict(route) for route in active_routes],
+        })
+
+    active_claims = list_pixel_claims(conn, active=True)
+    if active_claims:
+        blockers.append({
+            "code": "active_pixel_claims",
+            "message": "board has active Pixel claims",
+            "claims": [pixel_claim_to_dict(claim) for claim in active_claims],
+        })
+
+    return {
+        "ok": not blockers,
+        "task_id": task_id,
+        "board": slug,
+        "pixel_enabled": pixel_enabled,
+        "goal": goal or None,
+        "success": success,
+        "stage_key": current_stage,
+        "required_evidence": sorted(required_evidence),
+        "typed_evidence": sorted(typed_keys),
+        "blockers": blockers,
+    }
+
+
+class PixelDoneGateError(RuntimeError):
+    """Raised when a Pixel-enabled board rejects task completion."""
+
+    def __init__(self, verdict: dict[str, Any]):
+        self.verdict = verdict
+        codes = ", ".join(str(b.get("code")) for b in verdict.get("blockers", []))
+        super().__init__(f"pixel done gate failed for {verdict.get('task_id')}: {codes}")
+
+
+def pixel_brief(conn: sqlite3.Connection, *, board: Optional[str] = None) -> dict[str, Any]:
+    slug = _normalize_board_slug(board) or get_current_board()
+    pixel = _pixel_config(slug)
+    recent_events = [pixel_event_to_dict(event) for event in list_pixel_events(conn, limit=20)]
+    active_claims = [pixel_claim_to_dict(claim) for claim in list_pixel_claims(conn, active=True)]
+    blockers: list[dict[str, Any]] = []
+    done_gates: list[dict[str, Any]] = []
+    for task in list_tasks(conn, include_archived=False):
+        if task.status in {"done", "archived"}:
+            continue
+        verdict = validate_pixel_done(conn, task.id, board=slug)
+        summary = {
+            "task_id": task.id,
+            "ok": verdict["ok"],
+            "stage_key": verdict.get("stage_key"),
+            "blockers": verdict.get("blockers", []),
+        }
+        done_gates.append(summary)
+        if not verdict["ok"]:
+            blockers.extend(verdict.get("blockers", []))
+    return {
+        "board": slug,
+        "pixel_enabled": is_pixel_enabled(slug),
+        "goal": pixel.get("goal"),
+        "success": _string_list(pixel.get("success")),
+        "stages": dict(pixel.get("stages") or {}),
+        "recent_events": recent_events,
+        "active_claims": active_claims,
+        "blockers": blockers,
+        "done_gates": done_gates,
+    }
+
+
 def _append_event(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4340,6 +4962,19 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    board_slug = _normalize_board_slug(board) or get_current_board()
+    if is_pixel_enabled(board_slug):
+        verdict = validate_pixel_done(conn, task_id, metadata=metadata, board=board_slug)
+        if not verdict.get("ok"):
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "pixel_done_blocked",
+                    {"verdict": verdict},
+                )
+            raise PixelDoneGateError(verdict)
 
     with write_txn(conn):
         if expected_run_id is None:
