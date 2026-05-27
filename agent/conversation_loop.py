@@ -64,6 +64,7 @@ from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
+from agent.turn_telemetry import TurnTelemetry
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import display_hermes_home as _dhh_fn, PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -125,6 +126,29 @@ def _ra():
     """
     import run_agent
     return run_agent
+
+
+def _build_turn_telemetry() -> TurnTelemetry:
+    """Load telemetry config defensively and return a collector."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        perf_cfg = cfg.get("performance") if isinstance(cfg, dict) else {}
+        telemetry_cfg = (
+            perf_cfg.get("telemetry")
+            if isinstance(perf_cfg, dict)
+            else {}
+        )
+        if not isinstance(telemetry_cfg, dict):
+            telemetry_cfg = {}
+        return TurnTelemetry(
+            enabled=telemetry_cfg.get("enabled", True),
+            log_turn_summary=telemetry_cfg.get("log_turn_summary", True),
+        )
+    except Exception:
+        logger.debug("turn telemetry config load failed", exc_info=True)
+        return TurnTelemetry(enabled=False, log_turn_summary=False)
 
 
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
@@ -291,6 +315,9 @@ def run_conversation(
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     # Installed once, transparent when streams are healthy, prevents crash on write.
     _install_safe_stdio()
+
+    turn_telemetry = _build_turn_telemetry()
+    agent._turn_telemetry = turn_telemetry
 
     agent._ensure_db_session()
 
@@ -502,6 +529,7 @@ def run_conversation(
     # while having a large existing session — compress proactively rather
     # than waiting for an API error (which might be caught as a non-retryable
     # 4xx and abort the request entirely).
+    _preflight_compression_started = time.perf_counter()
     if (
         agent.compression_enabled
         and len(messages) > agent.context_compressor.protect_first_n
@@ -562,6 +590,9 @@ def run_conversation(
                 )
                 if _preflight_tokens < agent.context_compressor.threshold_tokens:
                     break  # Under threshold
+    turn_telemetry.record_preflight_compression(
+        time.perf_counter() - _preflight_compression_started
+    )
 
     # Plugin hook: pre_llm_call
     # Fired once per turn before the tool-calling loop.  Plugins can
@@ -963,6 +994,12 @@ def run_conversation(
         approx_request_tokens = estimate_request_tokens_rough(
             api_messages, tools=agent.tools or None
         )
+        turn_telemetry.record_request_size(
+            message_count=len(api_messages),
+            rough_token_estimate=approx_request_tokens,
+            char_count=total_chars,
+            tool_count=len(agent.tools or []),
+        )
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, approx_request_tokens
@@ -1010,6 +1047,7 @@ def run_conversation(
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
         api_start_time = time.time()
+        turn_telemetry.start_api_call(api_call_count)
         retry_count = 0
         max_retries = agent._api_max_retries
         primary_recovery_attempted = False
@@ -1144,6 +1182,12 @@ def run_conversation(
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
+                def _stop_spinner_with_telemetry():
+                    try:
+                        turn_telemetry.record_first_delta()
+                    finally:
+                        _stop_spinner()
+
                 _use_streaming = True
                 # Provider signaled "stream not supported" on a previous
                 # attempt — switch to non-streaming for the rest of this
@@ -1170,12 +1214,13 @@ def run_conversation(
 
                 if _use_streaming:
                     response = agent._interruptible_streaming_api_call(
-                        api_kwargs, on_first_delta=_stop_spinner
+                        api_kwargs, on_first_delta=_stop_spinner_with_telemetry
                     )
                 else:
                     response = agent._interruptible_api_call(api_kwargs)
                 
                 api_duration = time.time() - api_start_time
+                turn_telemetry.record_api_duration(api_duration, api_call_count)
                 
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
@@ -1664,6 +1709,7 @@ def run_conversation(
                         provider=agent.provider,
                         api_mode=agent.api_mode,
                     )
+                    turn_telemetry.record_usage(canonical_usage)
                     prompt_tokens = canonical_usage.prompt_tokens
                     completion_tokens = canonical_usage.output_tokens
                     total_tokens = canonical_usage.total_tokens
@@ -4231,6 +4277,12 @@ def run_conversation(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    result["performance"] = turn_telemetry.log_summary(
+        session_id=agent.session_id or "",
+        model=agent.model or "",
+        provider=agent.provider or "",
+        log=logger,
+    )
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.

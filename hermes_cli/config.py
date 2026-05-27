@@ -870,6 +870,16 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Low-noise per-turn performance telemetry.  This records timing/count
+    # metadata only; it must not alter request construction or persisted
+    # messages.
+    "performance": {
+        "telemetry": {
+            "enabled": True,
+            "log_turn_summary": True,
+        },
+    },
+
     "compression": {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio
