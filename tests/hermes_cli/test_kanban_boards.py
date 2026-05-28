@@ -259,11 +259,68 @@ class TestBoardCRUD:
         assert meta["objective"] == {
             "statement": "Ship the release",
             "success": ["tests pass"],
+            "failure": [],
             "constraints": ["no downtime"],
         }
         assert [s["key"] for s in meta["workflow"]["stages"]] == [
             "intake", "plan", "execute", "verify", "deliver", "improve",
         ]
+
+    def test_create_accepts_board_operating_contract(self, fresh_home):
+        contract = {
+            "objective": {
+                "statement": "Ship safely",
+                "success": ["all proof collected"],
+                "failure": ["unsafe outbound action"],
+                "constraints": ["mock-only"],
+            },
+            "runtime": {
+                "mode": "company",
+                "dispatcher": {"profile": "ceo"},
+                "profiles": {"ceo": "ceo", "optimizer": "opt", "worker": "worker"},
+                "require_worker_envelopes": True,
+                "require_provider_policy": True,
+                "provider_policy": {"mock_research": {"provider": "fixture"}},
+                "tool_policy": {"mock_research": {"required_toolsets": ["kanban"]}},
+                "worker_envelopes": {
+                    "worker": {
+                        "capabilities": ["mock_research"],
+                        "toolsets": ["kanban"],
+                        "allowed_side_effects": ["none"],
+                    }
+                },
+            },
+            "workflow": {
+                "id": "safe-flow",
+                "goal_id": "safe-goal",
+                "require_semantics": True,
+                "stages": [
+                    {
+                        "key": "execute",
+                        "actions": [
+                            {
+                                "key": "research",
+                                "required_capabilities": ["mock_research"],
+                                "required_toolsets": ["kanban"],
+                                "required_proof": ["mock_report"],
+                                "side_effect_class": "none",
+                            }
+                        ],
+                    }
+                ],
+            },
+        }
+
+        meta = kb.create_board("contract", runtime="company", contract=contract)
+
+        assert meta["objective"]["failure"] == ["unsafe outbound action"]
+        assert meta["runtime"]["mode"] == "company"
+        assert meta["runtime"]["dispatcher"]["profile"] == "ceo"
+        assert meta["runtime"]["provider_policy"]["mock_research"]["provider"] == "fixture"
+        assert meta["runtime"]["worker_envelopes"]["worker"]["capabilities"] == ["mock_research"]
+        action = meta["workflow"]["stages"][0]["actions"][0]
+        assert action["required_capabilities"] == ["mock_research"]
+        assert action["required_proof"] == ["mock_report"]
 
     def test_create_kernel_board_writes_plain_metadata(self, fresh_home):
         meta = kb.create_board("plain", runtime="kernel", name="Plain")
@@ -572,6 +629,50 @@ class TestCLI:
         assert "objective" not in raw
         assert raw["runtime"]["mode"] == "kernel"
         assert "workflow" not in raw
+
+    def test_boards_create_contract_via_cli(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        contract = {
+            "objective": {
+                "statement": "CLI contract goal",
+                "success": ["proof accepted"],
+                "failure": ["missing proof"],
+            },
+            "runtime": {
+                "mode": "company",
+                "dispatcher": {"profile": "ceo"},
+                "provider_policy": {"mock_research": {"provider": "fixture"}},
+                "worker_envelopes": {"worker": {"capabilities": ["mock_research"]}},
+            },
+            "workflow": {"id": "cli-flow", "stages": ["execute"]},
+        }
+        path = tmp_path / "contract.json"
+        path.write_text(json.dumps(contract), encoding="utf-8")
+
+        result = _cli(
+            [
+                "boards", "create", "cli-contract",
+                "--contract", f"@{path}",
+                "--failure", "override failure",
+            ],
+            env_extra=env,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "Runtime:      company" in result.stdout
+        assert "Dispatcher:   ceo" in result.stdout
+        assert "Failure:      override failure" in result.stdout
+        assert "Providers:    mock_research" in result.stdout
+        raw = json.loads(
+            (tmp_path / "kanban" / "boards" / "cli-contract" / "board.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert raw["objective"]["statement"] == "CLI contract goal"
+        assert raw["objective"]["failure"] == ["override failure"]
+        assert raw["runtime"]["mode"] == "company"
+        assert raw["runtime"]["dispatcher"]["profile"] == "ceo"
+        assert raw["runtime"]["worker_envelopes"]["worker"]["capabilities"] == ["mock_research"]
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}

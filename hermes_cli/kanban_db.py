@@ -71,7 +71,10 @@ new locking.
 from __future__ import annotations
 
 import contextlib
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl module.
+    fcntl = None  # type: ignore[assignment]
 import json
 import os
 import re
@@ -374,6 +377,26 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     return board_dir(slug) / "kanban.db"
 
 
+def _board_slug_for_db_path(path: Path) -> Optional[str]:
+    """Infer a board slug from a canonical Kanban DB path when possible."""
+    try:
+        resolved = path.expanduser().resolve()
+    except OSError:
+        resolved = path.expanduser().absolute()
+    try:
+        if resolved == (kanban_home() / "kanban.db").resolve():
+            return DEFAULT_BOARD
+    except OSError:
+        pass
+    try:
+        rel = resolved.relative_to(boards_root().resolve())
+    except (OSError, ValueError):
+        return None
+    if len(rel.parts) == 2 and rel.parts[1] == "kanban.db":
+        return _normalize_board_slug(rel.parts[0])
+    return None
+
+
 def workspaces_root(board: Optional[str] = None) -> Path:
     """Return the directory under which ``scratch`` workspaces are created.
 
@@ -472,7 +495,110 @@ def _string_list(values: Optional[Iterable[str]]) -> list[str]:
         return []
     if isinstance(values, str):
         values = [values]
+    elif isinstance(values, dict):
+        return []
+    elif not isinstance(values, (list, tuple, set)):
+        return []
     return [str(value).strip() for value in values if str(value).strip()]
+
+
+def _coerce_bool(value: Any) -> bool:
+    """Parse operator-authored booleans without making ``"false"`` truthy."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"", "0", "false", "no", "n", "off", "none", "null"}:
+            return False
+    return bool(value)
+
+
+def _json_object(value: Optional[Any], *, field: str) -> Optional[dict]:
+    """Normalize a JSON object supplied as dict or JSON string."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{field} must be a JSON object: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object/dict, got {type(value).__name__}")
+    return dict(value)
+
+
+def _normalize_policy_map(value: Optional[Any], *, field: str) -> dict:
+    """Normalize board runtime policy maps while preserving future keys."""
+    if value in (None, ""):
+        return {}
+    parsed = _json_object(value, field=field)
+    if parsed is None:
+        return {}
+    out: dict[str, Any] = {}
+    for raw_key, raw_policy in parsed.items():
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        if raw_policy is None:
+            out[key] = {}
+        elif isinstance(raw_policy, dict):
+            out[key] = dict(raw_policy)
+        else:
+            raise ValueError(f"{field}.{key} must be an object")
+    return out
+
+
+def _normalize_worker_envelopes(value: Optional[Any]) -> dict:
+    """Normalize runtime.worker_envelopes keyed by worker/profile name."""
+    raw = _normalize_policy_map(value, field="runtime.worker_envelopes")
+    out: dict[str, dict] = {}
+    for profile, envelope in raw.items():
+        row = dict(envelope)
+        for key in (
+            "capabilities",
+            "allowed_capabilities",
+            "toolsets",
+            "allowed_toolsets",
+            "allowed_side_effects",
+            "required_proof",
+            "skills",
+        ):
+            if key in row:
+                row[key] = _string_list(row.get(key))
+        if "capabilities" not in row and "allowed_capabilities" in row:
+            row["capabilities"] = list(row.get("allowed_capabilities") or [])
+        if "toolsets" not in row and "allowed_toolsets" in row:
+            row["toolsets"] = list(row.get("allowed_toolsets") or [])
+        out[profile] = row
+    return out
+
+
+def normalize_board_operating_contract(contract: Optional[Any]) -> dict:
+    """Normalize a serious-board operating contract wrapper."""
+    parsed = _json_object(contract, field="contract")
+    if parsed is None:
+        return {}
+    if isinstance(parsed.get("operating_contract"), dict):
+        parsed = dict(parsed["operating_contract"])
+    elif isinstance(parsed.get("contract"), dict):
+        parsed = dict(parsed["contract"])
+    out: dict[str, Any] = {}
+    if parsed.get("objective") is not None:
+        out["objective"] = normalize_objective_metadata(parsed.get("objective"))
+    if parsed.get("runtime") is not None:
+        out["runtime"] = normalize_runtime_metadata(parsed.get("runtime"))
+    if parsed.get("workflow") is not None:
+        out["workflow"] = normalize_workflow_definition(parsed.get("workflow"))
+    return out
 
 
 def normalize_objective_metadata(objective: Optional[Any]) -> Optional[dict]:
@@ -483,6 +609,7 @@ def normalize_objective_metadata(objective: Optional[Any]) -> Optional[dict]:
         return {
             "statement": objective.strip(),
             "success": [],
+            "failure": [],
             "constraints": [],
         }
     if not isinstance(objective, dict):
@@ -490,6 +617,7 @@ def normalize_objective_metadata(objective: Optional[Any]) -> Optional[dict]:
     out = dict(objective)
     out["statement"] = str(out.get("statement") or out.get("objective") or "").strip()
     out["success"] = _string_list(out.get("success") or out.get("success_criteria"))
+    out["failure"] = _string_list(out.get("failure") or out.get("failure_criteria"))
     out["constraints"] = _string_list(out.get("constraints"))
     return out
 
@@ -499,12 +627,14 @@ def build_objective_metadata(
     statement: Optional[str],
     fallback_statement: str,
     success: Optional[Iterable[str]] = None,
+    failure: Optional[Iterable[str]] = None,
     constraints: Optional[Iterable[str]] = None,
 ) -> dict:
     """Build the objective scaffold used by goal/company runtime boards."""
     return {
         "statement": str(statement or fallback_statement or "").strip(),
         "success": _string_list(success),
+        "failure": _string_list(failure),
         "constraints": _string_list(constraints),
     }
 
@@ -534,6 +664,19 @@ def normalize_runtime_metadata(runtime: Optional[Any]) -> Optional[dict]:
         key: (str(profiles.get(key) or "").strip() or None)
         for key in ("ceo", "optimizer", "worker")
     }
+    out["provider_policy"] = _normalize_policy_map(
+        out.get("provider_policy") or out.get("capabilities"),
+        field="runtime.provider_policy",
+    )
+    out["tool_policy"] = _normalize_policy_map(
+        out.get("tool_policy"),
+        field="runtime.tool_policy",
+    )
+    out["worker_envelopes"] = _normalize_worker_envelopes(out.get("worker_envelopes"))
+    if out.get("require_worker_envelopes") is not None:
+        out["require_worker_envelopes"] = _coerce_bool(out.get("require_worker_envelopes"))
+    if out.get("require_provider_policy") is not None:
+        out["require_provider_policy"] = _coerce_bool(out.get("require_provider_policy"))
     return out
 
 
@@ -555,6 +698,21 @@ def build_runtime_metadata(
             "worker": worker_profile,
         },
     }) or {}
+
+
+def _normalize_workflow_requirement_lists(row: dict) -> dict:
+    """Normalize generic contract lists preserved on stages/actions/workstreams."""
+    out = dict(row)
+    for key in (
+        "required_capabilities",
+        "required_toolsets",
+        "required_proof",
+        "evidence_required",
+        "allowed_side_effects",
+    ):
+        if key in out:
+            out[key] = _string_list(out.get(key))
+    return out
 
 
 def _workflow_list_keys(items: Any, *, field: str) -> list[dict]:
@@ -611,7 +769,7 @@ def normalize_workflow_definition(workflow: Optional[Any]) -> Optional[dict]:
     stage_keys = {stage["key"] for stage in stages}
     normalized_stages: list[dict] = []
     for stage in stages:
-        row = dict(stage)
+        row = _normalize_workflow_requirement_lists(dict(stage))
         if "label" in row and row["label"] is not None:
             row["label"] = str(row["label"])
         if "allowed_lifecycle_states" in row:
@@ -669,7 +827,7 @@ def normalize_workflow_definition(workflow: Optional[Any]) -> Optional[dict]:
             if not isinstance(action, dict):
                 normalized_actions.append(action)
                 continue
-            action_row = dict(action)
+            action_row = _normalize_workflow_requirement_lists(dict(action))
             schema = action_row.get("output_schema")
             if schema is None:
                 normalized_actions.append(action_row)
@@ -692,7 +850,7 @@ def normalize_workflow_definition(workflow: Optional[Any]) -> Optional[dict]:
     if workstreams:
         normalized_workstreams: list[dict] = []
         for ws in workstreams:
-            ws_row = dict(ws)
+            ws_row = _normalize_workflow_requirement_lists(dict(ws))
             stages_allowed = ws_row.get("stages") or ws_row.get("stage_keys") or []
             if isinstance(stages_allowed, str):
                 stages_allowed = [stages_allowed]
@@ -712,7 +870,7 @@ def normalize_workflow_definition(workflow: Optional[Any]) -> Optional[dict]:
             normalized_workstreams.append(ws_row)
         out["workstreams"] = normalized_workstreams
     if out.get("require_semantics") is not None:
-        out["require_semantics"] = bool(out["require_semantics"])
+        out["require_semantics"] = _coerce_bool(out["require_semantics"])
     return out
 
 
@@ -764,6 +922,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         "objective": None,
         "runtime": None,
         "workflow": None,
+        "metadata_error": None,
         "created_at": None,
         "archived": False,
     }
@@ -771,7 +930,11 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
         p = board_metadata_path(slug)
         if p.exists():
             raw = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
+            if not isinstance(raw, dict):
+                meta["metadata_error"] = (
+                    f"invalid board metadata: expected object/dict, got {type(raw).__name__}"
+                )
+            else:
                 # Never let the metadata file claim a different slug than
                 # its directory — trust the filesystem.
                 raw["slug"] = slug
@@ -782,8 +945,8 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 if raw.get("workflow") is not None:
                     raw["workflow"] = normalize_workflow_definition(raw.get("workflow"))
                 meta.update(raw)
-    except (OSError, json.JSONDecodeError, ValueError):
-        pass
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        meta["metadata_error"] = f"invalid board metadata: {exc}"
     meta["db_path"] = str(kanban_db_path(slug))
     return meta
 
@@ -808,9 +971,10 @@ def write_board_metadata(
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
-    # Preserve existing DB-derived fields — they get re-computed each
-    # read but shouldn't be written into board.json.
+    # Preserve existing DB-derived/runtime-error fields — they get re-computed
+    # each read but shouldn't be written into board.json.
     meta.pop("db_path", None)
+    meta.pop("metadata_error", None)
     if name is not None:
         meta["name"] = str(name).strip() or _default_board_display_name(slug)
     if description is not None:
@@ -863,15 +1027,17 @@ def create_board(
     icon: Optional[str] = None,
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
-    runtime: Optional[str] = "goal",
+    runtime: Optional[str] = None,
     objective: Optional[str] = None,
     success: Optional[Iterable[str]] = None,
+    failure: Optional[Iterable[str]] = None,
     constraints: Optional[Iterable[str]] = None,
     dispatcher_profile: Optional[str] = None,
     ceo_profile: Optional[str] = None,
     optimizer_profile: Optional[str] = None,
     worker_profile: Optional[str] = None,
     workflow: Optional[Any] = None,
+    contract: Optional[Any] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -882,32 +1048,64 @@ def create_board(
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
-    runtime_mode = normalize_runtime_mode(runtime)
+    contract_meta = normalize_board_operating_contract(contract) if contract is not None else {}
+    contract_objective = contract_meta.get("objective") if isinstance(contract_meta.get("objective"), dict) else None
+    contract_runtime = contract_meta.get("runtime") if isinstance(contract_meta.get("runtime"), dict) else None
+    contract_workflow = contract_meta.get("workflow") if isinstance(contract_meta.get("workflow"), dict) else None
+    runtime_mode = normalize_runtime_mode(runtime or (contract_runtime or {}).get("mode") or "goal")
     fallback_objective = (
         objective
+        or (contract_objective or {}).get("statement")
         or description
         or name
         or _default_board_display_name(normed)
     )
     if runtime_mode == "kernel":
-        objective_meta = None
-        runtime_meta = normalize_runtime_metadata({"mode": "kernel"})
-        workflow_meta: Any = workflow if workflow is not None else None
+        objective_meta = contract_objective if contract_objective is not None else None
+        runtime_meta = normalize_runtime_metadata(contract_runtime or {"mode": "kernel"}) or {}
+        runtime_meta["mode"] = "kernel"
+        workflow_meta: Any = workflow if workflow is not None else contract_workflow
     else:
-        objective_meta = build_objective_metadata(
-            statement=objective,
-            fallback_statement=fallback_objective,
-            success=success,
-            constraints=constraints,
-        )
-        runtime_meta = build_runtime_metadata(
-            mode=runtime_mode,
-            dispatcher_profile=dispatcher_profile,
-            ceo_profile=ceo_profile,
-            optimizer_profile=optimizer_profile,
-            worker_profile=worker_profile,
-        )
-        workflow_meta = workflow if workflow is not None else default_semantic_workflow()
+        objective_meta = dict(contract_objective or {})
+        if not objective_meta:
+            objective_meta = build_objective_metadata(
+                statement=objective,
+                fallback_statement=fallback_objective,
+                success=success,
+                failure=failure,
+                constraints=constraints,
+            )
+        else:
+            if objective is not None:
+                objective_meta["statement"] = str(objective).strip()
+            else:
+                objective_meta.setdefault("statement", str(fallback_objective or "").strip())
+            objective_meta["success"] = _string_list(success if success is not None else objective_meta.get("success"))
+            objective_meta["failure"] = _string_list(failure if failure is not None else objective_meta.get("failure"))
+            objective_meta["constraints"] = _string_list(constraints if constraints is not None else objective_meta.get("constraints"))
+            objective_meta = normalize_objective_metadata(objective_meta) or objective_meta
+        runtime_meta = dict(contract_runtime or {})
+        runtime_meta["mode"] = runtime_mode
+        dispatcher = runtime_meta.get("dispatcher") or {}
+        if isinstance(dispatcher, str):
+            dispatcher = {"profile": dispatcher}
+        elif not isinstance(dispatcher, dict):
+            dispatcher = {}
+        if dispatcher_profile is not None:
+            dispatcher["profile"] = dispatcher_profile
+        runtime_meta["dispatcher"] = dispatcher
+        profiles = runtime_meta.get("profiles") or {}
+        if not isinstance(profiles, dict):
+            profiles = {}
+        if ceo_profile is not None:
+            profiles["ceo"] = ceo_profile
+        if optimizer_profile is not None:
+            profiles["optimizer"] = optimizer_profile
+        if worker_profile is not None:
+            profiles["worker"] = worker_profile
+        runtime_meta["profiles"] = profiles
+        runtime_meta = normalize_runtime_metadata(runtime_meta)
+        workflow_meta = workflow if workflow is not None else (contract_workflow if contract_workflow is not None else default_semantic_workflow())
     meta = write_board_metadata(
         normed,
         name=name,
@@ -1579,6 +1777,8 @@ def _acquire_db_lock(db_path: Path) -> int:
     Returns the file descriptor (kept open to hold the lock). The lock is
     non-blocking for the first 30s via retry, then raises if still contended.
     """
+    if fcntl is None:
+        raise sqlite3.OperationalError("kanban DB file locking requires fcntl on this platform")
     lockfile = db_path.parent / ".kanban.lock"
     resolved = str(lockfile.resolve())
     # If this process already holds the lock (re-entrant connect), return existing fd
@@ -1616,6 +1816,8 @@ def _acquire_db_lock(db_path: Path) -> int:
 
 def _release_db_lock(db_path: Path) -> None:
     """Release the cross-process lock for a kanban DB directory."""
+    if fcntl is None:
+        return
     lockfile = db_path.parent / ".kanban.lock"
     resolved = str(lockfile.resolve())
     fd = _LOCK_FDS.pop(resolved, None)
@@ -1631,15 +1833,24 @@ def _release_db_lock(db_path: Path) -> None:
 
 
 class _LockedConnection:
-    """Wraps a sqlite3.Connection and releases the file lock on close().
+    """Wraps a sqlite3.Connection, its board identity, and optional file lock.
 
     Proxies all attribute access to the underlying connection so callers
     see a normal sqlite3.Connection interface.
     """
 
-    def __init__(self, conn: sqlite3.Connection, db_path: Path):
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        db_path: Path,
+        board: Optional[str] = None,
+        *,
+        release_lock: bool = True,
+    ):
         object.__setattr__(self, '_conn', conn)
         object.__setattr__(self, '_db_path', db_path)
+        object.__setattr__(self, '_board_slug', board)
+        object.__setattr__(self, '_release_lock', release_lock)
         object.__setattr__(self, '_closed', False)
 
     def close(self):
@@ -1650,7 +1861,8 @@ class _LockedConnection:
             try:
                 conn.close()
             finally:
-                _release_db_lock(db_path)
+                if object.__getattribute__(self, '_release_lock'):
+                    _release_db_lock(db_path)
 
     def __enter__(self):
         return self
@@ -2020,10 +2232,33 @@ def connect(
         if not _IS_WINDOWS:
             _release_db_lock(path)
         raise
-    # Wrap in _LockedConnection so the lock is released on close()
-    if not _IS_WINDOWS:
-        return _LockedConnection(conn, path)  # type: ignore[return-value]
-    return conn
+    # Always attach board identity to the connection wrapper. File locking is
+    # POSIX-only, but board identity is a cross-platform safety invariant.
+    try:
+        db_path_board = _board_slug_for_db_path(path)
+        try:
+            env_board = _normalize_board_slug(os.environ.get("HERMES_KANBAN_BOARD"))
+        except ValueError:
+            env_board = None
+        requested_board = _normalize_board_slug(board)
+        if requested_board is None and env_board and (
+            os.environ.get("HERMES_KANBAN_DB") or board_exists(env_board)
+        ):
+            requested_board = env_board
+        if db_path_board:
+            if requested_board and requested_board != db_path_board:
+                raise ValueError(
+                    f"board argument {requested_board!r} does not match pinned DB board {db_path_board!r}"
+                )
+            board_slug = db_path_board
+        else:
+            board_slug = _connection_board(conn, board)
+    except Exception:
+        conn.close()
+        if not _IS_WINDOWS:
+            _release_db_lock(path)
+        raise
+    return _LockedConnection(conn, path, board_slug, release_lock=not _IS_WINDOWS)  # type: ignore[return-value]
 
 
 def init_db(
@@ -2707,6 +2942,430 @@ def _warn_action_output_schema(
         )
 
 
+def _merge_unique_strings(*values: Any) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        for item in _string_list(value):
+            if item not in seen:
+                seen.add(item)
+                out.append(item)
+    return out
+
+
+def _contract_object(value: Any) -> dict:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _connection_board(conn: sqlite3.Connection, board: Optional[str] = None) -> str:
+    """Resolve the board attached to a DB connection; reject spoofed mismatches."""
+    explicit = _normalize_board_slug(board)
+    try:
+        attached = object.__getattribute__(conn, "_board_slug")
+    except Exception:
+        attached = None
+    attached_slug = _normalize_board_slug(attached) if attached else None
+    if attached_slug:
+        if explicit and explicit != attached_slug:
+            raise ValueError(
+                f"board argument {explicit!r} does not match connected board {attached_slug!r}"
+            )
+        return attached_slug
+
+    try:
+        env_slug = _normalize_board_slug(os.environ.get("HERMES_KANBAN_BOARD"))
+    except ValueError:
+        env_slug = None
+    db_path_override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    db_path_slug = _board_slug_for_db_path(Path(db_path_override)) if db_path_override else None
+    if db_path_slug:
+        if env_slug and env_slug != db_path_slug:
+            raise ValueError(
+                f"pinned board {env_slug!r} does not match pinned DB board {db_path_slug!r}"
+            )
+        if explicit and explicit != db_path_slug:
+            raise ValueError(
+                f"board argument {explicit!r} does not match pinned DB board {db_path_slug!r}"
+            )
+        return db_path_slug
+    if env_slug and board_exists(env_slug):
+        if explicit and explicit != env_slug:
+            raise ValueError(
+                f"board argument {explicit!r} does not match pinned board {env_slug!r}"
+            )
+        return env_slug
+    return explicit or get_current_board()
+
+
+def _policy_has_material_route(policy: Any) -> bool:
+    """Return True when a provider policy contains an actual execution route."""
+    def material_value(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, dict):
+            return _policy_has_material_route(value)
+        if isinstance(value, (list, tuple, set)):
+            return any(material_value(item) for item in value)
+        if isinstance(value, bool):
+            return value
+        return bool(str(value).strip())
+
+    row = _contract_object(policy)
+    if not row:
+        return False
+    material_keys = {
+        "provider",
+        "providers",
+        "model",
+        "models",
+        "tool",
+        "tools",
+        "tool_name",
+        "endpoint",
+        "url",
+        "base_url",
+        "command",
+        "mcp_server",
+        "route",
+        "routes",
+    }
+    ignored_keys = {
+        "allowed_for",
+        "denied_for",
+        "required_toolsets",
+        "constraints",
+        "notes",
+        "description",
+    }
+    for raw_key, value in row.items():
+        key = str(raw_key).strip()
+        if key in ignored_keys:
+            continue
+        if key in material_keys:
+            if material_value(value):
+                return True
+        elif isinstance(value, dict) and key in {"execution", "backend", "config"}:
+            if _policy_has_material_route(value):
+                return True
+    return False
+
+
+def _task_execution_contract(task: Task) -> dict:
+    data = _contract_object(task.funnel_data)
+    contract = data.get("execution_contract")
+    merged = dict(contract) if isinstance(contract, dict) else {}
+    for key in (
+        "required_capabilities",
+        "required_toolsets",
+        "required_proof",
+        "side_effect_class",
+        "require_provider_policy",
+    ):
+        if key in data and key not in merged:
+            merged[key] = data.get(key)
+    return merged
+
+
+def resolve_task_contract(task: Task, *, board: Optional[str] = None) -> dict[str, Any]:
+    """Return the derived execution contract for a task on its board."""
+    board_meta = read_board_metadata(board)
+    workflow_raw = board_meta.get("workflow")
+    runtime_raw = board_meta.get("runtime")
+    workflow = dict(workflow_raw) if isinstance(workflow_raw, dict) else {}
+    runtime = dict(runtime_raw) if isinstance(runtime_raw, dict) else {}
+    stage = _workflow_stage_map(workflow).get(task.stage_key or "")
+    action = _workflow_action_row(stage, task.action_key)
+    workstream = _workflow_workstream_map(workflow).get(task.workstream_id or "")
+    explicit = _task_execution_contract(task)
+    envelope_map = _normalize_worker_envelopes(runtime.get("worker_envelopes"))
+    assignee_key = task.assignee or ""
+    if assignee_key in envelope_map:
+        envelope = _contract_object(envelope_map.get(assignee_key))
+    elif "default" in envelope_map:
+        envelope = _contract_object(envelope_map.get("default"))
+    else:
+        envelope = {}
+    provider_policy = _normalize_policy_map(runtime.get("provider_policy"), field="runtime.provider_policy")
+    tool_policy = _normalize_policy_map(runtime.get("tool_policy"), field="runtime.tool_policy")
+    required_capabilities = _merge_unique_strings(
+        explicit.get("required_capabilities"),
+        action.get("required_capabilities") if isinstance(action, dict) else None,
+        stage.get("required_capabilities") if isinstance(stage, dict) else None,
+        workstream.get("required_capabilities") if isinstance(workstream, dict) else None,
+    )
+    required_toolsets = _merge_unique_strings(
+        explicit.get("required_toolsets"),
+        action.get("required_toolsets") if isinstance(action, dict) else None,
+        stage.get("required_toolsets") if isinstance(stage, dict) else None,
+        workstream.get("required_toolsets") if isinstance(workstream, dict) else None,
+    )
+    required_proof = _merge_unique_strings(
+        explicit.get("required_proof"),
+        action.get("required_proof") if isinstance(action, dict) else None,
+        stage.get("required_proof") if isinstance(stage, dict) else None,
+        workstream.get("required_proof") if isinstance(workstream, dict) else None,
+        envelope.get("required_proof") if isinstance(envelope, dict) else None,
+    )
+    side_effect_class = (
+        (action.get("side_effect_class") if isinstance(action, dict) else None)
+        or (stage.get("side_effect_class") if isinstance(stage, dict) else None)
+        or (workstream.get("side_effect_class") if isinstance(workstream, dict) else None)
+        or explicit.get("side_effect_class")
+    )
+    for cap in required_capabilities:
+        required_toolsets = _merge_unique_strings(
+            required_toolsets,
+            _contract_object(tool_policy.get(cap)).get("required_toolsets"),
+        )
+    require_provider_policy = (
+        _coerce_bool(explicit.get("require_provider_policy"))
+        or _coerce_bool(runtime.get("require_provider_policy"))
+        or _coerce_bool(workflow.get("require_provider_policy"))
+    )
+    require_worker_envelopes = _coerce_bool(runtime.get("require_worker_envelopes"))
+    return {
+        "board": board_meta.get("slug"),
+        "objective": board_meta.get("objective"),
+        "metadata_error": board_meta.get("metadata_error"),
+        "workflow_id": workflow.get("id") if isinstance(workflow, dict) else None,
+        "goal_id": task.goal_id or (workflow.get("goal_id") if isinstance(workflow, dict) else None),
+        "workstream_id": task.workstream_id,
+        "stage_key": task.stage_key,
+        "action_key": task.action_key,
+        "required_capabilities": required_capabilities,
+        "required_toolsets": required_toolsets,
+        "required_proof": required_proof,
+        "side_effect_class": side_effect_class,
+        "require_provider_policy": require_provider_policy,
+        "provider_policy": provider_policy,
+        "tool_policy": tool_policy,
+        "worker_envelope": envelope,
+        "worker_envelopes_declared": bool(envelope_map),
+        "require_worker_envelopes": require_worker_envelopes,
+    }
+
+
+def evaluate_dispatch_eligibility(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Validate a ready/review task before the dispatcher claims/spawns it."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return {"ok": False, "task_id": task_id, "blockers": [{"code": "unknown_task"}]}
+    board_slug = _connection_board(conn, board)
+    contract = resolve_task_contract(task, board=board_slug)
+    blockers: list[dict[str, Any]] = []
+    if contract.get("metadata_error"):
+        blockers.append({"code": "board_metadata_invalid", "error": contract.get("metadata_error")})
+    envelope = _contract_object(contract.get("worker_envelope"))
+    required_capabilities = set(_string_list(contract.get("required_capabilities")))
+    capabilities = set(_string_list(envelope.get("capabilities")))
+    required_toolsets = set(_string_list(contract.get("required_toolsets")))
+    envelope_toolsets = set(_string_list(envelope.get("toolsets")))
+    side_effect = contract.get("side_effect_class")
+    required_proof = set(_string_list(contract.get("required_proof")))
+    if (
+        contract.get("require_worker_envelopes")
+        and not envelope
+        and (required_capabilities or required_toolsets or side_effect or required_proof)
+    ):
+        blockers.append({"code": "missing_worker_envelope", "assignee": task.assignee})
+    if required_capabilities and envelope:
+        missing = sorted(required_capabilities - capabilities)
+        if missing:
+            blockers.append({"code": "missing_capabilities", "missing": missing, "assignee": task.assignee})
+    if required_toolsets and envelope:
+        missing_toolsets = sorted(required_toolsets - envelope_toolsets)
+        if missing_toolsets:
+            blockers.append({"code": "missing_toolsets", "missing": missing_toolsets, "assignee": task.assignee})
+    allowed_side_effects = set(_string_list(envelope.get("allowed_side_effects")))
+    if side_effect and envelope and str(side_effect) not in allowed_side_effects:
+        blockers.append({
+            "code": "side_effect_not_allowed",
+            "side_effect_class": side_effect,
+            "allowed": sorted(allowed_side_effects),
+        })
+    provider_policy = _contract_object(contract.get("provider_policy"))
+    if contract.get("require_provider_policy"):
+        missing_policy = sorted(cap for cap in required_capabilities if cap not in provider_policy)
+        if missing_policy:
+            blockers.append({"code": "missing_provider_policy", "capabilities": missing_policy})
+        empty_policy = sorted(
+            cap for cap in required_capabilities
+            if cap in provider_policy and not _policy_has_material_route(provider_policy.get(cap))
+        )
+        if empty_policy:
+            blockers.append({"code": "empty_provider_policy", "capabilities": empty_policy})
+    for cap in required_capabilities:
+        policy = _contract_object(provider_policy.get(cap))
+        allowed_for = _string_list(policy.get("allowed_for"))
+        if allowed_for and task.assignee not in allowed_for:
+            blockers.append({
+                "code": "provider_policy_denied",
+                "capability": cap,
+                "assignee": task.assignee,
+                "allowed_for": allowed_for,
+            })
+    return {"ok": not blockers, "task_id": task_id, "contract": contract, "blockers": blockers}
+
+
+def _block_dispatch_ineligible(
+    conn: sqlite3.Connection,
+    task_id: str,
+    verdict: dict[str, Any],
+) -> bool:
+    return _block_contract_ineligible(
+        conn,
+        task_id,
+        verdict,
+        source="dispatch",
+        allowed_statuses=("ready", "review"),
+    )
+
+
+def _block_contract_ineligible(
+    conn: sqlite3.Connection,
+    task_id: str,
+    verdict: dict[str, Any],
+    *,
+    source: str,
+    allowed_statuses: tuple[str, ...],
+) -> bool:
+    blockers = verdict.get("blockers") or []
+    reason = f"{source} eligibility failed: " + ", ".join(
+        str(blocker.get("code") or "blocked") for blocker in blockers if isinstance(blocker, dict)
+    )
+    placeholders = ",".join("?" for _ in allowed_statuses)
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', last_failure_error = ? "
+            f"WHERE id = ? AND status IN ({placeholders}) AND claim_lock IS NULL",
+            (reason[:1000], task_id, *allowed_statuses),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            f"{source}_contract_blocked",
+            {"verdict": verdict, "reason": reason[:1000]},
+        )
+    return True
+
+
+def _structured_completion_evidence_keys(*, metadata: Optional[dict], funnel_data: Optional[dict]) -> set[str]:
+    """Evidence keys for hard done gates; intentionally ignores prose."""
+    keys: set[str] = set()
+    for blob in (metadata, funnel_data):
+        if not isinstance(blob, dict):
+            continue
+        keys |= _evidence_keys(blob)
+        for list_key in ("artifacts", "proof", "evidence", "transition_evidence"):
+            keys |= _evidence_keys(blob.get(list_key))
+        contract = blob.get("execution_contract")
+        if isinstance(contract, dict):
+            keys |= _evidence_keys(contract.get("proof"))
+            keys |= _evidence_keys(contract.get("evidence"))
+    return keys
+
+
+def validate_contract_done(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    metadata: Optional[dict] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    task = get_task(conn, task_id)
+    if task is None:
+        return {"ok": False, "task_id": task_id, "blockers": [{"code": "unknown_task"}]}
+    board_slug = _connection_board(conn, board)
+    contract = resolve_task_contract(task, board=board_slug)
+    required = set(_string_list(contract.get("required_proof")))
+    provided = _structured_completion_evidence_keys(metadata=metadata, funnel_data=None)
+    missing = sorted(required - provided)
+    blockers: list[dict[str, Any]] = []
+    runtime_contract_active = bool(
+        contract.get("metadata_error")
+        or
+        required
+        or _string_list(contract.get("required_capabilities"))
+        or _string_list(contract.get("required_toolsets"))
+        or contract.get("side_effect_class")
+        or contract.get("require_worker_envelopes")
+        or contract.get("require_provider_policy")
+    )
+    if runtime_contract_active and metadata is not None and not isinstance(metadata, dict):
+        blockers.append({
+            "code": "invalid_completion_metadata",
+            "metadata_type": type(metadata).__name__,
+            "message": "contracted task completion metadata must be a structured object/dict",
+        })
+    if runtime_contract_active and task.status != "running":
+        blockers.append({
+            "code": "missing_eligible_run",
+            "status": task.status,
+            "message": "contracted tasks must be running under an eligible claim before completion",
+        })
+    if runtime_contract_active and task.status == "running":
+        now = int(time.time())
+        run_row = None
+        if task.current_run_id is not None:
+            run_row = conn.execute(
+                "SELECT id, status, ended_at, claim_lock, claim_expires FROM task_runs WHERE id = ?",
+                (int(task.current_run_id),),
+            ).fetchone()
+        if not task.claim_lock or task.current_run_id is None or run_row is None:
+            blockers.append({
+                "code": "missing_eligible_run",
+                "status": task.status,
+                "message": "contracted tasks must have a current running claim/run before completion",
+            })
+        elif run_row["status"] != "running" or run_row["ended_at"] is not None:
+            blockers.append({
+                "code": "missing_eligible_run",
+                "status": task.status,
+                "run_status": run_row["status"],
+                "message": "current run is not open/running",
+            })
+        elif task.claim_expires is None or int(task.claim_expires) <= now:
+            blockers.append({
+                "code": "stale_claim",
+                "claim_expires": task.claim_expires,
+                "message": "contracted task claim is missing or expired",
+            })
+    if runtime_contract_active:
+        eligibility = evaluate_dispatch_eligibility(conn, task_id, board=board)
+        if not eligibility.get("ok"):
+            blockers.extend(eligibility.get("blockers") or [])
+    if missing:
+        blockers.append({
+            "code": "missing_required_proof",
+            "missing": missing,
+            "provided": sorted(provided),
+        })
+    return {
+        "ok": not blockers,
+        "task_id": task_id,
+        "required_proof": sorted(required),
+        "provided_proof": sorted(provided),
+        "contract": contract,
+        "blockers": blockers,
+    }
+
+
+class ContractDoneGateError(RuntimeError):
+    """Raised when the generic board operating contract rejects completion."""
+
+    def __init__(self, verdict: dict[str, Any]):
+        self.verdict = verdict
+        codes = ", ".join(str(b.get("code")) for b in verdict.get("blockers", []))
+        super().__init__(f"contract done gate failed for {verdict.get('task_id')}: {codes}")
+
+
 def repair_orphan_task_runs(conn: sqlite3.Connection) -> list[dict]:
     """Close open task_runs whose parent task is no longer ``running``.
 
@@ -2851,7 +3510,7 @@ def kanban_semantic_diagnostics(
     include_archived: bool = False,
 ) -> dict[str, Any]:
     """Lint funnel semantics: invalid stages, lifecycle drift, and unclassified cards."""
-    board_slug = _normalize_board_slug(board) or get_current_board()
+    board_slug = _connection_board(conn, board)
     workflow = read_board_metadata(board_slug).get("workflow")
     stages = _workflow_stage_map(workflow if isinstance(workflow, dict) else None)
     workstreams = _workflow_workstream_map(workflow if isinstance(workflow, dict) else None)
@@ -3035,7 +3694,7 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
     parents = tuple(p for p in parents if p)
-    board_slug = board if board else get_current_board()
+    board_slug = _connection_board(conn, board)
     board_meta = read_board_metadata(board_slug)
     workflow = board_meta.get("workflow") if isinstance(board_meta.get("workflow"), dict) else None
     goal_id = _normalize_funnel_text(goal_id)
@@ -3124,8 +3783,6 @@ def create_task(
     # workspaces" — requiring every caller to pass --workspace dir is
     # error-prone and leads to data loss when stages share output files.
     if workspace_path is None:
-        board_slug = board if board else get_current_board()
-        board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
         if board_default and workspace_kind == "scratch":
             workspace_kind = "dir"
@@ -3176,7 +3833,7 @@ def create_task(
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
                 _validate_task_against_workflow(
-                    board,
+                    board_slug,
                     goal_id=goal_id,
                     workstream_id=workstream_id,
                     stage_key=stage_key,
@@ -3307,7 +3964,7 @@ def update_task_funnel_fields(
         else:
             next_funnel_data = normalized
 
-    board_slug = _normalize_board_slug(board) or get_current_board()
+    board_slug = _connection_board(conn, board)
     _validate_task_against_workflow(
         board_slug,
         goal_id=next_goal,
@@ -4425,6 +5082,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4434,6 +5092,17 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    board_slug = _connection_board(conn, board)
+    eligibility = evaluate_dispatch_eligibility(conn, task_id, board=board_slug)
+    if not eligibility.get("ok"):
+        _block_contract_ineligible(
+            conn,
+            task_id,
+            eligibility,
+            source="claim",
+            allowed_statuses=("ready",),
+        )
+        return None
     with write_txn(conn):
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -4539,6 +5208,7 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -4555,6 +5225,17 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    board_slug = _connection_board(conn, board)
+    eligibility = evaluate_dispatch_eligibility(conn, task_id, board=board_slug)
+    if not eligibility.get("ok"):
+        _block_contract_ineligible(
+            conn,
+            task_id,
+            eligibility,
+            source="claim",
+            allowed_statuses=("review",),
+        )
+        return None
     with write_txn(conn):
         cur = conn.execute(
             """
@@ -5052,7 +5733,22 @@ def complete_task(
     else:
         verified_cards = []
 
-    board_slug = _normalize_board_slug(board) or get_current_board()
+    board_slug = _connection_board(conn, board)
+    contract_verdict = validate_contract_done(
+        conn,
+        task_id,
+        metadata=metadata,
+        board=board_slug,
+    )
+    if not contract_verdict.get("ok"):
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "contract_done_blocked",
+                {"verdict": contract_verdict},
+            )
+        raise ContractDoneGateError(contract_verdict)
     if is_pixel_enabled(board_slug):
         verdict = validate_pixel_done(conn, task_id, metadata=metadata, board=board_slug)
         if not verdict.get("ok"):
@@ -5182,7 +5878,7 @@ def complete_task(
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
-    board_slug = _normalize_board_slug(board) or get_current_board()
+    board_slug = _connection_board(conn, board)
     _apply_completion_evidence_and_maybe_transition(
         conn,
         task_id,
@@ -6651,6 +7347,12 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    contract_blocked: list[tuple[str, list[str]]] = field(default_factory=list)
+    """Tasks rejected by the board operating contract before claim/spawn.
+
+    Stored as ``(task_id, blocker_codes)`` so dispatch telemetry and dry-run
+    output can show contract failures without requiring DB event inspection.
+    """
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -6730,21 +7432,20 @@ def reap_worker_zombies() -> "list[int]":
     Returns the list of reaped PIDs. Safe to call when there are no
     children (returns []). No-op on Windows.
     """
-    if os.name == "nt":
-        return []
     reaped: "list[int]" = []
-    try:
-        while True:
-            try:
-                pid, status = os.waitpid(-1, os.WNOHANG)
-            except ChildProcessError:
-                break
-            if pid == 0:
-                break
-            _record_worker_exit(pid, status)
-            reaped.append(pid)
-    except Exception:
-        pass
+    if os.name != "nt":
+        try:
+            while True:
+                try:
+                    pid, status = os.waitpid(-1, os.WNOHANG)
+                except ChildProcessError:
+                    break
+                if pid == 0:
+                    break
+                _record_worker_exit(pid, status)
+                reaped.append(pid)
+        except Exception:
+            pass
     return reaped
 
 
@@ -7712,7 +8413,7 @@ def dispatch_once(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
-    board_slug = _normalize_board_slug(board) or get_current_board()
+    board_slug = _connection_board(conn, board)
     dispatch_audit = audit_board_dispatcher_ownership(board_slug)
     if dispatch_audit.get("status") == "critical":
         _log.error(
@@ -7790,6 +8491,17 @@ def dispatch_once(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+        eligibility = evaluate_dispatch_eligibility(conn, row["id"], board=board_slug)
+        if not eligibility.get("ok"):
+            codes = [
+                str(blocker.get("code") or "blocked")
+                for blocker in eligibility.get("blockers") or []
+                if isinstance(blocker, dict)
+            ]
+            result.contract_blocked.append((row["id"], codes))
+            if not dry_run:
+                _block_dispatch_ineligible(conn, row["id"], eligibility)
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -7837,7 +8549,7 @@ def dispatch_once(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds, board=board_slug)
         if claimed is None:
             continue
         try:
@@ -7906,6 +8618,17 @@ def dispatch_once(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+        eligibility = evaluate_dispatch_eligibility(conn, row["id"], board=board_slug)
+        if not eligibility.get("ok"):
+            codes = [
+                str(blocker.get("code") or "blocked")
+                for blocker in eligibility.get("blockers") or []
+                if isinstance(blocker, dict)
+            ]
+            result.contract_blocked.append((row["id"], codes))
+            if not dry_run:
+                _block_dispatch_ineligible(conn, row["id"], eligibility)
+            continue
         try:
             from hermes_cli.profiles import profile_exists
         except Exception:
@@ -7916,7 +8639,7 @@ def dispatch_once(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds, board=board_slug)
         if claimed is None:
             continue
         try:
@@ -9028,7 +9751,7 @@ def build_funnel_read_model(
     workstream_filter = _normalize_funnel_text(workstream_id)
     stage_filter = _normalize_funnel_text(stage_key)
     action_filter = _normalize_funnel_text(action_key)
-    board_slug = _normalize_board_slug(board) or get_current_board()
+    board_slug = _connection_board(conn, board)
 
     tasks = list_tasks(
         conn,

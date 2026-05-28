@@ -710,6 +710,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    board=board,
                 )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
@@ -730,6 +731,32 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.ContractDoneGateError as gate_err:
+                blockers = gate_err.verdict.get("blockers") or []
+                codes = ", ".join(
+                    str(blocker.get("code"))
+                    for blocker in blockers
+                    if isinstance(blocker, dict) and blocker.get("code")
+                )
+                return tool_error(
+                    f"kanban_complete blocked by contract done gate: "
+                    f"{codes or 'missing required proof'}. "
+                    f"Your task is still in-flight (no state change). "
+                    f"Add the required structured proof/artifacts to metadata "
+                    f"and retry kanban_complete. Verdict: {gate_err.verdict}"
+                )
+            except kb.PixelDoneGateError as gate_err:
+                blockers = gate_err.verdict.get("blockers") or []
+                codes = ", ".join(
+                    str(blocker.get("code"))
+                    for blocker in blockers
+                    if isinstance(blocker, dict) and blocker.get("code")
+                )
+                return tool_error(
+                    f"kanban_complete blocked by Pixel done gate: "
+                    f"{codes or 'blocked'}. Your task is still in-flight "
+                    f"(no state change). Verdict: {gate_err.verdict}"
                 )
             if not ok:
                 return tool_error(
@@ -1145,9 +1172,9 @@ _DESC_BOARD = (
     "Kanban board slug to target. When omitted, the call resolves the "
     "active board the usual way: HERMES_KANBAN_DB env → "
     "HERMES_KANBAN_BOARD env → the 'current' symlink under the kanban "
-    "home → 'default'. Pass an explicit slug only when the caller (e.g. "
-    "a Telegram routing layer) needs to override the env-pinned active "
-    "board for this one call."
+    "home → 'default'. Dispatcher-spawned workers are DB/board pinned; "
+    "an explicit board must match that pinned board and cannot be used "
+    "to relabel a task from another board."
 )
 
 

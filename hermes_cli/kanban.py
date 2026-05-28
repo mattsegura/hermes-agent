@@ -291,12 +291,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Switch to the new board after creating it")
     b_create.add_argument("--default-workdir", default=None,
                           help="Default workspace path for tasks created on this board")
-    b_create.add_argument("--runtime", choices=sorted(kb.VALID_RUNTIME_MODES), default="goal",
-                          help="Board runtime mode (default: goal; kernel is isolated/plain)")
+    b_create.add_argument("--runtime", choices=sorted(kb.VALID_RUNTIME_MODES), default=None,
+                          help="Board runtime mode (default: contract runtime.mode, else goal; kernel is isolated/plain)")
     b_create.add_argument("--objective", default=None,
                           help="Objective statement for goal/company runtime boards")
     b_create.add_argument("--success", action="append", default=None,
                           help="Success criterion for the board objective; repeatable")
+    b_create.add_argument("--failure", action="append", default=None,
+                          help="Failure signal for the board objective; repeatable")
     b_create.add_argument("--constraint", action="append", default=None,
                           help="Objective constraint; repeatable")
     b_create.add_argument("--dispatcher-profile", default=None,
@@ -309,6 +311,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Default worker profile metadata for this board")
     b_create.add_argument("--workflow", default=None,
                           help="JSON object or @file path defining semantic workflow stages")
+    b_create.add_argument("--contract", default=None,
+                          help="JSON object or @file path defining objective/runtime/workflow contract")
 
     b_rm = boards_sub.add_parser(
         "rm", aliases=["remove", "delete"],
@@ -1281,27 +1285,46 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
     if workflow_error:
         print(f"kanban boards create: {workflow_error}", file=sys.stderr)
         return 2
-    runtime = getattr(args, "runtime", "goal") or "goal"
+    contract, contract_error = _parse_json_object_flag(getattr(args, "contract", None), "--contract")
+    if contract_error:
+        print(f"kanban boards create: {contract_error}", file=sys.stderr)
+        return 2
+    runtime = getattr(args, "runtime", None)
+    contract_runtime_raw = contract.get("runtime") if isinstance(contract, dict) else None
+    contract_runtime = dict(contract_runtime_raw) if isinstance(contract_runtime_raw, dict) else {}
+    effective_runtime = runtime or contract_runtime.get("mode") or "goal"
     dispatcher_profile = getattr(args, "dispatcher_profile", None)
-    if runtime != "kernel" and not dispatcher_profile:
-        dispatcher_profile = get_active_profile_name() or "default"
-    meta = kb.create_board(
-        normed,
-        name=args.name,
-        description=args.description,
-        icon=args.icon,
-        color=args.color,
-        default_workdir=args.default_workdir,
-        runtime=runtime,
-        objective=getattr(args, "objective", None),
-        success=getattr(args, "success", None),
-        constraints=getattr(args, "constraint", None),
-        dispatcher_profile=dispatcher_profile,
-        ceo_profile=getattr(args, "ceo_profile", None),
-        optimizer_profile=getattr(args, "optimizer_profile", None),
-        worker_profile=getattr(args, "worker_profile", None),
-        workflow=workflow,
+    contract_dispatcher = contract_runtime.get("dispatcher") if isinstance(contract_runtime, dict) else None
+    contract_dispatcher_profile = (
+        contract_dispatcher.get("profile")
+        if isinstance(contract_dispatcher, dict)
+        else (contract_dispatcher if isinstance(contract_dispatcher, str) else None)
     )
+    if effective_runtime != "kernel" and not dispatcher_profile and not contract_dispatcher_profile:
+        dispatcher_profile = get_active_profile_name() or "default"
+    try:
+        meta = kb.create_board(
+            normed,
+            name=args.name,
+            description=args.description,
+            icon=args.icon,
+            color=args.color,
+            default_workdir=args.default_workdir,
+            runtime=runtime,
+            objective=getattr(args, "objective", None),
+            success=getattr(args, "success", None),
+            failure=getattr(args, "failure", None),
+            constraints=getattr(args, "constraint", None),
+            dispatcher_profile=dispatcher_profile,
+            ceo_profile=getattr(args, "ceo_profile", None),
+            optimizer_profile=getattr(args, "optimizer_profile", None),
+            worker_profile=getattr(args, "worker_profile", None),
+            workflow=workflow,
+            contract=contract,
+        )
+    except ValueError as exc:
+        print(f"kanban boards create: {exc}", file=sys.stderr)
+        return 2
     verb = "already exists" if already else "created"
     print(f"Board {meta['slug']!r} {verb}.")
     print(f"  Display name: {meta.get('name', '')}")
@@ -1318,8 +1341,14 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
     ]
     print(f"  Runtime:      {runtime_meta.get('mode') or runtime}")
     print(f"  Objective:    {objective.get('statement') or '(none)'}")
+    if objective.get("failure"):
+        print(f"  Failure:      {'; '.join(objective.get('failure') or [])}")
     print(f"  Workflow:     {' -> '.join(stage_keys) if stage_keys else '(none)'}")
     print(f"  Dispatcher:   {dispatcher or '(unowned)'}")
+    if runtime_meta.get("provider_policy"):
+        print(f"  Providers:    {', '.join(sorted(runtime_meta.get('provider_policy') or {}))}")
+    if runtime_meta.get("worker_envelopes"):
+        print(f"  Envelopes:    {', '.join(sorted(runtime_meta.get('worker_envelopes') or {}))}")
     profile_bits = [
         f"{key}={value}"
         for key, value in profiles.items()
@@ -2329,6 +2358,23 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     metadata=metadata,
                     expected_run_id=_worker_run_id_for(tid),
                 )
+            except kb.ContractDoneGateError as exc:
+                failed.append(tid)
+                if getattr(args, "json", False):
+                    print(json.dumps(exc.verdict, indent=2, ensure_ascii=False))
+                else:
+                    blockers = exc.verdict.get("blockers") or []
+                    codes = ", ".join(
+                        str(blocker.get("code"))
+                        for blocker in blockers
+                        if blocker.get("code")
+                    )
+                    print(
+                        f"kanban: contract done gate failed for {tid}: "
+                        f"{codes or 'blocked'}",
+                        file=sys.stderr,
+                    )
+                continue
             except kb.PixelDoneGateError as exc:
                 failed.append(tid)
                 if getattr(args, "json", False):
@@ -2637,6 +2683,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "contract_blocked": [
+                {"task_id": tid, "blockers": blockers}
+                for (tid, blockers) in res.contract_blocked
+            ],
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2664,6 +2714,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.contract_blocked:
+        print("Contract-blocked:")
+        for tid, blockers in res.contract_blocked:
+            print(f"  - {tid}: {', '.join(blockers) if blockers else 'blocked'}")
     return 0
 
 
