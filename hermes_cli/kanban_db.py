@@ -75,6 +75,7 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows has no fcntl module.
     fcntl = None  # type: ignore[assignment]
+import hashlib
 import json
 import os
 import re
@@ -199,6 +200,7 @@ DEFAULT_SEMANTIC_STAGES = ("intake", "plan", "execute", "verify", "deliver", "im
 # pass without fuss. Board names with display formatting (spaces, emoji)
 # live in ``board.json``; the slug is just the directory name.
 _BOARD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
+_REACTIVE_ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
 
 def _normalize_board_slug(slug: Optional[str]) -> Optional[str]:
@@ -1548,6 +1550,102 @@ class WatchRoute:
         )
 
 
+@dataclass
+class ReactiveEntity:
+    """Durable external/resource entity owned by a Kanban task."""
+
+    id: str
+    entity_type: str
+    task_id: str
+    state: str
+    substate: Optional[str]
+    external_key: Optional[str]
+    external_identity: Optional[dict]
+    owner: Optional[str]
+    capability: Optional[str]
+    assignee: Optional[str]
+    allowed_trigger_types: list[str]
+    authority_limits: Optional[dict]
+    proof_requirements: list[str]
+    terminal_outcome: Optional[str]
+    active: bool
+    terminal: bool
+    metadata: Optional[dict]
+    watch_route_id: Optional[int]
+    created_at: int
+    updated_at: int
+    last_triggered_at: Optional[int]
+    metadata_error: Optional[str] = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "ReactiveEntity":
+        def parse_object(column: str) -> tuple[Optional[dict], Optional[str]]:
+            raw = row[column]
+            if raw is None or raw == "":
+                return None, None
+            try:
+                parsed = json.loads(raw)
+            except Exception as exc:
+                return None, f"{column}: {exc}"
+            if not isinstance(parsed, dict):
+                return None, f"{column}: expected object, got {type(parsed).__name__}"
+            return parsed, None
+
+        def parse_list(column: str) -> tuple[list[str], Optional[str]]:
+            raw = row[column]
+            if raw is None or raw == "":
+                return [], None
+            try:
+                parsed = json.loads(raw)
+            except Exception as exc:
+                return [], f"{column}: {exc}"
+            if not isinstance(parsed, list):
+                return [], f"{column}: expected list, got {type(parsed).__name__}"
+            return [str(value).strip() for value in parsed if str(value).strip()], None
+
+        external_identity, external_error = parse_object("external_identity")
+        authority_limits, authority_error = parse_object("authority_limits")
+        metadata, metadata_error = parse_object("metadata")
+        allowed_trigger_types, allowed_error = parse_list("allowed_trigger_types")
+        proof_requirements, proof_error = parse_list("proof_requirements")
+        errors = [
+            err for err in (
+                external_error,
+                authority_error,
+                metadata_error,
+                allowed_error,
+                proof_error,
+            )
+            if err
+        ]
+        return cls(
+            id=row["id"],
+            entity_type=row["entity_type"],
+            task_id=row["task_id"],
+            state=row["state"],
+            substate=row["substate"],
+            external_key=row["external_key"],
+            external_identity=external_identity,
+            owner=row["owner"],
+            capability=row["capability"],
+            assignee=row["assignee"],
+            allowed_trigger_types=allowed_trigger_types,
+            authority_limits=authority_limits,
+            proof_requirements=proof_requirements,
+            terminal_outcome=row["terminal_outcome"],
+            active=bool(row["active"]),
+            terminal=bool(row["terminal"]),
+            metadata=metadata,
+            watch_route_id=(int(row["watch_route_id"]) if row["watch_route_id"] is not None else None),
+            created_at=int(row["created_at"]),
+            updated_at=int(row["updated_at"]),
+            last_triggered_at=(
+                int(row["last_triggered_at"]) if row["last_triggered_at"] is not None else None
+            ),
+            metadata_error="; ".join(errors) if errors else None,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -1706,6 +1804,50 @@ CREATE TABLE IF NOT EXISTS task_watch_routes (
     trigger_payload TEXT
 );
 
+-- Durable external/resource entities that can sleep on watch routes, wake on
+-- normalized triggers, and block serious-board completion until resolved.
+CREATE TABLE IF NOT EXISTS reactive_entities (
+    id                    TEXT PRIMARY KEY,
+    entity_type           TEXT NOT NULL,
+    task_id               TEXT NOT NULL,
+    state                 TEXT NOT NULL,
+    substate              TEXT,
+    external_key          TEXT,
+    external_identity     TEXT,
+    owner                 TEXT,
+    capability            TEXT,
+    assignee              TEXT,
+    allowed_trigger_types TEXT,
+    authority_limits      TEXT,
+    proof_requirements    TEXT,
+    terminal_outcome      TEXT,
+    active                INTEGER NOT NULL DEFAULT 1,
+    terminal              INTEGER NOT NULL DEFAULT 0,
+    metadata              TEXT,
+    watch_route_id        INTEGER,
+    created_at            INTEGER NOT NULL,
+    updated_at            INTEGER NOT NULL,
+    last_triggered_at     INTEGER
+);
+
+-- Audit ledger for normalized inbound triggers. Matched triggers also emit
+-- task_events/watch route payloads; this table keeps duplicates and unknown
+-- routes visible instead of silently dropping them.
+CREATE TABLE IF NOT EXISTS reactive_trigger_audit (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id    TEXT,
+    task_id      TEXT,
+    route_id     INTEGER,
+    trigger_type TEXT NOT NULL,
+    trigger_key  TEXT,
+    fingerprint  TEXT NOT NULL,
+    payload      TEXT,
+    actor        TEXT,
+    accepted     INTEGER NOT NULL DEFAULT 0,
+    reason       TEXT,
+    created_at   INTEGER NOT NULL
+);
+
 -- Native Kanban Pixel ledger. Pixel state intentionally lives in the board DB
 -- and board metadata, never in .humanless_pixel sidecars.
 CREATE TABLE IF NOT EXISTS kanban_pixel_events (
@@ -1742,6 +1884,11 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_watch_task            ON task_watch_routes(task_id, active);
 CREATE INDEX IF NOT EXISTS idx_watch_trigger         ON task_watch_routes(trigger_type, trigger_key, active);
+CREATE INDEX IF NOT EXISTS idx_reactive_task         ON reactive_entities(task_id, active, terminal);
+CREATE INDEX IF NOT EXISTS idx_reactive_external     ON reactive_entities(entity_type, external_key, active);
+CREATE INDEX IF NOT EXISTS idx_reactive_route        ON reactive_entities(watch_route_id);
+CREATE INDEX IF NOT EXISTS idx_reactive_audit_fp     ON reactive_trigger_audit(fingerprint, accepted, created_at);
+CREATE INDEX IF NOT EXISTS idx_reactive_audit_task   ON reactive_trigger_audit(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_pixel_events_stage    ON kanban_pixel_events(stage_key, event_type, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_pixel_events_task     ON kanban_pixel_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_pixel_claims_active   ON kanban_pixel_claims(active, lane_id, task_id);
@@ -3347,12 +3494,21 @@ def validate_contract_done(
             "missing": missing,
             "provided": sorted(provided),
         })
+    reactive_verdict = validate_reactive_entities_done(
+        conn,
+        task_id,
+        metadata=metadata,
+        board=board_slug,
+    )
+    if not reactive_verdict.get("ok"):
+        blockers.extend(reactive_verdict.get("blockers") or [])
     return {
         "ok": not blockers,
         "task_id": task_id,
         "required_proof": sorted(required),
         "provided_proof": sorted(provided),
         "contract": contract,
+        "reactive_entities": reactive_verdict.get("reactive_entities", []),
         "blockers": blockers,
     }
 
@@ -6406,6 +6562,641 @@ def _normalize_trigger_type(value: Any) -> str:
     return text
 
 
+def _new_reactive_entity_id() -> str:
+    return "re_" + secrets.token_hex(6)
+
+
+def _normalize_reactive_entity_id(value: Optional[Any]) -> str:
+    text = str(value or "").strip()
+    if not text:
+        text = _new_reactive_entity_id()
+    if not _REACTIVE_ENTITY_ID_RE.match(text):
+        raise ValueError(
+            "reactive entity id must be 1-128 chars and contain only "
+            "letters, digits, _, ., :, or -"
+        )
+    return text
+
+
+def _normalize_entity_type(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if not text:
+        raise ValueError("entity_type is required")
+    if not re.match(r"^[a-z0-9_:.]+$", text):
+        raise ValueError("entity_type may contain only letters, digits, _, :, and .")
+    return text
+
+
+def _json_object_or_none(value: Optional[Any], *, field: str) -> Optional[dict]:
+    if value in (None, ""):
+        return None
+    parsed = _json_object(value, field=field)
+    return parsed if parsed else None
+
+
+def _json_object_blob(value: Optional[Any], *, field: str) -> Optional[str]:
+    parsed = _json_object_or_none(value, field=field)
+    return json.dumps(parsed, ensure_ascii=False) if parsed else None
+
+
+def _normalized_reactive_trigger_types(values: Optional[Iterable[str]]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in _string_list(values):
+        normalized = _normalize_trigger_type(value)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+def _reactive_trigger_template(trigger: Any) -> dict[str, Any]:
+    row = _json_object_or_none(trigger, field="trigger") or {}
+    trigger_type = row.get("trigger_type", row.get("type"))
+    trigger_key = row.get("trigger_key", row.get("key"))
+    payload = row.get("payload")
+    return {
+        "trigger_type": _normalize_trigger_type(trigger_type),
+        "trigger_key": _normalize_funnel_text(trigger_key),
+        "wake_status": str(row.get("wake_status") or "ready").strip().lower(),
+        "reason": _normalize_funnel_text(row.get("reason")),
+        "payload": _normalize_watch_payload(payload, field="trigger.payload"),
+    }
+
+
+def reactive_entity_to_dict(entity: ReactiveEntity) -> dict[str, Any]:
+    return {
+        "id": entity.id,
+        "entity_type": entity.entity_type,
+        "task_id": entity.task_id,
+        "state": entity.state,
+        "substate": entity.substate,
+        "external_key": entity.external_key,
+        "external_identity": entity.external_identity,
+        "owner": entity.owner,
+        "capability": entity.capability,
+        "assignee": entity.assignee,
+        "allowed_trigger_types": entity.allowed_trigger_types,
+        "authority_limits": entity.authority_limits,
+        "proof_requirements": entity.proof_requirements,
+        "terminal_outcome": entity.terminal_outcome,
+        "active": entity.active,
+        "terminal": entity.terminal,
+        "metadata": entity.metadata,
+        "watch_route_id": entity.watch_route_id,
+        "created_at": entity.created_at,
+        "updated_at": entity.updated_at,
+        "last_triggered_at": entity.last_triggered_at,
+        "metadata_error": entity.metadata_error,
+    }
+
+
+def create_reactive_entity(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    entity_type: str,
+    entity_id: Optional[str] = None,
+    state: str = "open",
+    substate: Optional[str] = None,
+    external_identity: Optional[dict] = None,
+    external_key: Optional[str] = None,
+    owner: Optional[str] = None,
+    capability: Optional[str] = None,
+    assignee: Optional[str] = None,
+    allowed_trigger_types: Optional[Iterable[str]] = None,
+    authority_limits: Optional[dict] = None,
+    proof_requirements: Optional[Iterable[str]] = None,
+    terminal_outcome: Optional[str] = None,
+    active: bool = True,
+    terminal: bool = False,
+    metadata: Optional[dict] = None,
+    watch_route_id: Optional[int] = None,
+) -> ReactiveEntity:
+    """Create a durable reactive entity row for a task/card."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError(f"unknown task: {task_id}")
+    entity_id = _normalize_reactive_entity_id(entity_id)
+    entity_type = _normalize_entity_type(entity_type)
+    state = _normalize_funnel_text(state) or "open"
+    substate = _normalize_funnel_text(substate)
+    external_key = _normalize_funnel_text(external_key)
+    owner = _normalize_funnel_text(owner)
+    capability = _normalize_funnel_text(capability)
+    assignee = _canonical_assignee(assignee)
+    allowed = _normalized_reactive_trigger_types(allowed_trigger_types)
+    proof = _string_list(proof_requirements)
+    now = int(time.time())
+    with write_txn(conn):
+        conn.execute(
+            """
+            INSERT INTO reactive_entities (
+                id, entity_type, task_id, state, substate, external_key,
+                external_identity, owner, capability, assignee,
+                allowed_trigger_types, authority_limits, proof_requirements,
+                terminal_outcome, active, terminal, metadata, watch_route_id,
+                created_at, updated_at, last_triggered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                entity_id,
+                entity_type,
+                task_id,
+                state,
+                substate,
+                external_key,
+                _json_object_blob(external_identity, field="external_identity"),
+                owner,
+                capability,
+                assignee,
+                json.dumps(allowed, ensure_ascii=False) if allowed else None,
+                _json_object_blob(authority_limits, field="authority_limits"),
+                json.dumps(proof, ensure_ascii=False) if proof else None,
+                _normalize_funnel_text(terminal_outcome),
+                1 if active else 0,
+                1 if terminal else 0,
+                _json_object_blob(metadata, field="metadata"),
+                int(watch_route_id) if watch_route_id is not None else None,
+                now,
+                now,
+            ),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "reactive_entity_created",
+            {
+                "entity_id": entity_id,
+                "entity_type": entity_type,
+                "state": state,
+                "substate": substate,
+                "external_key": external_key,
+                "allowed_trigger_types": allowed,
+                "proof_requirements": proof,
+                "watch_route_id": watch_route_id,
+            },
+        )
+        row = conn.execute("SELECT * FROM reactive_entities WHERE id = ?", (entity_id,)).fetchone()
+    return ReactiveEntity.from_row(row)
+
+
+def get_reactive_entity(conn: sqlite3.Connection, entity_id: str) -> Optional[ReactiveEntity]:
+    row = conn.execute("SELECT * FROM reactive_entities WHERE id = ?", (entity_id,)).fetchone()
+    return ReactiveEntity.from_row(row) if row else None
+
+
+def list_reactive_entities(
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str] = None,
+    entity_type: Optional[str] = None,
+    external_key: Optional[str] = None,
+    active: Optional[bool] = None,
+    terminal: Optional[bool] = None,
+) -> list[ReactiveEntity]:
+    query = "SELECT * FROM reactive_entities WHERE 1=1"
+    params: list[Any] = []
+    if task_id is not None:
+        query += " AND task_id = ?"
+        params.append(task_id)
+    if entity_type is not None:
+        query += " AND entity_type = ?"
+        params.append(_normalize_entity_type(entity_type))
+    if external_key is not None:
+        query += " AND external_key = ?"
+        params.append(_normalize_funnel_text(external_key))
+    if active is not None:
+        query += " AND active = ?"
+        params.append(1 if active else 0)
+    if terminal is not None:
+        query += " AND terminal = ?"
+        params.append(1 if terminal else 0)
+    query += " ORDER BY active DESC, terminal ASC, updated_at DESC, id ASC"
+    return [ReactiveEntity.from_row(row) for row in conn.execute(query, tuple(params)).fetchall()]
+
+
+def _task_scope_with_descendants(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    rows = conn.execute(
+        """
+        WITH RECURSIVE scope(id) AS (
+            SELECT ?
+            UNION
+            SELECT l.child_id
+              FROM task_links l
+              JOIN scope s ON s.id = l.parent_id
+        )
+        SELECT id FROM scope ORDER BY id
+        """,
+        (task_id,),
+    ).fetchall()
+    return [row["id"] for row in rows]
+
+
+def _serious_board_reactive_gate_enabled(board: Optional[str]) -> bool:
+    meta = read_board_metadata(board)
+    runtime = meta.get("runtime") if isinstance(meta.get("runtime"), dict) else {}
+    return runtime.get("mode") == "company"
+
+
+def _default_workflow_semantics(board: Optional[str]) -> dict[str, Optional[str]]:
+    workflow = read_board_metadata(board).get("workflow")
+    if not isinstance(workflow, dict):
+        return {"goal_id": None, "workstream_id": None, "stage_key": None, "action_key": None}
+    goal_id = _normalize_funnel_text(workflow.get("goal_id"))
+    workstream_id = None
+    stage_key = None
+    action_key = None
+    workstreams = [
+        row for row in workflow.get("workstreams") or []
+        if isinstance(row, dict) and row.get("key")
+    ]
+    if workstreams:
+        workstream_id = _normalize_funnel_text(workstreams[0].get("key"))
+        stages = workstreams[0].get("stages") or []
+        if stages:
+            stage_key = _normalize_funnel_text(stages[0])
+    stages = [
+        row for row in workflow.get("stages") or []
+        if isinstance(row, dict) and row.get("key")
+    ]
+    if not stage_key and stages:
+        stage_key = _normalize_funnel_text(stages[0].get("key"))
+    if stage_key:
+        for stage in stages:
+            if _normalize_funnel_text(stage.get("key")) != stage_key:
+                continue
+            actions = [
+                row for row in stage.get("actions") or []
+                if isinstance(row, dict) and row.get("key")
+            ]
+            if actions:
+                action_key = _normalize_funnel_text(actions[0].get("key"))
+            break
+    return {
+        "goal_id": goal_id,
+        "workstream_id": workstream_id,
+        "stage_key": stage_key,
+        "action_key": action_key,
+    }
+
+
+def _reactive_entities_for_task_scope(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[ReactiveEntity]:
+    task_ids = _task_scope_with_descendants(conn, task_id)
+    if not task_ids:
+        return []
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"""
+        SELECT * FROM reactive_entities
+         WHERE task_id IN ({placeholders})
+           AND (active = 1 OR terminal = 0 OR proof_requirements IS NOT NULL)
+         ORDER BY task_id, active DESC, terminal ASC, updated_at DESC, id ASC
+        """,
+        tuple(task_ids),
+    ).fetchall()
+    return [ReactiveEntity.from_row(row) for row in rows]
+
+
+def validate_reactive_entities_done(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    metadata: Optional[dict] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return serious-board done-gate verdict for unresolved reactive entities."""
+    if get_task(conn, task_id) is None:
+        return {"ok": False, "task_id": task_id, "blockers": [{"code": "unknown_task"}]}
+    board_slug = _connection_board(conn, board)
+    if not _serious_board_reactive_gate_enabled(board_slug):
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "board": board_slug,
+            "blockers": [],
+            "reactive_entities": [],
+        }
+    blockers: list[dict[str, Any]] = []
+    if metadata is not None and not isinstance(metadata, dict):
+        blockers.append({
+            "code": "invalid_completion_metadata",
+            "metadata_type": type(metadata).__name__,
+            "message": "reactive entity completion metadata must be a structured object/dict",
+        })
+    entities = _reactive_entities_for_task_scope(conn, task_id)
+    for entity in entities:
+        entity_row = reactive_entity_to_dict(entity)
+        if entity.metadata_error:
+            blockers.append({
+                "code": "reactive_entity_invalid_metadata",
+                "entity_id": entity.id,
+                "task_id": entity.task_id,
+                "entity_type": entity.entity_type,
+                "error": entity.metadata_error,
+            })
+        if entity.active and not entity.terminal:
+            blockers.append({
+                "code": "unresolved_reactive_entity",
+                "entity": entity_row,
+            })
+        if entity.proof_requirements:
+            provided = _structured_completion_evidence_keys(
+                metadata=metadata,
+                funnel_data=entity.metadata,
+            )
+            missing = sorted(set(entity.proof_requirements) - provided)
+            if missing:
+                blockers.append({
+                    "code": "reactive_entity_missing_required_proof",
+                    "entity_id": entity.id,
+                    "task_id": entity.task_id,
+                    "missing": missing,
+                    "provided": sorted(provided),
+                })
+    return {
+        "ok": not blockers,
+        "task_id": task_id,
+        "board": board_slug,
+        "blockers": blockers,
+        "reactive_entities": [reactive_entity_to_dict(entity) for entity in entities],
+    }
+
+
+def resolve_reactive_entity(
+    conn: sqlite3.Connection,
+    entity_id: str,
+    *,
+    terminal_outcome: str,
+    metadata: Optional[dict] = None,
+    proof: Optional[Iterable[str]] = None,
+    state: str = "resolved",
+    substate: Optional[str] = None,
+    actor: Optional[str] = None,
+) -> ReactiveEntity:
+    """Mark a reactive entity terminal after structured proof validation."""
+    entity = get_reactive_entity(conn, entity_id)
+    if entity is None:
+        raise ValueError(f"unknown reactive entity: {entity_id}")
+    if entity.metadata_error:
+        raise ValueError(f"reactive entity metadata is invalid: {entity.metadata_error}")
+    terminal_outcome = _normalize_funnel_text(terminal_outcome) or ""
+    if not terminal_outcome:
+        raise ValueError("terminal_outcome is required")
+    state = _normalize_funnel_text(state) or "resolved"
+    substate = _normalize_funnel_text(substate)
+    next_metadata = dict(entity.metadata or {})
+    supplied = _json_object_or_none(metadata, field="metadata") or {}
+    if supplied:
+        next_metadata.update(supplied)
+    proof_keys = _string_list(proof)
+    if proof_keys:
+        existing_proof = _string_list(next_metadata.get("proof"))
+        next_metadata["proof"] = sorted(set(existing_proof) | set(proof_keys))
+    now = int(time.time())
+    next_metadata.setdefault("resolved_at", now)
+    if actor:
+        next_metadata.setdefault("resolved_by", actor)
+    provided = _structured_completion_evidence_keys(
+        metadata=next_metadata,
+        funnel_data=entity.metadata,
+    )
+    missing = sorted(set(entity.proof_requirements) - provided)
+    if missing:
+        raise ValueError(
+            "missing reactive entity proof: " + ", ".join(missing)
+        )
+    with write_txn(conn):
+        conn.execute(
+            """
+            UPDATE reactive_entities
+               SET state = ?,
+                   substate = ?,
+                   active = 0,
+                   terminal = 1,
+                   terminal_outcome = ?,
+                   metadata = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (
+                state,
+                substate,
+                terminal_outcome,
+                json.dumps(next_metadata, ensure_ascii=False) if next_metadata else None,
+                now,
+                entity_id,
+            ),
+        )
+        _append_event(
+            conn,
+            entity.task_id,
+            "reactive_entity_resolved",
+            {
+                "entity_id": entity_id,
+                "entity_type": entity.entity_type,
+                "terminal_outcome": terminal_outcome,
+                "state": state,
+                "substate": substate,
+                "proof": sorted(provided),
+                "actor": actor,
+            },
+        )
+    refreshed = get_reactive_entity(conn, entity_id)
+    if refreshed is None:  # pragma: no cover - row existed before the update.
+        raise RuntimeError(f"reactive entity disappeared: {entity_id}")
+    return refreshed
+
+
+def create_watch_route_from_trigger_metadata(
+    conn: sqlite3.Connection,
+    task_id: str,
+    trigger: dict,
+    *,
+    reason: Optional[str] = None,
+    created_by: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> Optional[WatchRoute]:
+    """Create/activate a watch route from normalized trigger template data."""
+    normalized = _reactive_trigger_template(trigger)
+    return set_task_watching(
+        conn,
+        task_id,
+        trigger_type=normalized["trigger_type"],
+        trigger_key=normalized["trigger_key"],
+        reason=reason or normalized["reason"],
+        payload=normalized["payload"],
+        wake_status=normalized["wake_status"],
+        created_by=created_by,
+        expected_run_id=expected_run_id,
+    )
+
+
+def activate_reactive_entity_watch_route(
+    conn: sqlite3.Connection,
+    entity_id: str,
+    trigger: dict,
+    *,
+    reason: Optional[str] = None,
+    created_by: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> WatchRoute:
+    """Park an entity's task in watching and link the active route to the entity."""
+    entity = get_reactive_entity(conn, entity_id)
+    if entity is None:
+        raise ValueError(f"unknown reactive entity: {entity_id}")
+    route = create_watch_route_from_trigger_metadata(
+        conn,
+        entity.task_id,
+        trigger,
+        reason=reason,
+        created_by=created_by,
+        expected_run_id=expected_run_id,
+    )
+    if route is None:
+        raise ValueError(f"cannot activate watch route for task {entity.task_id}")
+    now = int(time.time())
+    trigger_type = route.trigger_type
+    allowed = entity.allowed_trigger_types or [trigger_type]
+    if trigger_type not in allowed:
+        allowed = [*allowed, trigger_type]
+    with write_txn(conn):
+        conn.execute(
+            """
+            UPDATE reactive_entities
+               SET state = 'watching',
+                   substate = COALESCE(substate, 'watching'),
+                   active = 1,
+                   terminal = 0,
+                   terminal_outcome = NULL,
+                   watch_route_id = ?,
+                   allowed_trigger_types = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (route.id, json.dumps(allowed, ensure_ascii=False), now, entity_id),
+        )
+        _append_event(
+            conn,
+            entity.task_id,
+            "reactive_entity_watching",
+            {
+                "entity_id": entity_id,
+                "route_id": route.id,
+                "trigger_type": route.trigger_type,
+                "trigger_key": route.trigger_key,
+            },
+        )
+    row = conn.execute("SELECT * FROM task_watch_routes WHERE id = ?", (route.id,)).fetchone()
+    return WatchRoute.from_row(row)
+
+
+def create_reactive_entity_card(
+    conn: sqlite3.Connection,
+    *,
+    entity_type: str,
+    title: str,
+    entity_id: Optional[str] = None,
+    body: Optional[str] = None,
+    external_identity: Optional[dict] = None,
+    external_key: Optional[str] = None,
+    owner: Optional[str] = None,
+    capability: Optional[str] = None,
+    assignee: Optional[str] = None,
+    allowed_trigger_types: Optional[Iterable[str]] = None,
+    authority_limits: Optional[dict] = None,
+    proof_requirements: Optional[Iterable[str]] = None,
+    metadata: Optional[dict] = None,
+    trigger: Optional[dict] = None,
+    parents: Iterable[str] = (),
+    created_by: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    goal_id: Optional[str] = None,
+    workstream_id: Optional[str] = None,
+    stage_key: Optional[str] = None,
+    action_key: Optional[str] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Create a generic reactive entity card and optional watch route.
+
+    Conversation/thread cards are just ``entity_type='conversation_thread'``
+    with an external identity map such as ``{"platform": "mock",
+    "thread_id": "..."}``.
+    """
+    entity_type = _normalize_entity_type(entity_type)
+    external_identity = _json_object_or_none(external_identity, field="external_identity")
+    metadata = _json_object_or_none(metadata, field="metadata")
+    funnel_data: dict[str, Any] = {
+        "reactive_entity": {
+            "entity_type": entity_type,
+            "external_key": _normalize_funnel_text(external_key),
+            "owner": _normalize_funnel_text(owner),
+            "capability": _normalize_funnel_text(capability),
+        }
+    }
+    if external_identity:
+        funnel_data["external_identity"] = external_identity
+        if external_identity.get("thread_id"):
+            funnel_data["conversation_state"] = dict(external_identity)
+    if metadata:
+        funnel_data["reactive_metadata"] = metadata
+    normalized_trigger = _reactive_trigger_template(trigger) if trigger else None
+    allowed = _normalized_reactive_trigger_types(allowed_trigger_types)
+    if normalized_trigger and normalized_trigger["trigger_type"] not in allowed:
+        allowed.append(normalized_trigger["trigger_type"])
+    task_id = create_task(
+        conn,
+        title=title,
+        body=body,
+        assignee=assignee,
+        created_by=created_by,
+        parents=parents,
+        idempotency_key=idempotency_key,
+        goal_id=goal_id,
+        workstream_id=workstream_id,
+        stage_key=stage_key,
+        action_key=action_key,
+        funnel_data=funnel_data,
+        board=board,
+    )
+    entity = create_reactive_entity(
+        conn,
+        task_id=task_id,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        state="open",
+        substate="created",
+        external_identity=external_identity,
+        external_key=external_key,
+        owner=owner,
+        capability=capability,
+        assignee=assignee,
+        allowed_trigger_types=allowed,
+        authority_limits=authority_limits,
+        proof_requirements=proof_requirements,
+        metadata=metadata,
+    )
+    route = None
+    if normalized_trigger:
+        route = activate_reactive_entity_watch_route(
+            conn,
+            entity.id,
+            normalized_trigger,
+            reason=normalized_trigger["reason"],
+            created_by=created_by,
+        )
+        entity = get_reactive_entity(conn, entity.id) or entity
+    return {
+        "task_id": task_id,
+        "entity": entity,
+        "watch_route": route,
+    }
+
+
 def list_watch_routes(
     conn: sqlite3.Connection,
     task_id: Optional[str] = None,
@@ -6580,6 +7371,95 @@ def _watch_latest_inbound(
     return inbound
 
 
+def _active_reactive_entities_for_route(
+    conn: sqlite3.Connection,
+    route: WatchRoute,
+) -> list[ReactiveEntity]:
+    rows = conn.execute(
+        """
+        SELECT * FROM reactive_entities
+         WHERE active = 1
+           AND terminal = 0
+           AND watch_route_id = ?
+         ORDER BY updated_at DESC, id ASC
+        """,
+        (route.id,),
+    ).fetchall()
+    return [ReactiveEntity.from_row(row) for row in rows]
+
+
+def _reactive_route_trigger_blockers(route: WatchRoute, entities: list[ReactiveEntity]) -> list[dict]:
+    blockers: list[dict[str, Any]] = []
+    for entity in entities:
+        if entity.metadata_error:
+            blockers.append({
+                "code": "reactive_entity_invalid_metadata",
+                "entity_id": entity.id,
+                "entity_type": entity.entity_type,
+                "error": entity.metadata_error,
+            })
+        if entity.allowed_trigger_types and route.trigger_type not in entity.allowed_trigger_types:
+            blockers.append({
+                "code": "reactive_trigger_type_not_allowed",
+                "entity_id": entity.id,
+                "entity_type": entity.entity_type,
+                "trigger_type": route.trigger_type,
+                "allowed_trigger_types": entity.allowed_trigger_types,
+            })
+    return blockers
+
+
+def _mark_reactive_entities_triggered(
+    conn: sqlite3.Connection,
+    route: WatchRoute,
+    *,
+    entities: list[ReactiveEntity],
+    payload: Optional[dict],
+    actor: Optional[str],
+    triggered_at: int,
+) -> None:
+    latest = _watch_latest_inbound(
+        route,
+        payload=payload,
+        actor=actor,
+        triggered_at=triggered_at,
+    )
+    for entity in entities:
+        metadata = dict(entity.metadata or {})
+        metadata["latest_trigger"] = latest
+        conn.execute(
+            """
+            UPDATE reactive_entities
+               SET state = 'triggered',
+                   substate = 'woken',
+                   metadata = ?,
+                   updated_at = ?,
+                   last_triggered_at = ?
+             WHERE id = ?
+            """,
+            (
+                json.dumps(metadata, ensure_ascii=False),
+                triggered_at,
+                triggered_at,
+                entity.id,
+            ),
+        )
+        _append_event(
+            conn,
+            route.task_id,
+            "reactive_entity_triggered",
+            {
+                "entity_id": entity.id,
+                "entity_type": entity.entity_type,
+                "route_id": route.id,
+                "trigger_type": route.trigger_type,
+                "trigger_key": route.trigger_key,
+                "actor": actor,
+                "payload": payload,
+            },
+        )
+
+
 def trigger_watch(
     conn: sqlite3.Connection,
     *,
@@ -6617,6 +7497,22 @@ def trigger_watch(
         ).fetchall()
         for row in rows:
             route = WatchRoute.from_row(row)
+            route_entities = _active_reactive_entities_for_route(conn, route)
+            trigger_blockers = _reactive_route_trigger_blockers(route, route_entities)
+            if trigger_blockers:
+                _append_event(
+                    conn,
+                    route.task_id,
+                    "reactive_trigger_rejected",
+                    {
+                        "route_id": route.id,
+                        "trigger_type": route.trigger_type,
+                        "trigger_key": route.trigger_key,
+                        "actor": actor,
+                        "blockers": trigger_blockers,
+                    },
+                )
+                continue
             new_status = _dependency_gated_wake_status(conn, route.task_id, route.wake_status)
             upd = conn.execute(
                 "UPDATE task_watch_routes SET active = 0, triggered_at = ?, trigger_payload = ? "
@@ -6677,6 +7573,15 @@ def trigger_watch(
             if payload:
                 event_payload["payload"] = payload
             _append_event(conn, route.task_id, "watch_triggered", event_payload)
+            if route_entities:
+                _mark_reactive_entities_triggered(
+                    conn,
+                    route,
+                    entities=route_entities,
+                    payload=payload,
+                    actor=actor,
+                    triggered_at=now,
+                )
             if new_status == "blocked" and task_upd.rowcount:
                 blocked_payload = {
                     "reason": route.reason,
@@ -6693,6 +7598,298 @@ def trigger_watch(
             triggered_row = conn.execute("SELECT * FROM task_watch_routes WHERE id = ?", (route.id,)).fetchone()
             triggered.append(WatchRoute.from_row(triggered_row))
     return triggered
+
+
+def _reactive_trigger_fingerprint(
+    *,
+    trigger_type: str,
+    trigger_key: Optional[str],
+    payload: Optional[dict],
+    event_id: Optional[str],
+) -> str:
+    explicit = _normalize_funnel_text(event_id)
+    if not explicit and isinstance(payload, dict):
+        for key in ("event_id", "message_id", "id"):
+            explicit = _normalize_funnel_text(payload.get(key))
+            if explicit:
+                break
+    if explicit:
+        basis = {"event_id": explicit, "trigger_type": trigger_type, "trigger_key": trigger_key}
+    else:
+        basis = {"trigger_type": trigger_type, "trigger_key": trigger_key, "payload": payload or {}}
+    encoded = json.dumps(basis, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _record_reactive_trigger_audit(
+    conn: sqlite3.Connection,
+    *,
+    entity_id: Optional[str],
+    task_id: Optional[str],
+    route_id: Optional[int],
+    trigger_type: str,
+    trigger_key: Optional[str],
+    fingerprint: str,
+    payload: Optional[dict],
+    actor: Optional[str],
+    accepted: bool,
+    reason: str,
+) -> int:
+    now = int(time.time())
+    cur = conn.execute(
+        """
+        INSERT INTO reactive_trigger_audit (
+            entity_id, task_id, route_id, trigger_type, trigger_key,
+            fingerprint, payload, actor, accepted, reason, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            entity_id,
+            task_id,
+            route_id,
+            trigger_type,
+            trigger_key,
+            fingerprint,
+            json.dumps(payload, ensure_ascii=False) if payload else None,
+            actor,
+            1 if accepted else 0,
+            reason,
+            now,
+        ),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def list_reactive_trigger_audits(
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str] = None,
+    entity_id: Optional[str] = None,
+    fingerprint: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    query = "SELECT * FROM reactive_trigger_audit WHERE 1=1"
+    params: list[Any] = []
+    if task_id is not None:
+        query += " AND task_id = ?"
+        params.append(task_id)
+    if entity_id is not None:
+        query += " AND entity_id = ?"
+        params.append(entity_id)
+    if fingerprint is not None:
+        query += " AND fingerprint = ?"
+        params.append(fingerprint)
+    query += " ORDER BY created_at ASC, id ASC"
+    rows = conn.execute(query, tuple(params)).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else None
+        except Exception:
+            payload = None
+        out.append({
+            "id": int(row["id"]),
+            "entity_id": row["entity_id"],
+            "task_id": row["task_id"],
+            "route_id": row["route_id"],
+            "trigger_type": row["trigger_type"],
+            "trigger_key": row["trigger_key"],
+            "fingerprint": row["fingerprint"],
+            "payload": payload,
+            "actor": row["actor"],
+            "accepted": bool(row["accepted"]),
+            "reason": row["reason"],
+            "created_at": int(row["created_at"]),
+        })
+    return out
+
+
+def _entities_by_route_id(
+    conn: sqlite3.Connection,
+    route_ids: Iterable[int],
+) -> dict[int, list[ReactiveEntity]]:
+    ids = [int(route_id) for route_id in route_ids]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT * FROM reactive_entities WHERE watch_route_id IN ({placeholders}) ORDER BY id",
+        tuple(ids),
+    ).fetchall()
+    out: dict[int, list[ReactiveEntity]] = {}
+    for row in rows:
+        entity = ReactiveEntity.from_row(row)
+        if entity.watch_route_id is not None:
+            out.setdefault(entity.watch_route_id, []).append(entity)
+    return out
+
+
+def trigger_reactive_event(
+    conn: sqlite3.Connection,
+    *,
+    trigger_type: str,
+    trigger_key: Optional[str] = None,
+    payload: Optional[dict] = None,
+    actor: Optional[str] = None,
+    event_id: Optional[str] = None,
+    unknown_policy: str = "triage",
+    triage_assignee: Optional[str] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Normalize and audit an inbound event, waking matching reactive cards.
+
+    ``unknown_policy='triage'`` creates an explicit triage card for unmatched
+    routes so inbound external state is not silently dropped.
+    """
+    normalized_type = _normalize_trigger_type(trigger_type)
+    normalized_key = _normalize_funnel_text(trigger_key)
+    payload = _normalize_watch_payload(payload, field="payload")
+    fingerprint = _reactive_trigger_fingerprint(
+        trigger_type=normalized_type,
+        trigger_key=normalized_key,
+        payload=payload,
+        event_id=event_id,
+    )
+    prior = conn.execute(
+        "SELECT * FROM reactive_trigger_audit WHERE fingerprint = ? AND accepted = 1 "
+        "ORDER BY id ASC LIMIT 1",
+        (fingerprint,),
+    ).fetchone()
+    if prior is not None:
+        with write_txn(conn):
+            audit_id = _record_reactive_trigger_audit(
+                conn,
+                entity_id=prior["entity_id"],
+                task_id=prior["task_id"],
+                route_id=prior["route_id"],
+                trigger_type=normalized_type,
+                trigger_key=normalized_key,
+                fingerprint=fingerprint,
+                payload=payload,
+                actor=actor,
+                accepted=False,
+                reason="duplicate",
+            )
+        return {
+            "status": "duplicate",
+            "duplicate": True,
+            "fingerprint": fingerprint,
+            "audit_ids": [audit_id],
+            "triggered_routes": [],
+            "entities": [],
+            "triage_task_id": None,
+        }
+
+    routes = trigger_watch(
+        conn,
+        trigger_type=normalized_type,
+        trigger_key=normalized_key,
+        payload=payload,
+        actor=actor,
+    )
+    route_entities = _entities_by_route_id(conn, [route.id for route in routes])
+    audit_ids: list[int] = []
+    entities: list[ReactiveEntity] = []
+    if routes:
+        with write_txn(conn):
+            for route in routes:
+                matched_entities = route_entities.get(route.id) or []
+                if matched_entities:
+                    entities.extend(matched_entities)
+                _recorded_entity_id = matched_entities[0].id if matched_entities else None
+                audit_ids.append(
+                    _record_reactive_trigger_audit(
+                        conn,
+                        entity_id=_recorded_entity_id,
+                        task_id=route.task_id,
+                        route_id=route.id,
+                        trigger_type=normalized_type,
+                        trigger_key=normalized_key,
+                        fingerprint=fingerprint,
+                        payload=payload,
+                        actor=actor,
+                        accepted=True,
+                        reason="matched_route",
+                    )
+                )
+        return {
+            "status": "triggered",
+            "duplicate": False,
+            "fingerprint": fingerprint,
+            "audit_ids": audit_ids,
+            "triggered_routes": [watch_route_to_dict(route) for route in routes],
+            "entities": [reactive_entity_to_dict(entity) for entity in entities],
+            "triage_task_id": None,
+        }
+
+    unknown_policy = str(unknown_policy or "triage").strip().lower()
+    if unknown_policy not in {"triage", "audit"}:
+        raise ValueError("unknown_policy must be 'triage' or 'audit'")
+    triage_task_id = None
+    if unknown_policy == "triage":
+        key = f"reactive-trigger:{fingerprint}"
+        label = f"{normalized_type}:{normalized_key}" if normalized_key else normalized_type
+        semantics = _default_workflow_semantics(board)
+        triage_task_id = create_task(
+            conn,
+            title=f"Unmatched reactive event: {label}",
+            body="Inbound reactive event did not match an active watch route.",
+            assignee=triage_assignee,
+            created_by=actor,
+            triage=True,
+            idempotency_key=key,
+            funnel_data={
+                "unmatched_reactive_trigger": {
+                    "trigger_type": normalized_type,
+                    "trigger_key": normalized_key,
+                    "fingerprint": fingerprint,
+                    "payload": payload,
+                    "actor": actor,
+                }
+            },
+            goal_id=semantics["goal_id"],
+            workstream_id=semantics["workstream_id"],
+            stage_key=semantics["stage_key"],
+            action_key=semantics["action_key"],
+            board=board,
+        )
+    with write_txn(conn):
+        if triage_task_id:
+            _append_event(
+                conn,
+                triage_task_id,
+                "reactive_trigger_unknown",
+                {
+                    "trigger_type": normalized_type,
+                    "trigger_key": normalized_key,
+                    "fingerprint": fingerprint,
+                    "payload": payload,
+                    "actor": actor,
+                },
+            )
+        audit_ids.append(
+            _record_reactive_trigger_audit(
+                conn,
+                entity_id=None,
+                task_id=triage_task_id,
+                route_id=None,
+                trigger_type=normalized_type,
+                trigger_key=normalized_key,
+                fingerprint=fingerprint,
+                payload=payload,
+                actor=actor,
+                accepted=False,
+                reason="unknown_route",
+            )
+        )
+    return {
+        "status": "triage_created" if triage_task_id else "unknown",
+        "duplicate": False,
+        "fingerprint": fingerprint,
+        "audit_ids": audit_ids,
+        "triggered_routes": [],
+        "entities": [],
+        "triage_task_id": triage_task_id,
+    }
 
 
 def transition_task_stage(
@@ -9764,6 +10961,9 @@ def build_funnel_read_model(
     watch_routes_by_task: dict[str, list[dict]] = {}
     for route in list_watch_routes(conn, active=True):
         watch_routes_by_task.setdefault(route.task_id, []).append(watch_route_to_dict(route))
+    reactive_entities_by_task: dict[str, list[dict]] = {}
+    for entity in list_reactive_entities(conn):
+        reactive_entities_by_task.setdefault(entity.task_id, []).append(reactive_entity_to_dict(entity))
     parents_by_child: dict[str, list[str]] = {}
     children_by_parent: dict[str, list[str]] = {}
     for link in links:
@@ -9807,6 +11007,9 @@ def build_funnel_read_model(
                     "cards_with_artifacts": 0,
                     "cards_with_proof": 0,
                     "cards_with_outcomes": 0,
+                    "reactive_entities": 0,
+                    "active_reactive_entities": 0,
+                    "terminal_reactive_entities": 0,
                     "avg_cycle_seconds": None,
                 },
                 "blockers": [],
@@ -9848,6 +11051,7 @@ def build_funnel_read_model(
         parents = parents_by_child.get(task.id, [])
         children = children_by_parent.get(task.id, [])
         watch_routes = watch_routes_by_task.get(task.id, [])
+        reactive_entities = reactive_entities_by_task.get(task.id, [])
 
         status_counts = stage["counts_by_status"]
         status_counts[task.status] = int(status_counts.get(task.status, 0)) + 1
@@ -9871,6 +11075,13 @@ def build_funnel_read_model(
             metrics["completed_count"] += 1
         metrics["failure_count"] += signals["failure_count"]
         metrics["artifact_count"] += len(signals["artifacts"])
+        metrics["reactive_entities"] += len(reactive_entities)
+        metrics["active_reactive_entities"] += sum(
+            1 for entity in reactive_entities if entity.get("active") and not entity.get("terminal")
+        )
+        metrics["terminal_reactive_entities"] += sum(
+            1 for entity in reactive_entities if entity.get("terminal")
+        )
         if signals["artifacts"]:
             stage["_cards_with_artifacts"].add(task.id)
         if signals["proof"]:
@@ -9914,6 +11125,7 @@ def build_funnel_read_model(
             "parents": parents,
             "children": children,
             "watch_routes": watch_routes,
+            "reactive_entities": reactive_entities,
             "runtime": {
                 "lifecycle_status": task.status,
                 "waiting_reason": watch_routes[0].get("reason") if watch_routes else None,
@@ -9921,6 +11133,7 @@ def build_funnel_read_model(
                     watch_routes[0].get("trigger_type") if watch_routes else None
                 ),
                 "owner": task.assignee,
+                "reactive_entity_count": len(reactive_entities),
             },
             "semantic": node,
             "funnel_data": task.funnel_data,
