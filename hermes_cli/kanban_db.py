@@ -16010,12 +16010,21 @@ def run_daemon(
     stop_event=None,
     on_tick=None,
 ) -> None:
-    """Run the dispatcher in a loop until interrupted.
+    """Run the standalone dispatcher in a loop until interrupted.
 
-    Calls :func:`dispatch_once` every ``interval`` seconds. Exits cleanly
-    on SIGINT / SIGTERM so ``hermes kanban daemon`` is systemd-friendly.
-    ``stop_event`` (a :class:`threading.Event`) and ``on_tick`` (a
-    callable receiving the :class:`DispatchResult`) are test hooks.
+    F4 fix: this is now a faithful mirror of the gateway's per-board tick. Every
+    ``interval`` seconds it enumerates all non-archived boards and, for each,
+    runs the FULL tick -- :func:`reactive_tick` + :func:`optimizer_tick` +
+    :func:`dispatch_once` -- with the same tick-health bookkeeping the gateway
+    records (so ``hermes kanban doctor`` sees a ``--force`` daemon as a real,
+    ticking gateway). Previously it looped ``dispatch_once`` on the DEFAULT board
+    only, so an operator running the "separate dispatcher unit" got a dead
+    self-tuning loop (no reactive follow-ups, no optimizer) with no warning.
+
+    Exits cleanly on SIGINT / SIGTERM so ``hermes kanban daemon`` is
+    systemd-friendly. ``stop_event`` (a :class:`threading.Event`) and ``on_tick``
+    (a callable receiving each board's :class:`DispatchResult`) are test hooks;
+    ``on_tick`` fires once per board per tick.
     """
     import signal
     import threading
@@ -16037,19 +16046,75 @@ def run_daemon(
                 except (ValueError, OSError):
                     pass
 
+    def _daemon_board_slugs() -> list[str]:
+        try:
+            boards = list_boards(include_archived=False)
+            slugs = [b.get("slug") or DEFAULT_BOARD for b in boards]
+            return slugs or [DEFAULT_BOARD]
+        except Exception:
+            return [DEFAULT_BOARD]
+
+    def _tick_board(slug: str) -> None:
+        with contextlib.closing(connect(board=slug)) as conn:
+            # Triple-tick: reactive follow-ups + optimizer tune + dispatch, with
+            # the same visible-failure bookkeeping as the gateway (F5+F3).
+            tick_ok = True
+            try:
+                reactive_tick(conn, board=slug)
+            except Exception as exc:
+                tick_ok = False
+                try:
+                    record_tick_health_failure(
+                        conn, board=slug, kind="reactive", error=exc
+                    )
+                except Exception:
+                    _log.warning(
+                        "kanban reactive_tick failed on board %s", slug, exc_info=True
+                    )
+            try:
+                optimizer_tick(conn, board=slug)
+            except Exception as exc:
+                tick_ok = False
+                try:
+                    record_tick_health_failure(
+                        conn, board=slug, kind="optimizer", error=exc
+                    )
+                except Exception:
+                    _log.warning(
+                        "kanban optimizer_tick failed on board %s", slug, exc_info=True
+                    )
+            if tick_ok:
+                try:
+                    record_tick_health_success(conn, board=slug)
+                except Exception:
+                    _log.debug(
+                        "kanban tick-health bookkeeping failed on board %s",
+                        slug, exc_info=True,
+                    )
+            res = dispatch_once(
+                conn,
+                board=slug,
+                max_spawn=max_spawn,
+                failure_limit=failure_limit,
+            )
+        if on_tick is not None:
+            try:
+                on_tick(res)
+            except Exception:
+                pass
+
     while not stop_event.is_set():
         try:
-            with contextlib.closing(connect()) as conn:
-                res = dispatch_once(
-                    conn,
-                    max_spawn=max_spawn,
-                    failure_limit=failure_limit,
-                )
-            if on_tick is not None:
+            for slug in _daemon_board_slugs():
+                if stop_event.is_set():
+                    break
                 try:
-                    on_tick(res)
+                    _tick_board(slug)
                 except Exception:
-                    pass
+                    # A single board's failure must never kill the daemon or
+                    # starve the other boards.
+                    import traceback
+                    traceback.print_exc()
         except Exception:
             # Don't let any single tick kill the daemon.
             import traceback
