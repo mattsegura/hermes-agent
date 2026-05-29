@@ -5072,6 +5072,27 @@ CREATE TABLE IF NOT EXISTS reactive_timer_schedules (
     UNIQUE(board, loop_key, entity_id)
 );
 
+-- Tick liveness/health (F5+F3 observability). One row per board records the
+-- last successful gateway tick and the running error counters/streaks for the
+-- reactive + optimizer sub-ticks. The dispatcher writes this every tick; the
+-- ``kanban doctor`` liveness check reads it to fail loudly when a board has
+-- live work (active timer schedules or optimizer-managed knobs) but the
+-- gateway is not actually ticking it. A streak crossing the escalation
+-- threshold flips per-tick logging from WARNING to ERROR.
+CREATE TABLE IF NOT EXISTS board_tick_health (
+    board                  TEXT PRIMARY KEY,
+    last_tick_at           INTEGER,
+    last_successful_tick   INTEGER,
+    last_error_at          INTEGER,
+    last_error_kind        TEXT,
+    last_error             TEXT,
+    reactive_error_streak  INTEGER NOT NULL DEFAULT 0,
+    optimizer_error_streak INTEGER NOT NULL DEFAULT 0,
+    reactive_error_total   INTEGER NOT NULL DEFAULT 0,
+    optimizer_error_total  INTEGER NOT NULL DEFAULT 0,
+    updated_at             INTEGER
+);
+
 -- Native Kanban Pixel ledger. Pixel state intentionally lives in the board DB
 -- and board metadata, never in .humanless_pixel sidecars.
 CREATE TABLE IF NOT EXISTS kanban_pixel_events (
@@ -8755,13 +8776,15 @@ def _safe_record_board_signal(conn: sqlite3.Connection, **kwargs: Any) -> None:
     """Emit a board signal without ever letting telemetry break the caller.
 
     Signal capture is best-effort: a malformed snapshot or a transient write
-    error must not abort a real state transition or completion. Failures are
-    logged at debug and swallowed.
+    error must not abort a real state transition or completion. F5+F3: a dropped
+    signal is data the optimizer learns from, so the failure is surfaced at
+    WARNING (not DEBUG) -- the caller is still protected, but the loss is no
+    longer silent.
     """
     try:
         record_board_signal(conn, **kwargs)
     except Exception:  # pragma: no cover - defensive telemetry guard
-        _log.debug("board_signals emit failed", exc_info=True)
+        _log.warning("board_signals emit failed", exc_info=True)
 
 
 def _end_run(
@@ -12276,6 +12299,220 @@ def _timer_schedule_should_stop(
     return False, None
 
 
+# ---------------------------------------------------------------------------
+# Tick liveness/health (F5+F3): make a dead loop visible instead of silent.
+# ---------------------------------------------------------------------------
+
+# After this many CONSECUTIVE failed sub-ticks on one board, per-tick logging
+# escalates from WARNING to ERROR -- a transient hiccup stays quiet, a wedged
+# loop screams. Also the threshold past which `board_tick_stale` flags a board
+# as unhealthy on error grounds.
+TICK_ERROR_ESCALATION_THRESHOLD: int = 3
+
+# How long a board with live work may go without a successful tick before the
+# doctor liveness check fails loudly. Generous relative to any sane tick cadence.
+TICK_STALENESS_SECONDS: int = 900
+
+_TICK_HEALTH_KINDS: frozenset[str] = frozenset({"reactive", "optimizer"})
+
+
+def _tick_health_row(conn: sqlite3.Connection, board: str) -> Optional[Any]:
+    return conn.execute(
+        "SELECT * FROM board_tick_health WHERE board = ?", (board,)
+    ).fetchone()
+
+
+def record_tick_health_failure(
+    conn: sqlite3.Connection,
+    *,
+    kind: str,
+    error: Any,
+    board: Optional[str] = None,
+    now: Optional[int] = None,
+    logger: Optional[logging.Logger] = None,
+) -> dict[str, Any]:
+    """Record a failed reactive/optimizer sub-tick on a board (F5+F3).
+
+    Increments the per-board streak + lifetime counter for ``kind``, stamps the
+    last error, appends a ``{kind}_tick_error`` ``task_events`` row, and logs at
+    WARNING -- escalating to ERROR once the consecutive streak reaches
+    :data:`TICK_ERROR_ESCALATION_THRESHOLD`. Best-effort and side-effect-safe so
+    a health-recording hiccup can never break the dispatcher.
+
+    Returns ``{"streak": int, "total": int, "escalated": bool}``.
+    """
+    if kind not in _TICK_HEALTH_KINDS:
+        raise ValueError(f"unknown tick kind: {kind!r}")
+    board_slug = _connection_board(conn, board)
+    now = int(time.time()) if now is None else int(now)
+    msg = str(error)
+    streak_col = f"{kind}_error_streak"
+    total_col = f"{kind}_error_total"
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO board_tick_health (board, updated_at) VALUES (?, ?) "
+            "ON CONFLICT(board) DO NOTHING",
+            (board_slug, now),
+        )
+        conn.execute(
+            f"UPDATE board_tick_health "
+            f"SET {streak_col} = {streak_col} + 1, "
+            f"    {total_col} = {total_col} + 1, "
+            f"    last_error_at = ?, last_error_kind = ?, last_error = ?, "
+            f"    last_tick_at = ?, updated_at = ? "
+            f"WHERE board = ?",
+            (now, kind, msg[:2000], now, now, board_slug),
+        )
+        _append_event(
+            conn,
+            "__tick__",
+            f"{kind}_tick_error",
+            {"board": board_slug, "error": msg[:2000]},
+        )
+    row = _tick_health_row(conn, board_slug)
+    streak = int(row[streak_col]) if row is not None else 1
+    total = int(row[total_col]) if row is not None else 1
+    escalated = streak >= TICK_ERROR_ESCALATION_THRESHOLD
+    log = logger or _log
+    if escalated:
+        log.error(
+            "kanban %s_tick failed on board %s (%d consecutive failures): %s",
+            kind, board_slug, streak, msg,
+        )
+    else:
+        log.warning(
+            "kanban %s_tick failed on board %s: %s", kind, board_slug, msg,
+        )
+    return {"streak": streak, "total": total, "escalated": escalated}
+
+
+def record_tick_health_success(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    now: Optional[int] = None,
+) -> None:
+    """Stamp a successful gateway tick on a board and reset error streaks (F3).
+
+    Records ``last_successful_tick`` so the doctor liveness check can tell a
+    ticking board from a wedged one. The lifetime error totals are preserved;
+    only the consecutive streaks reset.
+    """
+    board_slug = _connection_board(conn, board)
+    now = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO board_tick_health (board, last_tick_at, "
+            "last_successful_tick, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(board) DO UPDATE SET "
+            "last_tick_at = excluded.last_tick_at, "
+            "last_successful_tick = excluded.last_successful_tick, "
+            "reactive_error_streak = 0, optimizer_error_streak = 0, "
+            "updated_at = excluded.updated_at",
+            (board_slug, now, now, now),
+        )
+
+
+def get_tick_health(
+    conn: sqlite3.Connection, board: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    """Return the board's tick-health row as a dict (or ``None`` if unticked)."""
+    board_slug = _connection_board(conn, board)
+    row = _tick_health_row(conn, board_slug)
+    if row is None:
+        return None
+    return {k: row[k] for k in row.keys()}
+
+
+def _board_has_live_reactive_work(conn: sqlite3.Connection, board: str) -> bool:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM reactive_timer_schedules "
+        "WHERE board = ? AND active = 1",
+        (board,),
+    ).fetchone()
+    return bool(row and int(row["n"]) > 0)
+
+
+def board_tick_stale(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    now: Optional[int] = None,
+    staleness_seconds: int = TICK_STALENESS_SECONDS,
+) -> dict[str, Any]:
+    """Liveness check for one board (F5+F3) -- fail loudly on a dead loop.
+
+    A board is UNHEALTHY when it has live work the gateway is supposed to be
+    driving (active ``reactive_timer_schedules`` or optimizer-managed knobs) but
+    either (a) has no recorded successful tick, (b) its last successful tick is
+    older than ``staleness_seconds``, or (c) a sub-tick error streak has crossed
+    the escalation threshold. A board with no live work is always healthy (the
+    gateway has nothing to do for it).
+
+    Returns ``{"board", "healthy", "stale", "reasons": [...], "has_live_work",
+    "last_successful_tick", "age_seconds", ...}``.
+    """
+    board_slug = _connection_board(conn, board)
+    now = int(time.time()) if now is None else int(now)
+    has_timers = _board_has_live_reactive_work(conn, board_slug)
+    try:
+        contract = _metadata_as_business_contract(read_board_metadata(board_slug))
+    except Exception:
+        contract = {}
+    from hermes_cli import kanban_optimizer as _opt
+    try:
+        managed_knob = _opt.select_managed_knob(contract)
+    except Exception:
+        managed_knob = None
+    has_managed_knob = bool(managed_knob)
+    has_live_work = has_timers or has_managed_knob
+
+    health = get_tick_health(conn, board_slug)
+    last_ok = health.get("last_successful_tick") if health else None
+    age = (now - int(last_ok)) if last_ok else None
+    reactive_streak = int(health.get("reactive_error_streak") or 0) if health else 0
+    optimizer_streak = int(health.get("optimizer_error_streak") or 0) if health else 0
+
+    reasons: list[str] = []
+    if has_live_work:
+        if last_ok is None:
+            reasons.append(
+                "board has live work (active timer schedules or an optimizer-managed "
+                "knob) but the gateway has never recorded a successful tick -- is the "
+                "gateway running?"
+            )
+        elif age is not None and age > staleness_seconds:
+            reasons.append(
+                f"board has live work but the last successful tick was {age}s ago "
+                f"(> {staleness_seconds}s staleness budget) -- the gateway is not "
+                f"ticking this board."
+            )
+        if reactive_streak >= TICK_ERROR_ESCALATION_THRESHOLD:
+            reasons.append(
+                f"reactive_tick has failed {reactive_streak} consecutive times."
+            )
+        if optimizer_streak >= TICK_ERROR_ESCALATION_THRESHOLD:
+            reasons.append(
+                f"optimizer_tick has failed {optimizer_streak} consecutive times."
+            )
+
+    stale = bool(reasons)
+    return {
+        "board": board_slug,
+        "healthy": not stale,
+        "stale": stale,
+        "reasons": reasons,
+        "has_live_work": has_live_work,
+        "has_active_timers": has_timers,
+        "managed_knob": managed_knob,
+        "last_successful_tick": last_ok,
+        "age_seconds": age,
+        "reactive_error_streak": reactive_streak,
+        "optimizer_error_streak": optimizer_streak,
+        "staleness_seconds": staleness_seconds,
+    }
+
+
 def reactive_tick(
     conn: sqlite3.Connection,
     *,
@@ -12837,7 +13074,17 @@ def optimizer_tick(
     }
     try:
         contract = _metadata_as_business_contract(read_board_metadata(board_slug))
-    except Exception:
+    except Exception as exc:
+        # F5+F3: a contract-read failure used to return {} SILENTLY -- the
+        # self-tuning loop was dead and everything still reported healthy.
+        # Surface it at WARNING and report it in the result so callers/tests
+        # can see the loop is not running.
+        _log.warning(
+            "kanban optimizer_tick could not read contract for board %s: %s",
+            board_slug, exc,
+        )
+        result["skipped"].append({"knob": knob, "reason": "contract_read_failed"})
+        result["error"] = str(exc)
         return result
     target = knob or _opt.select_managed_knob(contract)
     if not target or _opt.find_knob_spec(contract, target) is None:

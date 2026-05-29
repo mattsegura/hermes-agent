@@ -751,7 +751,7 @@ _hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
-from dotenv import load_dotenv  # backward-compat for tests that monkeypatch this symbol
+from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
 from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
@@ -831,6 +831,8 @@ if _config_path.exists():
                 "docker_env": "TERMINAL_DOCKER_ENV",
                 "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
                 "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
+                "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
+                "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
                 "sandbox_dir": "TERMINAL_SANDBOX_DIR",
                 "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
             }
@@ -932,9 +934,14 @@ if _config_path.exists():
             _redact = _security_cfg.get("redact_secrets")
             if _redact is not None:
                 os.environ["HERMES_REDACT_SECRETS"] = str(_redact).lower()
-        # Gateway settings (media delivery allowlist + recency trust)
+        # Gateway settings (media delivery allowlist + recency trust + strict mode)
         _gateway_cfg = _cfg.get("gateway", {})
         if isinstance(_gateway_cfg, dict):
+            _strict = _gateway_cfg.get("strict")
+            if _strict is not None:
+                os.environ["HERMES_MEDIA_DELIVERY_STRICT"] = (
+                    "1" if _strict else "0"
+                )
             _allow_dirs = _gateway_cfg.get("media_delivery_allow_dirs")
             if _allow_dirs:
                 if isinstance(_allow_dirs, str):
@@ -1800,7 +1807,34 @@ class GatewayRunner:
             ensure_installed(log_failures=False)
         except Exception:
             pass  # Non-fatal — fail-open at scan time if unavailable
-        
+
+        # Startup heads-up (#30882): a gateway in manual approval mode with no
+        # automated risk assessor (tirith disabled AND no auxiliary.approval
+        # model) can only gate dangerous commands / execute_code scripts via
+        # live in-chat approval. With approval routing fixed, those actions now
+        # fail closed (block) rather than silently auto-running — surface that
+        # so operators knowingly enable tirith or configure auxiliary.approval
+        # for unattended gateways.
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            _appr_cfg = _load_full_config()
+            _appr_mode = str(
+                cfg_get(_appr_cfg, "approvals", "mode", default="manual") or "manual"
+            ).strip().lower()
+            _tirith_on = bool(cfg_get(_appr_cfg, "security", "tirith_enabled", default=True))
+            _aux_approval = cfg_get(_appr_cfg, "auxiliary", "approval", default=None)
+            if _appr_mode == "manual" and not _tirith_on and not _aux_approval:
+                logger.warning(
+                    "Gateway approvals.mode=manual with no automated risk "
+                    "assessor (security.tirith_enabled is false and "
+                    "auxiliary.approval is unset): dangerous commands and "
+                    "execute_code scripts will BLOCK until a human approves "
+                    "them in chat. Enable security.tirith_enabled or configure "
+                    "auxiliary.approval for unattended operation."
+                )
+        except Exception:
+            logger.debug("approvals.mode startup check skipped", exc_info=True)
+
         # Initialize session database for session_search tool support
         self._session_db = None
         try:
@@ -2295,6 +2329,32 @@ class GatewayRunner:
             session_key=session_entry.session_key,
             session_id=session_entry.session_id,
         )
+
+    def _sync_telegram_topic_binding(
+        self,
+        source: SessionSource,
+        session_entry,
+        *,
+        reason: str,
+    ) -> None:
+        """Update the topic binding to point at ``session_entry.session_id``.
+
+        Telegram topic lanes persist a (chat_id, thread_id) -> session_id row
+        so reopening a topic in a fresh process resumes the right Hermes
+        session. When compression rotates ``session_entry.session_id`` mid-turn,
+        the binding goes stale and the next inbound message in that topic
+        reloads the oversized parent transcript instead of the compressed
+        child, retriggering preflight compression — sometimes in a loop
+        (#20470, #29712, #33414).
+        """
+        if not self._is_telegram_topic_lane(source):
+            return
+        try:
+            self._record_telegram_topic_binding(source, session_entry)
+        except Exception:
+            logger.debug(
+                "telegram topic binding refresh failed (%s)", reason, exc_info=True,
+            )
 
     def _recover_telegram_topic_thread_id(
         self,
@@ -4152,6 +4212,7 @@ class GatewayRunner:
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
             adapter._busy_text_mode = self._busy_text_mode
             
             # Try to connect
@@ -5413,6 +5474,49 @@ class GatewayRunner:
             )
             stale_timeout_seconds = 0
 
+        # Read kanban.default_assignee — fallback profile for tasks
+        # created without an explicit assignee (e.g. via the dashboard).
+        # When set, the dispatcher applies it to unassigned ready tasks
+        # instead of skipping them indefinitely (#27145). Empty string
+        # (the schema default) means "no fallback, keep skipping" —
+        # backward-compatible with existing installs.
+        default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
+        if default_assignee:
+            logger.info(
+                "kanban dispatcher: default_assignee=%r (unassigned ready tasks "
+                "will route to this profile)",
+                default_assignee,
+            )
+
+        # Read kanban.max_in_progress_per_profile — per-profile concurrency
+        # cap (#21582). When set, no single profile gets more than N
+        # workers running at once, even if the global max_in_progress
+        # would allow it. Prevents one profile's local model / API quota
+        # / browser pool from being overwhelmed by a fan-out.
+        raw_per_profile = kanban_cfg.get("max_in_progress_per_profile", None)
+        max_in_progress_per_profile = None
+        if raw_per_profile is not None:
+            try:
+                max_in_progress_per_profile = int(raw_per_profile)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "kanban dispatcher: invalid kanban.max_in_progress_per_profile=%r; ignoring",
+                    raw_per_profile,
+                )
+                max_in_progress_per_profile = None
+            else:
+                if max_in_progress_per_profile < 1:
+                    logger.warning(
+                        "kanban dispatcher: kanban.max_in_progress_per_profile=%r is below 1; ignoring",
+                        raw_per_profile,
+                    )
+                    max_in_progress_per_profile = None
+                else:
+                    logger.info(
+                        "kanban dispatcher: max_in_progress_per_profile=%d",
+                        max_in_progress_per_profile,
+                    )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -5597,6 +5701,8 @@ class GatewayRunner:
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,
+                    default_assignee=default_assignee,
+                    max_in_progress_per_profile=max_in_progress_per_profile,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -5920,6 +6026,7 @@ class GatewayRunner:
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
                     adapter._busy_text_mode = self._busy_text_mode
 
                     success = await self._connect_adapter_with_timeout(adapter, platform)
@@ -6543,6 +6650,31 @@ class GatewayRunner:
             return YuanbaoAdapter(config)
 
         return None
+
+    def _adapter_enforces_own_access_policy(self, platform: Optional[Platform]) -> bool:
+        """Whether the adapter for *platform* gates access at intake itself.
+
+        Mirrors ``BasePlatformAdapter.enforces_own_access_policy``. Adapters
+        such as WeCom, Weixin, Yuanbao, and QQBot evaluate their documented
+        ``dm_policy`` / ``group_policy`` / ``allow_from`` config before a
+        message is dispatched to the gateway, so a message that reaches
+        ``_is_user_authorized`` has already been authorized by the adapter.
+        Defaults to ``False`` when the adapter is unknown or doesn't expose
+        the flag.
+        """
+        if not platform:
+            return False
+        # Some test helpers build a bare GatewayRunner via object.__new__ and
+        # never set ``adapters``; treat a missing/empty map as "no adapter"
+        # rather than raising (see pitfalls.md #17).
+        adapters = getattr(self, "adapters", None)
+        if not adapters:
+            return False
+        adapter = adapters.get(platform)
+        if adapter is None:
+            return False
+        return bool(getattr(adapter, "enforces_own_access_policy", False))
+
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
         Check if a user is authorized to use the bot.
@@ -6682,6 +6814,15 @@ class GatewayRunner:
         global_allowlist = os.getenv("GATEWAY_ALLOWED_USERS", "").strip()
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
+            # No env allowlists configured. Adapters that own their own
+            # config-driven access policy (dm_policy / group_policy /
+            # allow_from / group_allow_from) already gated this message at
+            # intake — it would not have reached the gateway otherwise — so
+            # honor that decision instead of falling through to the
+            # env-only default-deny below, which would silently break
+            # `dm_policy: open` and config-only allowlists. (#34515)
+            if self._adapter_enforces_own_access_policy(source.platform):
+                return True
             # No allowlists configured -- check global allow-all flag
             return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
 
@@ -6788,6 +6929,20 @@ class GatewayRunner:
         if config and hasattr(config, "unauthorized_dm_behavior"):
             if config.unauthorized_dm_behavior != "pair":  # non-default → explicit override
                 return config.unauthorized_dm_behavior
+
+        # Config-driven dm_policy (WeCom / Weixin / Yuanbao / QQBot). An
+        # allowlist or disabled DM policy means the operator restricted access,
+        # so unauthorized DMs should be dropped silently rather than answered
+        # with a pairing code. An explicit pairing policy opts back into codes.
+        if platform and config and hasattr(config, "platforms"):
+            platform_cfg = config.platforms.get(platform)
+            extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
+            if isinstance(extra, dict):
+                dm_policy = str(extra.get("dm_policy") or "").strip().lower()
+                if dm_policy == "pairing":
+                    return "pair"
+                if dm_policy in {"allowlist", "disabled"}:
+                    return "ignore"
 
         # No explicit override.  Fall back to allowlist-aware default:
         # if any allowlist is configured for this platform, silently drop
@@ -8125,7 +8280,8 @@ class GatewayRunner:
                                 "🎤 I received your voice message but can't transcribe it — "
                                 "no speech-to-text provider is configured.\n\n"
                                 "To enable voice: install faster-whisper "
-                                "(`pip install faster-whisper` in the Hermes venv) "
+                                "(`uv pip install faster-whisper` in the Hermes venv; "
+                                "`pip install faster-whisper` also works if pip is on PATH) "
                                 "and set `stt.enabled: true` in config.yaml, "
                                 "then /restart the gateway."
                             )
@@ -8332,6 +8488,28 @@ class GatewayRunner:
                 binding = None
             if binding:
                 bound_session_id = str(binding.get("session_id") or "")
+                # Heal bindings that point at a pre-compression parent: walk
+                # the compression-continuation chain forward to its tip so the
+                # next message resumes the compressed child instead of
+                # reloading the oversized parent transcript (#20470/#29712/
+                # #33414). Returns the input unchanged when the session isn't
+                # a compression parent, so this is cheap and safe.
+                if bound_session_id and self._session_db is not None:
+                    try:
+                        canonical_session_id = self._session_db.get_compression_tip(
+                            bound_session_id,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "compression-tip lookup failed for %s",
+                            bound_session_id, exc_info=True,
+                        )
+                        canonical_session_id = bound_session_id
+                    if (
+                        canonical_session_id
+                        and canonical_session_id != bound_session_id
+                    ):
+                        bound_session_id = canonical_session_id
                 if bound_session_id and bound_session_id != session_entry.session_id:
                     # Route the override through SessionStore so the session_key
                     # → session_id mapping is persisted to disk and the previous
@@ -8341,6 +8519,15 @@ class GatewayRunner:
                     switched = self.session_store.switch_session(session_key, bound_session_id)
                     if switched is not None:
                         session_entry = switched
+                # If the stored binding pointed at a parent, rewrite it to the
+                # canonical descendant now that we've followed the chain.
+                if (
+                    bound_session_id
+                    and bound_session_id != str(binding.get("session_id") or "")
+                ):
+                    self._sync_telegram_topic_binding(
+                        source, session_entry, reason="compression-tip-walk",
+                    )
             else:
                 try:
                     self._record_telegram_topic_binding(source, session_entry)
@@ -8717,6 +8904,10 @@ class GatewayRunner:
                                     if _hyg_new_sid != session_entry.session_id:
                                         session_entry.session_id = _hyg_new_sid
                                         self.session_store._save()
+                                        self._sync_telegram_topic_binding(
+                                            source, session_entry,
+                                            reason="hygiene-compression",
+                                        )
 
                                     self.session_store.rewrite_transcript(
                                         session_entry.session_id, _compressed
@@ -8982,6 +9173,9 @@ class GatewayRunner:
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 session_entry.session_id = agent_result["session_id"]
                 self.session_store._save()
+                self._sync_telegram_topic_binding(
+                    source, session_entry, reason="agent-result-compression",
+                )
 
             # Prepend reasoning/thinking if display is enabled (per-platform)
             try:
@@ -10348,8 +10542,16 @@ class GatewayRunner:
 
         raw_args = event.get_command_args().strip()
 
-        # Parse --provider and --global flags
-        model_input, explicit_provider, persist_global = parse_model_flags(raw_args)
+        # Parse --provider, --global, and --refresh flags
+        model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
+
+        # --refresh: bust the disk cache so the picker shows live data.
+        if force_refresh:
+            try:
+                from hermes_cli.models import clear_provider_models_cache
+                clear_provider_models_cache()
+            except Exception:
+                pass
 
         # Read current model/provider from config
         current_model = ""
@@ -11649,9 +11851,16 @@ class GatewayRunner:
 
             from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
-            media_files, _ = adapter.extract_media(response)
+            media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-            _, cleaned = adapter.extract_images(response)
+            # Chain the cleaned text through each extractor (extract_media →
+            # extract_images → extract_local_files) so MEDIA: tags and image URLs
+            # are removed before the bare-path auto-detect runs. Previously the
+            # cleaned text from extract_media was dropped (``_``) and
+            # extract_local_files scanned text that still contained MEDIA: tags,
+            # producing false-positive bare-path matches with the MEDIA: prefix
+            # glued on. This matches the chain order in gateway/platforms/base.py.
+            _, cleaned = adapter.extract_images(cleaned)
             local_files, _ = adapter.extract_local_files(cleaned)
             local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
 
@@ -12418,6 +12627,9 @@ class GatewayRunner:
                 if new_session_id != session_entry.session_id:
                     session_entry.session_id = new_session_id
                     self.session_store._save()
+                    self._sync_telegram_topic_binding(
+                        source, session_entry, reason="compress-command",
+                    )
 
                 self.session_store.rewrite_transcript(new_session_id, compressed)
                 # Reset stored token count — transcript changed, old value is stale
@@ -17381,13 +17593,33 @@ class GatewayRunner:
             # append any that aren't already present in the final response, so the
             # adapter's extract_media() can find and deliver the files exactly once.
             #
-            # Uses path-based deduplication against _history_media_paths (collected
-            # before run_conversation) instead of index slicing. This is safe even
-            # when context compression shrinks the message list. (Fixes #160)
+            # Scope the scan to THIS turn's tool results only. ``agent_history``
+            # was passed into run_conversation as ``conversation_history``, so the
+            # agent's returned ``messages`` list is ``agent_history`` followed by
+            # the messages produced this turn. Slicing at ``len(agent_history)``
+            # isolates the current turn precisely, so a stale MEDIA: path emitted
+            # by a tool several turns earlier (still present in the full message
+            # list) can never leak onto a later text-only reply. (Fixes #34608)
+            #
+            # Path-based deduplication against _history_media_paths (collected
+            # before run_conversation) is retained as a secondary guard. It is
+            # also the sole guard on the fallback branch taken when mid-run
+            # context compression shrinks the message list below the original
+            # history length, preserving the compression-safe behaviour of #160.
             if "MEDIA:" not in final_response:
                 media_tags = []
                 has_voice_directive = False
-                for msg in result.get("messages", []):
+                _all_msgs = result.get("messages", [])
+                _history_len = len(agent_history)
+                # Only trust the slice boundary when the message list still
+                # contains the full history prefix. Mid-run compression can
+                # rewrite/shrink the list; in that case fall back to scanning
+                # everything and rely on _history_media_paths for dedup.
+                if _history_len and len(_all_msgs) >= _history_len:
+                    _scan_msgs = _all_msgs[_history_len:]
+                else:
+                    _scan_msgs = _all_msgs
+                for msg in _scan_msgs:
                     if msg.get("role") in {"tool", "function"}:
                         content = msg.get("content", "")
                         if "MEDIA:" in content:
@@ -18300,6 +18532,95 @@ class GatewayRunner:
         return response
 
 
+def _run_planned_stop_watcher(
+    stop_event: threading.Event,
+    runner,
+    loop: asyncio.AbstractEventLoop,
+    shutdown_handler,
+    *,
+    poll_interval: float = 0.5,
+) -> None:
+    """Poll for the planned-stop marker and trigger graceful shutdown.
+
+    On Windows, ``asyncio.add_signal_handler`` raises NotImplementedError
+    for SIGTERM/SIGINT, so the standard signal-driven shutdown path
+    never runs when ``hermes gateway stop`` signals the gateway. The
+    consequence is that the drain loop is skipped — in-flight agent
+    sessions are killed mid-turn and ``resume_pending`` is never set,
+    so the next gateway boot has no idea those sessions need to be
+    auto-resumed (issue #33778, v0.13.0 session-resume feature broken
+    on native Windows).
+
+    This watcher runs on every platform (cheap, defensive) and bridges
+    the gap on Windows by translating a filesystem marker into the
+    same shutdown-handler invocation a real SIGTERM would have produced
+    on POSIX. The CLI's ``hermes_cli.gateway_windows.stop()`` writes
+    the marker via ``write_planned_stop_marker(pid)`` and then waits
+    for the gateway PID to exit; this watcher is what makes that
+    exit happen cleanly.
+
+    On POSIX this is a no-op safety net — the signal handler always
+    races us to consuming the marker file because it fires synchronously
+    from the kernel's signal delivery.
+
+    Args:
+        stop_event: cleared by start_gateway() during normal shutdown
+            to tell the watcher to exit.
+        runner: the GatewayRunner instance; we check ``_running`` and
+            ``_draining`` to avoid triggering shutdown if the gateway
+            is already in one of those states.
+        loop: the asyncio event loop the shutdown handler must run on.
+        shutdown_handler: same callable that's wired to SIGTERM —
+            tolerates a ``None`` signal argument (planned stop case)
+            and consumes the marker via
+            ``consume_planned_stop_marker_for_self()``.
+        poll_interval: seconds between marker checks. 0.5s gives a
+            responsive shutdown without burning CPU.
+    """
+    from gateway.status import (
+        _get_planned_stop_marker_path,
+        planned_stop_marker_targets_self,
+    )
+    marker_path = _get_planned_stop_marker_path()
+    while not stop_event.is_set():
+        try:
+            if (
+                marker_path.exists()
+                and not getattr(runner, "_draining", False)
+                and getattr(runner, "_running", False)
+            ):
+                # A marker existing is NOT sufficient — it may have been
+                # written for a PREVIOUS gateway instance (different PID)
+                # and left behind because that process exited before the
+                # CLI's stop() could clean it up. Firing the handler on a
+                # stale/foreign marker drives the gateway into shutdown,
+                # then consume_planned_stop_marker_for_self() correctly
+                # reports a PID mismatch — but by then we're already
+                # stopping, so it's logged as an unexpected "UNKNOWN" exit
+                # and the watchdog crash-loops the gateway (issue #34597,
+                # a regression from PR #33798 which added this watcher
+                # without the PID check).
+                #
+                # Only fire when the marker actually targets us. The probe
+                # is non-destructive on a match (the handler does the
+                # authoritative consume on the loop thread) and self-heals
+                # by unlinking stale/malformed markers so they cannot wedge
+                # a freshly booted gateway.
+                if not planned_stop_marker_targets_self():
+                    stop_event.wait(poll_interval)
+                    continue
+                # Drive the same path as a real signal handler.
+                # Pass signal=None — the handler tolerates that and consumes
+                # the marker via consume_planned_stop_marker_for_self,
+                # which also validates target_pid + start_time match us.
+                loop.call_soon_threadsafe(shutdown_handler, None)
+                # Done — the handler will set _draining; we exit on next tick.
+                break
+        except Exception as _e:
+            logger.debug("Planned-stop watcher tick error: %s", _e)
+        stop_event.wait(poll_interval)
+
+
 def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
     """
     Background thread that ticks the cron scheduler at a regular interval.
@@ -18704,7 +19025,28 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 pass
     else:
         logger.info("Skipping signal handlers (not running in main thread).")
-    
+
+    # Windows fallback: asyncio.add_signal_handler raises NotImplementedError
+    # on Windows, so `hermes gateway stop`'s SIGTERM (which Python maps to
+    # TerminateProcess on Windows) never invokes shutdown_signal_handler.
+    # That means the drain loop never runs, mark_resume_pending never fires,
+    # and sessions are silently lost across restarts (issue #33778).
+    #
+    # The fix is a marker-polling thread: `hermes gateway stop` writes the
+    # planned-stop marker BEFORE killing, and this thread notices it and
+    # drives the same shutdown path the signal handler would have.  Runs
+    # on every platform (cheap, defensive) so non-signal-bearing
+    # environments (Windows native, sandboxed CI runners that mask
+    # SIGTERM) still get a clean drain.
+    _planned_stop_watcher_stop = threading.Event()
+    _planned_stop_watcher_thread = threading.Thread(
+        target=_run_planned_stop_watcher,
+        args=(_planned_stop_watcher_stop, runner, loop, shutdown_signal_handler),
+        daemon=True,
+        name="planned-stop-watcher",
+    )
+    _planned_stop_watcher_thread.start()
+
     # Claim the PID file BEFORE bringing up any platform adapters.
     # This closes the --replace race window: two concurrent `gateway run
     # --replace` invocations both pass the termination-wait above, but
@@ -18781,6 +19123,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Stop cron ticker cleanly
     cron_stop.set()
     cron_thread.join(timeout=5)
+
+    # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
+    _planned_stop_watcher_stop.set()
+    _planned_stop_watcher_thread.join(timeout=2)
 
     # Close MCP server connections
     try:

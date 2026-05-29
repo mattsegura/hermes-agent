@@ -65,6 +65,39 @@ import os
 import sys
 
 
+# Mouse-tracking residue suppression — runs BEFORE every other import on the
+# TUI hot path so the terminal stops emitting SGR/X10 mouse reports while the
+# Python launcher is still doing imports (≈100–300ms in cooked + echo mode,
+# before the Node TUI takes stdin into raw mode). During that window any
+# incoming bytes are echoed straight back to the user's shell scrollback as
+# ``^[[<…M`` text. The TUI itself runs `resetTerminalModes()` again in
+# `entry.tsx`; this is just the earlier cousin. ``HERMES_TUI_NO_EARLY_DISABLE``
+# escapes the behaviour for diagnostics.
+def _suppress_mouse_residue_early() -> None:
+    if os.environ.get("HERMES_TUI_NO_EARLY_DISABLE") == "1":
+        return
+    if not (os.environ.get("HERMES_TUI") == "1" or "--tui" in sys.argv[1:]):
+        return
+    try:
+        # Skip when stdout is redirected (`hermes --tui … >log`, CI capture):
+        # the bytes can't reach the terminal anyway and would just pollute
+        # the log with raw CSI.
+        if not os.isatty(1):
+            return
+        # Disable every mouse-tracking variant we know about. Idempotent and
+        # safe to send even when no tracking is currently asserted.
+        os.write(
+            1,
+            b"\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?9l"
+            b"\x1b[?1006l\x1b[?1005l\x1b[?1015l\x1b[?1016l\x1b[?2029l",
+        )
+    except OSError:
+        pass
+
+
+_suppress_mouse_residue_early()
+
+
 def _is_termux_startup_environment_fast() -> bool:
     """Tiny Termux check for pre-import startup shortcuts."""
     prefix = os.environ.get("PREFIX", "")
@@ -2084,6 +2117,13 @@ def cmd_postinstall(args):
 def cmd_model(args):
     """Select default model — starts with provider selection, then model picker."""
     _require_tty("model")
+    if getattr(args, "refresh", False):
+        try:
+            from hermes_cli.models import clear_provider_models_cache
+            clear_provider_models_cache()
+            print("  Cleared model picker cache.")
+        except Exception:
+            pass
     select_provider_and_model(args=args)
 
 
@@ -3031,7 +3071,7 @@ def _model_flow_nous(config, current_model="", args=None):
 
     # Verify credentials are still valid (catches expired sessions early)
     try:
-        creds = resolve_nous_runtime_credentials(min_key_ttl_seconds=5 * 60)
+        creds = resolve_nous_runtime_credentials()
     except Exception as exc:
         relogin = isinstance(exc, AuthError) and exc.relogin_required
         msg = format_auth_error(exc) if isinstance(exc, AuthError) else str(exc)
@@ -3059,8 +3099,20 @@ def _model_flow_nous(config, current_model="", args=None):
     # Fetch live pricing (non-blocking — returns empty dict on failure)
     pricing = get_pricing_for_provider("nous")
 
-    # Check if user is on free tier
-    free_tier = check_nous_free_tier()
+    # Force fresh account data for model selection so recent credit purchases
+    # are reflected immediately.
+    free_tier = check_nous_free_tier(force_fresh=True)
+    if not free_tier:
+        try:
+            refreshed_creds = resolve_nous_runtime_credentials(
+                force_refresh=True,
+            )
+            if refreshed_creds:
+                creds = refreshed_creds
+        except Exception:
+            # Runtime inference has its own paid-entitlement recovery path; do
+            # not block model selection if this opportunistic refresh fails.
+            pass
 
     # Resolve portal URL early — needed both for upgrade links and for the
     # freeRecommendedModels endpoint below.
@@ -3082,7 +3134,24 @@ def _model_flow_nous(config, current_model="", args=None):
     # newly-launched paid models surface in the picker too — independent
     # of CLI release cadence.
     unavailable_models: list[str] = []
+    unavailable_message = ""
     if free_tier:
+        try:
+            from hermes_cli.nous_account import (
+                format_nous_portal_entitlement_message,
+                get_nous_portal_account_info,
+            )
+
+            _account_info = get_nous_portal_account_info(force_fresh=True)
+            unavailable_message = (
+                format_nous_portal_entitlement_message(
+                    _account_info,
+                    capability="paid Nous models",
+                )
+                or ""
+            )
+        except Exception:
+            unavailable_message = ""
         model_ids, pricing = union_with_portal_free_recommendations(
             model_ids, pricing, _nous_portal_url,
         )
@@ -3104,7 +3173,7 @@ def _model_flow_nous(config, current_model="", args=None):
             from hermes_cli.auth import DEFAULT_NOUS_PORTAL_URL
 
             _url = (_nous_portal_url or DEFAULT_NOUS_PORTAL_URL).rstrip("/")
-            print(f"Upgrade at {_url} to access paid models.")
+            print(unavailable_message or f"Upgrade at {_url} to access paid models.")
         return
 
     print(
@@ -3117,6 +3186,7 @@ def _model_flow_nous(config, current_model="", args=None):
         pricing=pricing,
         unavailable_models=unavailable_models,
         portal_url=_nous_portal_url,
+        unavailable_message=unavailable_message,
     )
     if selected:
         _save_model_choice(selected)
@@ -5521,7 +5591,6 @@ def _model_flow_bedrock(config, current_model=""):
 def _model_flow_api_key_provider(config, provider_id, current_model=""):
     """Generic flow for API-key providers (z.ai, MiniMax, OpenCode, etc.)."""
     from hermes_cli.auth import (
-        LMSTUDIO_NOAUTH_PLACEHOLDER,
         PROVIDER_REGISTRY,
         _prompt_model_selection,
         _save_model_choice,
@@ -6091,13 +6160,6 @@ def cmd_webhook(args):
     webhook_command(args)
 
 
-def cmd_portal(args):
-    """Nous Portal status and Tool Gateway routing surface."""
-    from hermes_cli.portal_cli import portal_command
-
-    return portal_command(args)
-
-
 def cmd_slack(args):
     """Slack integration helpers.
 
@@ -6444,6 +6506,104 @@ def _web_ui_build_needed(web_dir: Path) -> bool:
     return False
 
 
+def _run_with_idle_timeout(
+    cmd: list[str],
+    cwd: Path,
+    *,
+    idle_timeout_seconds: int = 180,
+    indent: str = "    ",
+) -> subprocess.CompletedProcess:
+    """Run a subprocess that streams output, with an idle-output timeout.
+
+    Issue #33788: ``npm run build`` (Vite) was invoked with
+    ``capture_output=True`` and no timeout. On low-memory hosts (notably
+    WSL2 with the default 4 GB cap) the build can stall or sit silent for
+    minutes; users see a frozen terminal, assume the update is hung, and
+    reboot — leaving the editable install in a half-state with the
+    ``hermes`` launcher present but ``hermes_cli`` not importable.
+
+    This helper fixes both halves: stdout is streamed (so the user sees
+    progress), and if no bytes have appeared on stdout/stderr for
+    ``idle_timeout_seconds``, the process is terminated and the call
+    returns with a non-zero ``returncode``. The caller's existing
+    stale-dist fallback (#23817) takes over from there.
+
+    Returns a ``CompletedProcess`` with merged stdout (text), empty
+    stderr, and an integer returncode. Never raises on idle timeout —
+    propagation of failure is via the returncode.
+    """
+    merged_chunks: list[str] = []
+    last_output_ts = _time.monotonic()
+    lock = threading.Lock()
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+    except OSError as exc:
+        # E.g. npm not on PATH between the which() check and now.
+        return subprocess.CompletedProcess(cmd, 127, stdout="", stderr=str(exc))
+
+    def _reader() -> None:
+        nonlocal last_output_ts
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            try:
+                print(f"{indent}{line.rstrip()}", flush=True)
+            except UnicodeEncodeError:
+                # Windows cp1252 fallback — same pattern as _say().
+                enc = getattr(sys.stdout, "encoding", None) or "ascii"
+                safe = line.rstrip().encode(enc, errors="replace").decode(enc, errors="replace")
+                print(f"{indent}{safe}", flush=True)
+            with lock:
+                merged_chunks.append(line)
+                last_output_ts = _time.monotonic()
+
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
+
+    idle_killed = False
+    while True:
+        try:
+            rc = proc.wait(timeout=5)
+            break
+        except subprocess.TimeoutExpired:
+            with lock:
+                idle = _time.monotonic() - last_output_ts
+            if idle > idle_timeout_seconds:
+                idle_killed = True
+                proc.terminate()
+                try:
+                    rc = proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    rc = proc.wait()
+                break
+
+    # Drain reader so we don't leak the stdout file descriptor.
+    reader_thread.join(timeout=2)
+
+    combined = "".join(merged_chunks)
+    if idle_killed:
+        msg = (
+            f"\n  ⚠ Build produced no output for {idle_timeout_seconds}s — terminated.\n"
+            "    Common causes: out-of-memory on a low-RAM host (WSL/container),\n"
+            "    a stuck Node process, or an antivirus scan stalling I/O.\n"
+        )
+        combined += msg
+        # Force a non-zero rc even if terminate() raced with a clean exit.
+        if rc == 0:
+            rc = 124  # GNU `timeout` convention
+    return subprocess.CompletedProcess(cmd, rc, stdout=combined, stderr="")
+
+
 def _run_npm_install_deterministic(
     npm: str,
     cwd: Path,
@@ -6549,31 +6709,26 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
         if fatal:
             _say("  Run manually:  cd web && npm install && npm run build")
         return False
-    # First attempt
-    r2 = subprocess.run(
-        [npm, "run", "build"],
-        cwd=web_dir,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    # First attempt — stream output via idle-timeout helper (issue #33788).
+    # capture_output=True on a long Vite build looks identical to a hang;
+    # users react by rebooting, which leaves the editable install in a
+    # half-state. Streaming + idle-kill makes failures observable AND
+    # recoverable (the stale-dist fallback below handles the kill path).
+    r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir)
     if r2.returncode != 0:
         # Retry once after a short delay — covers boot-time races on Windows
         # (antivirus scanning Node.js binaries, npm cache not ready, transient
         # I/O when launched via Scheduled Task at logon). See issue #23817.
         _time.sleep(3)
-        r2 = subprocess.run(
-            [npm, "run", "build"],
-            cwd=web_dir,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir)
 
     if r2.returncode != 0:
-        stderr_preview = (r2.stderr or "").strip()
+        # _run_with_idle_timeout merges stderr into stdout; older callers
+        # using subprocess.run kept them split. Pull from whichever has
+        # content so the error surfaces regardless of which path produced
+        # the CompletedProcess.
+        build_output = (r2.stderr or "") + (r2.stdout or "")
+        stderr_preview = build_output.strip()
         stderr_tail = "\n  ".join(stderr_preview.splitlines()[-10:]) if stderr_preview else ""
         dist_dir = web_dir.parent / "hermes_cli" / "web_dist"
         dist_index = dist_dir / "index.html"
@@ -7064,6 +7219,11 @@ def _update_via_zip(args):
         _install_python_dependencies_with_optional_fallback(pip_cmd)
 
     _update_node_dependencies()
+    # Core (Python deps + git pull / ZIP extract) is now complete; the CLI
+    # is functional from this point onward. The web UI build below is
+    # optional — a failure here only affects ``hermes dashboard``. Make
+    # that visible so users don't panic and reboot mid-build (#33788).
+    print("→ Core update complete. Building dashboard (optional)...")
     _build_web_ui(PROJECT_ROOT / "web")
 
     # Sync skills
@@ -8092,37 +8252,18 @@ def _install_psutil_android_compat(
     nothing is persisted in the repository.
 
     Stopgap: remove this once https://github.com/giampaolo/psutil/pull/2762
-    merges and ships in a release. ``scripts/install_psutil_android.py``
-    contains the same logic for ``scripts/install.sh`` (fresh installs).
-    Both copies should be removed together.
+    merges and ships in a release. The standalone installer script uses the
+    same shared helper and should be removed together.
     """
-    import tarfile
     import tempfile
     import urllib.request
-
-    psutil_url = (
-        "https://files.pythonhosted.org/packages/aa/c6/"
-        "d1ddf4abb55e93cebc4f2ed8b5d6dbad109ecb8d63748dd2b20ab5e57ebe/"
-        "psutil-7.2.2.tar.gz"
-    )
+    from hermes_cli.psutil_android import PSUTIL_URL, prepare_patched_psutil_sdist
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         archive = tmp_path / "psutil.tar.gz"
-        urllib.request.urlretrieve(psutil_url, archive)
-        with tarfile.open(archive) as tar:
-            tar.extractall(tmp_path)
-
-        src_root = next(
-            p for p in tmp_path.iterdir() if p.is_dir() and p.name.startswith("psutil-")
-        )
-        common_py = src_root / "psutil" / "_common.py"
-        content = common_py.read_text(encoding="utf-8")
-        marker = 'LINUX = sys.platform.startswith("linux")'
-        replacement = 'LINUX = sys.platform.startswith(("linux", "android"))'
-        if marker not in content:
-            raise RuntimeError("psutil Android compatibility patch marker not found")
-        common_py.write_text(content.replace(marker, replacement), encoding="utf-8")
+        urllib.request.urlretrieve(PSUTIL_URL, archive)
+        src_root = prepare_patched_psutil_sdist(archive, tmp_path)
 
         _run_install_with_heartbeat(
             install_cmd_prefix + ["install", "--no-build-isolation", str(src_root)],
@@ -8383,6 +8524,14 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     """
     from hermes_cli.config import detect_install_method
     method = detect_install_method(PROJECT_ROOT)
+    if method == "docker":
+        # Docker can't ``git fetch`` from within the container.  Surface the
+        # same long-form ``docker pull`` guidance ``hermes update`` (apply
+        # path) uses — telling the user to "reinstall via curl" or that
+        # ".git is missing" would point them at the wrong remediation.
+        from hermes_cli.config import format_docker_update_message
+        print(format_docker_update_message())
+        sys.exit(1)
     if method == "pip":
         from hermes_cli.config import recommended_update_command
         from hermes_cli.banner import check_via_pypi
@@ -8683,11 +8832,26 @@ def cmd_update(args):
     runs the update, then restores stdio on the way out (even on
     ``sys.exit`` or unhandled exceptions).
     """
-    from hermes_cli.config import is_managed, managed_error
+    from hermes_cli.config import (
+        detect_install_method,
+        format_docker_update_message,
+        is_managed,
+        managed_error,
+    )
 
     if is_managed():
         managed_error("update Hermes Agent")
         return
+
+    # Docker users can't ``git pull`` — the image excludes ``.git`` from
+    # the build context.  Bail with a friendly explanation pointing at
+    # ``docker pull`` BEFORE any of the apply-path / check-path branches
+    # below get a chance to error out with misleading "Not a git
+    # repository" text.  See format_docker_update_message() for the full
+    # rationale and tag-pinning / config-persistence notes.
+    if detect_install_method(PROJECT_ROOT) == "docker":
+        print(format_docker_update_message())
+        sys.exit(1)
 
     if getattr(args, "check", False):
         # --check honors --branch so the "any new commits?" answer matches
@@ -8961,12 +9125,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # though `git pull` can't touch $HERMES_HOME, this is cheap
         # belt-and-suspenders insurance and gives the user something to
         # restore from via `/snapshot list` / `/snapshot restore <id>`.
+        pre_update_snapshot_id = None
         try:
             from hermes_cli.backup import create_quick_snapshot
 
-            snap_id = create_quick_snapshot(label="pre-update")
-            if snap_id:
-                print(f"  ✓ Pre-update snapshot: {snap_id}")
+            pre_update_snapshot_id = create_quick_snapshot(label="pre-update", keep=1)
+            if pre_update_snapshot_id:
+                print(f"  ✓ Pre-update snapshot: {pre_update_snapshot_id}")
         except Exception as exc:
             # Never let a snapshot failure block an update.
             logger.debug("Pre-update snapshot failed: %s", exc)
@@ -9134,6 +9299,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _refresh_active_lazy_features()
 
         _update_node_dependencies()
+        # See note above (ZIP path): core is now complete, web UI build is
+        # optional from a CLI perspective. Telegraphing this avoids the
+        # "stuck at webui-build → reboot → broken install" trap (#33788).
+        print("→ Core update complete. Building dashboard (optional)...")
         _build_web_ui(PROJECT_ROOT / "web")
 
         print()
@@ -9298,6 +9467,25 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print("Skipped. Run 'hermes config migrate' later to configure.")
         else:
             print("  ✓ Configuration is up to date")
+
+        # Safety net: config-version migrations have been observed to leave
+        # cron/jobs.json valid-but-empty, silently dropping every scheduled
+        # job (issue #34600). If the live file is now empty while the
+        # pre-update snapshot held jobs, restore it and warn loudly.
+        try:
+            from hermes_cli.backup import restore_cron_jobs_if_emptied
+
+            cron_restore = restore_cron_jobs_if_emptied(pre_update_snapshot_id)
+            if cron_restore:
+                print()
+                print(
+                    "  ⚠️  cron/jobs.json was emptied during this update — "
+                    f"restored {cron_restore['job_count']} job(s) from "
+                    f"pre-update snapshot {cron_restore['snapshot_id']}."
+                )
+        except Exception as exc:
+            # Never let the cron safety net break an otherwise-good update.
+            logger.debug("Cron jobs auto-restore check failed: %s", exc)
 
         print()
         print("✓ Update complete!")
@@ -10394,11 +10582,10 @@ def cmd_profile(args):
             if collision:
                 print(f"Error: {collision}")
                 sys.exit(1)
-            wrapper_path = create_wrapper_script(alias_name)
+            wrapper_path = create_wrapper_script(
+                alias_name, target=name if custom_name else None
+            )
             if wrapper_path:
-                # If custom name, write the profile name into the wrapper
-                if custom_name:
-                    wrapper_path.write_text(f'#!/bin/sh\nexec hermes -p {name} "$@"\n')
                 print(f"✓ Alias created: {wrapper_path}")
                 if not _is_wrapper_dir_in_path():
                     print(f"⚠ {_get_wrapper_dir()} is not in your PATH.")
@@ -10800,24 +10987,6 @@ def cmd_logs(args):
         since=getattr(args, "since", None),
         component=getattr(args, "component", None),
     )
-
-
-def _build_provider_choices() -> list[str]:
-    """Build the --provider choices list from CANONICAL_PROVIDERS + 'auto'."""
-    try:
-        from hermes_cli.models import CANONICAL_PROVIDERS as _cp
-        return ["auto"] + [p.slug for p in _cp]
-    except Exception:
-        # Fallback: static list guarantees the CLI always works
-        return [
-            "auto", "openrouter", "nous", "openai-codex", "xai-oauth", "copilot-acp", "copilot",
-            "anthropic", "gemini", "google-gemini-cli", "xai", "bedrock", "azure-foundry",
-            "ollama-cloud", "huggingface", "zai", "kimi-coding", "kimi-coding-cn",
-            "stepfun", "minimax", "minimax-cn", "kilocode", "novita", "xiaomi", "arcee",
-            "nvidia", "deepseek", "alibaba", "qwen-oauth", "opencode-zen", "opencode-go",
-        ]
-
-
 # Top-level subcommands that argparse knows about WITHOUT running plugin
 # discovery.  Used to short-circuit eager plugin imports (which can take
 # 500ms+ pulling in google.cloud.pubsub_v1, aiohttp, grpc, etc.) when the
@@ -11141,6 +11310,11 @@ def main():
         description="Interactively select your inference provider and default model",
     )
     model_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Wipe the model picker disk cache and re-fetch every provider's live /v1/models list.",
+    )
+    model_parser.add_argument(
         "--portal-url",
         help="Portal base URL for Nous login (default: production portal)",
     )
@@ -11325,6 +11499,19 @@ def main():
         "--replace",
         action="store_true",
         help="Replace any existing gateway instance (useful for systemd)",
+    )
+    gateway_run.add_argument(
+        "--no-supervise",
+        action="store_true",
+        help=(
+            "Inside the s6-overlay Docker image, normally `gateway run` is "
+            "automatically redirected to the supervised s6 service (so the "
+            "gateway gets auto-restart on crash, plus a supervised dashboard "
+            "if HERMES_DASHBOARD is set). Pass --no-supervise to opt out and "
+            "get the historical pre-s6 foreground behavior: the gateway is "
+            "the container's main process and the container exits with the "
+            "gateway's exit code. No effect outside an s6 container."
+        ),
     )
     _add_accept_hooks_flag(gateway_run)
     _add_accept_hooks_flag(gateway_parser)
@@ -12472,6 +12659,11 @@ Examples:
         ],
     )
     skills_search.add_argument("--limit", type=int, default=10, help="Max results")
+    skills_search.add_argument(
+        "--json",
+        action="store_true",
+        help="Output JSON instead of a table (full identifiers, scripting-friendly)",
+    )
 
     skills_install = skills_subparsers.add_parser("install", help="Install a skill")
     skills_install.add_argument(
@@ -12710,7 +12902,34 @@ Examples:
     )
     plugins_remove.add_argument("name", help="Plugin directory name to remove")
 
-    plugins_subparsers.add_parser("list", aliases=["ls"], help="List installed plugins")
+    plugins_list = plugins_subparsers.add_parser(
+        "list", aliases=["ls"], help="List installed plugins"
+    )
+    plugins_list.add_argument(
+        "--enabled",
+        action="store_true",
+        help="Show only enabled plugins",
+    )
+    plugins_list.add_argument(
+        "--user",
+        action="store_true",
+        help="Show only user-installed plugins (including git plugins)",
+    )
+    plugins_list.add_argument(
+        "--no-bundled",
+        action="store_true",
+        help="Hide bundled plugins",
+    )
+    plugins_list.add_argument(
+        "--plain",
+        action="store_true",
+        help="Print compact plain-text output instead of a Rich table",
+    )
+    plugins_list.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON",
+    )
 
     plugins_enable = plugins_subparsers.add_parser(
         "enable", help="Enable a disabled plugin"
@@ -13190,6 +13409,11 @@ Examples:
         "--yes", "-y", action="store_true", help="Skip confirmation"
     )
 
+    sessions_subparsers.add_parser(
+        "optimize",
+        help="Reclaim disk space: merge FTS5 segments + VACUUM (no data change)",
+    )
+
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
     sessions_rename = sessions_subparsers.add_parser(
@@ -13361,6 +13585,34 @@ Examples:
 
             relaunch(["--resume", selected_id])
             return  # won't reach here after execvp
+
+        elif action == "optimize":
+            db_path = db.db_path
+            before_mb = (
+                os.path.getsize(db_path) / (1024 * 1024)
+                if db_path.exists()
+                else 0.0
+            )
+            print("Optimizing session store (FTS merge + VACUUM)…")
+            try:
+                # vacuum() merges FTS5 segments (optimize_fts) then VACUUMs,
+                # and returns the number of indexes it merged.
+                n = db.vacuum()
+            except Exception as e:
+                print(f"Error: optimization failed: {e}")
+                db.close()
+                return
+            after_mb = (
+                os.path.getsize(db_path) / (1024 * 1024)
+                if db_path.exists()
+                else 0.0
+            )
+            saved = before_mb - after_mb
+            print(f"Optimized {n} FTS index(es).")
+            print(
+                f"Database size: {before_mb:.1f} MB -> {after_mb:.1f} MB "
+                f"(reclaimed {saved:.1f} MB)"
+            )
 
         elif action == "stats":
             total = db.session_count()
