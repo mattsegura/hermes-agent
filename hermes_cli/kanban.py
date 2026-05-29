@@ -1148,6 +1148,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit one JSON object per task on stdout",
     )
 
+    # --- doctor (tick liveness check) ---
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="Liveness check: fail loudly when a board has live work "
+             "(active timer schedules or an optimizer-managed knob) but the "
+             "gateway is not ticking it.",
+    )
+    p_doctor.add_argument("--json", action="store_true", help="Emit JSON output")
+    p_doctor.add_argument(
+        "--all-boards", action="store_true",
+        help="Check every non-archived board (default: only the current board)",
+    )
+    p_doctor.add_argument(
+        "--staleness-seconds", type=int, default=kb.TICK_STALENESS_SECONDS,
+        help=f"How long a board with live work may go without a successful tick "
+             f"before it is flagged stale (default: {kb.TICK_STALENESS_SECONDS})",
+    )
+
     # --- gc ---
     p_gc = sub.add_parser(
         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
@@ -1287,6 +1305,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "context":  _cmd_context,
         "specify":  _cmd_specify,
         "decompose":  _cmd_decompose,
+        "doctor":   _cmd_doctor,
         "gc":       _cmd_gc,
     }
     handler = handlers.get(action)
@@ -3257,6 +3276,10 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     long-lived background services), but the default path exits 2
     with guidance so nobody accidentally keeps running two dispatchers
     against the same kanban.db.
+
+    F4: the ``--force`` loop now runs the FULL per-board tick
+    (reactive + optimizer + dispatch across every non-archived board),
+    matching the gateway, so it is no longer a dead self-tuning loop.
     """
     # --force lets power users keep the standalone loop for one more
     # release cycle. Undocumented in `--help` so nobody discovers it
@@ -3300,6 +3323,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     print(
         f"Kanban dispatcher running STANDALONE via --force "
         f"(interval={args.interval}s, pid={os.getpid()}). "
+        f"Runs the FULL per-board tick (reactive + optimizer + dispatch) "
+        f"across every non-archived board, matching the gateway. "
         f"Ctrl-C to stop. NOTE: if a gateway is also running with "
         f"dispatch_in_gateway=true (default), you have two dispatchers "
         f"racing for claims.",
