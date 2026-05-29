@@ -779,7 +779,6 @@ def test_run_daemon_runs_reactive_and_optimizer_and_dispatch(fresh_home, monkeyp
     calls = {"reactive": 0, "optimizer": 0, "dispatch": 0}
     orig_reactive = kb.reactive_tick
     orig_optimizer = kb.optimizer_tick
-    orig_dispatch = kb.dispatch_once
 
     def _reactive(conn, **kw):
         calls["reactive"] += 1
@@ -789,9 +788,12 @@ def test_run_daemon_runs_reactive_and_optimizer_and_dispatch(fresh_home, monkeyp
         calls["optimizer"] += 1
         return orig_optimizer(conn, **kw)
 
+    # Stub dispatch so the standalone loop never spawns real worker processes
+    # (the watcher card is assigned to mock-worker). We only need to prove the
+    # daemon CALLS dispatch on the same tick as reactive + optimizer.
     def _dispatch(conn, **kw):
         calls["dispatch"] += 1
-        return orig_dispatch(conn, **kw)
+        return None
 
     monkeypatch.setattr(kb, "reactive_tick", _reactive)
     monkeypatch.setattr(kb, "optimizer_tick", _optimizer)
@@ -804,10 +806,12 @@ def test_run_daemon_runs_reactive_and_optimizer_and_dispatch(fresh_home, monkeyp
 
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
-    time.sleep(0.3)
-    stop.set()
-    t.join(timeout=2.0)
-    assert not t.is_alive()
+    try:
+        time.sleep(0.3)
+    finally:
+        stop.set()
+        t.join(timeout=5.0)
+    assert not t.is_alive(), "standalone daemon thread must stop on stop_event"
     # F4: the standalone daemon now drives the FULL tick, not dispatch-only.
     assert calls["reactive"] >= 1
     assert calls["optimizer"] >= 1
