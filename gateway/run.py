@@ -5677,12 +5677,25 @@ class GatewayRunner:
                 # loops one cadence step on the same tick that dispatches
                 # ready work. Best-effort — a reactive hiccup must never
                 # stop the dispatcher from spawning workers.
+                # F5+F3: a failed sub-tick must be VISIBLE, not swallowed at
+                # DEBUG. record_tick_health_failure logs at WARNING (ERROR after
+                # N consecutive failures), bumps the per-board error counters,
+                # and writes a {kind}_tick_error task_event. A clean tick stamps
+                # last_successful_tick so the doctor can tell a wedged loop from
+                # a healthy one. Health recording is itself best-effort.
+                tick_ok = True
                 try:
                     _kb.reactive_tick(conn, board=slug)
-                except Exception:
-                    logger.debug(
-                        "kanban reactive_tick failed on board %s", slug, exc_info=True
-                    )
+                except Exception as exc:
+                    tick_ok = False
+                    try:
+                        _kb.record_tick_health_failure(
+                            conn, board=slug, kind="reactive", error=exc, logger=logger
+                        )
+                    except Exception:
+                        logger.warning(
+                            "kanban reactive_tick failed on board %s", slug, exc_info=True
+                        )
                 # P2 closed learning loop: re-evaluate the board's managed
                 # bounded knob from realized outcomes and (within declared
                 # bounds) tune it autonomously. Self-throttling so it does not
@@ -5690,10 +5703,24 @@ class GatewayRunner:
                 # must never stop the dispatcher from spawning workers.
                 try:
                     _kb.optimizer_tick(conn, board=slug)
-                except Exception:
-                    logger.debug(
-                        "kanban optimizer_tick failed on board %s", slug, exc_info=True
-                    )
+                except Exception as exc:
+                    tick_ok = False
+                    try:
+                        _kb.record_tick_health_failure(
+                            conn, board=slug, kind="optimizer", error=exc, logger=logger
+                        )
+                    except Exception:
+                        logger.warning(
+                            "kanban optimizer_tick failed on board %s", slug, exc_info=True
+                        )
+                if tick_ok:
+                    try:
+                        _kb.record_tick_health_success(conn, board=slug)
+                    except Exception:
+                        logger.debug(
+                            "kanban tick-health bookkeeping failed on board %s",
+                            slug, exc_info=True,
+                        )
                 return _kb.dispatch_once(
                     conn,
                     board=slug,
