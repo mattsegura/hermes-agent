@@ -145,6 +145,23 @@ def test_specify_task_rejects_non_triage_task(kanban_home):
     assert client.chat.completions.create.call_count == 0
 
 
+def test_specify_task_respects_board_launch_gate(kanban_home):
+    kb.write_board_metadata(kb.DEFAULT_BOARD, launch_phase="contract_review")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+
+    p, client = _patch_aux_client('{"title": "unused", "body": "unused"}')
+    with p:
+        outcome = spec.specify_task(tid)
+
+    assert outcome.ok is False
+    assert "launch_blocked" in outcome.reason
+    assert "contract_review" in outcome.reason
+    assert client.chat.completions.create.call_count == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+
+
 def test_specify_task_unknown_id(kanban_home):
     p, client = _patch_aux_client("unused")
     with p:

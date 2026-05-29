@@ -29,7 +29,7 @@ import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
-from tools.registry import discover_builtin_tools, registry
+from tools.registry import discover_builtin_tools, get_tool_availability_cache_context, registry
 from toolsets import resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
@@ -249,8 +249,8 @@ _LEGACY_TOOLSET_MAP = {
 #
 # Invalidation happens transparently via the registry's _generation counter,
 # which bumps on register() / deregister() / register_toolset_alias(). The
-# inner check_fn TTL cache in registry.py handles environment drift (Docker
-# daemon start/stop, env var changes, etc.) on a 30 s horizon.
+# runtime availability fingerprint keeps profile/env/HERMES_HOME-scoped tool
+# exposure from leaking across long-lived gateway agent initializations.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 
 
@@ -292,15 +292,16 @@ def get_tool_definitions(
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
             cfg_stat = cfg_path.stat()
-            cfg_fp = (cfg_stat.st_mtime_ns, cfg_stat.st_size)
+            cfg_fp = (str(cfg_path), cfg_stat.st_mtime_ns, cfg_stat.st_size)
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
+        availability_fp = get_tool_availability_cache_context()
         cache_key = (
             frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
-            bool(os.environ.get("HERMES_KANBAN_TASK")),
+            availability_fp,
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
@@ -368,9 +369,25 @@ def _compute_tool_definitions(
     # is enabled, any tools belonging to a disabled toolset are strictly
     # stripped out. See issue #17309.
     if disabled_toolsets:
+        disabled_names = {str(name) for name in disabled_toolsets}
         for toolset_name in disabled_toolsets:
             if validate_toolset(toolset_name):
-                resolved = resolve_toolset(toolset_name)
+                resolved = set(resolve_toolset(toolset_name))
+                if toolset_name == "kanban" and os.environ.get("HERMES_KANBAN_TASK"):
+                    # Dispatcher-spawned workers must keep their lifecycle
+                    # tools even when owner chat disables the full Kanban
+                    # surface in config. The per-tool check_fns still hide
+                    # board-routing and launch-review tools from workers.
+                    resolved.clear()
+                if (
+                    toolset_name == "kanban"
+                    and "kanban_launch_intake" not in disabled_names
+                ):
+                    # ``kanban`` is commonly disabled on owner-facing
+                    # profiles to suppress execution tools. Launch intake is
+                    # a separate review-only surface and should survive unless
+                    # explicitly disabled by name.
+                    resolved.difference_update(resolve_toolset("kanban_launch_intake"))
                 tools_to_include.difference_update(resolved)
                 if not quiet_mode:
                     print(f"🚫 Disabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}")

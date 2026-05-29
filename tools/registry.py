@@ -18,6 +18,7 @@ import ast
 import importlib
 import json
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -119,15 +120,47 @@ class ToolEntry:
 # ---------------------------------------------------------------------------
 
 _CHECK_FN_TTL_SECONDS = 30.0
-_check_fn_cache: Dict[Callable, tuple[float, bool]] = {}
+_TOOL_AVAILABILITY_ENV_KEYS = (
+    "HERMES_HOME",
+    "HERMES_PROFILE",
+    "HERMES_PROFILE_NAME",
+    "HERMES_CONFIG",
+    "HERMES_ENV",
+    "HERMES_KANBAN_TASK",
+    "HOME",
+    "USERPROFILE",
+)
+_check_fn_cache: Dict[tuple[Callable, tuple], tuple[float, bool]] = {}
 _check_fn_cache_lock = threading.Lock()
 
 
-def _check_fn_cached(fn: Callable) -> bool:
+def get_tool_availability_cache_context() -> tuple:
+    """Return the runtime fingerprint that can affect tool exposure."""
+    env_fp = tuple((key, os.environ.get(key, "")) for key in _TOOL_AVAILABILITY_ENV_KEYS)
+
+    try:
+        from hermes_constants import get_config_path, get_hermes_home_override
+
+        home_override = get_hermes_home_override() or ""
+        cfg_path = get_config_path()
+        try:
+            cfg_stat = cfg_path.stat()
+            cfg_fp = (str(cfg_path), cfg_stat.st_mtime_ns, cfg_stat.st_size)
+        except (FileNotFoundError, OSError):
+            cfg_fp = (str(cfg_path), None, None)
+    except Exception:
+        home_override = ""
+        cfg_fp = ("", None, None)
+
+    return (env_fp, home_override, cfg_fp)
+
+
+def _check_fn_cached(fn: Callable, context: tuple | None = None) -> bool:
     """Return bool(fn()), TTL-cached across calls. Swallows exceptions as False."""
+    cache_key = (fn, context if context is not None else get_tool_availability_cache_context())
     now = time.monotonic()
     with _check_fn_cache_lock:
-        cached = _check_fn_cache.get(fn)
+        cached = _check_fn_cache.get(cache_key)
         if cached is not None:
             ts, value = cached
             if now - ts < _CHECK_FN_TTL_SECONDS:
@@ -137,7 +170,7 @@ def _check_fn_cached(fn: Callable) -> bool:
     except Exception:
         value = False
     with _check_fn_cache_lock:
-        _check_fn_cache[fn] = (now, value)
+        _check_fn_cache[cache_key] = (now, value)
     return value
 
 
@@ -350,6 +383,7 @@ class ToolRegistry:
         # same check_fn within one definitions pass without re-reading the
         # TTL clock.
         check_results: Dict[Callable, bool] = {}
+        availability_context = get_tool_availability_cache_context()
         entries_by_name = {entry.name: entry for entry in self._snapshot_entries()}
         for name in sorted(tool_names):
             entry = entries_by_name.get(name)
@@ -357,7 +391,10 @@ class ToolRegistry:
                 continue
             if entry.check_fn:
                 if entry.check_fn not in check_results:
-                    check_results[entry.check_fn] = _check_fn_cached(entry.check_fn)
+                    check_results[entry.check_fn] = _check_fn_cached(
+                        entry.check_fn,
+                        context=availability_context,
+                    )
                 if not check_results[entry.check_fn]:
                     if not quiet:
                         logger.debug("Tool %s unavailable (check failed)", name)

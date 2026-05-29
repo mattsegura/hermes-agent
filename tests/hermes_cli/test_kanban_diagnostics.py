@@ -625,6 +625,57 @@ def _triage_task():
     return _task(id="t_triage1", status="triage")
 
 
+def _closed_launch_gate():
+    return {
+        "ok": False,
+        "board": "seller-launch",
+        "launch_phase": "contract_review",
+        "reason": "board launch_phase is contract_review",
+        "blockers": [{"code": "board_not_active"}],
+        "readiness": {
+            "ok": False,
+            "status": "needs_clarification",
+            "missing": ["workflow.stages", "entities"],
+            "errors": [],
+            "questions": [
+                "What are the ordered stages from intake through exit?",
+                "What business entities should agents track across loops, states, and exits?",
+            ],
+        },
+    }
+
+
+def test_launch_blocked_suppresses_triage_aux_advice():
+    config = {
+        "auxiliary": {},
+        "kanban": {"auto_decompose": False},
+        "launch_gate": _closed_launch_gate(),
+    }
+
+    diags = kd.compute_task_diagnostics(_triage_task(), [], [], config=config)
+    kinds = [d.kind for d in diags]
+
+    assert "launch_blocked" in kinds
+    assert "triage_aux_unavailable" not in kinds
+    launch = next(d for d in diags if d.kind == "launch_blocked")
+    assert launch.data["missing"] == ["workflow.stages", "entities"]
+    assert launch.data["questions"]
+    assert "What are the ordered stages" in launch.detail
+
+
+def test_launch_blocked_suppresses_ready_stranded_advice():
+    now = 100_000
+    config = {"launch_gate": _closed_launch_gate()}
+    task = _task(status="ready", assignee="worker", claim_lock=None)
+    events = [_event("created", ts=now - 6 * 3600)]
+
+    diags = kd.compute_task_diagnostics(task, events, [], now=now, config=config)
+    kinds = [d.kind for d in diags]
+
+    assert "launch_blocked" in kinds
+    assert "stranded_in_ready" not in kinds
+
+
 def test_triage_aux_unavailable_silent_without_config_context():
     """Low-level callers passing no config dict should not see this rule."""
     diags = kd.compute_task_diagnostics(_triage_task(), [], [])

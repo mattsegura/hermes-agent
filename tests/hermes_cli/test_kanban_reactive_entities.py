@@ -66,6 +66,12 @@ def _contract() -> dict:
         },
         "runtime": {
             "mode": "company",
+            "dispatcher": {"profile": "mock-ceo"},
+            "profiles": {
+                "ceo": "mock-ceo",
+                "optimizer": "mock-optimizer",
+                "worker": "mock-worker",
+            },
             "require_worker_envelopes": True,
             "require_provider_policy": True,
             "provider_policy": {
@@ -83,7 +89,7 @@ def _contract() -> dict:
             "id": "reactive-contract-flow",
             "goal_id": "mock-goal",
             "require_semantics": True,
-            "workstreams": [{"key": "ops", "stages": ["execute"]}],
+            "workstreams": [{"key": "ops", "stages": ["execute", "closed"]}],
             "stages": [
                 {
                     "key": "execute",
@@ -96,14 +102,71 @@ def _contract() -> dict:
                             "side_effect_class": "none",
                         }
                     ],
+                    "exit_criteria": [
+                        {"transition": "closed", "evidence_required": ["mock_report"]}
+                    ],
+                },
+                {
+                    "key": "closed",
+                    "actions": [{"key": "archive"}],
+                    "terminal": True,
+                    "exit_criteria": [],
                 }
             ],
+        },
+        "entities": [
+            {
+                "key": "conversation_thread",
+                "type": "conversation",
+                "states": ["open", "watching", "closed", "dropped"],
+                "terminal_states": ["closed", "dropped"],
+            }
+        ],
+        "event_loops": [
+            {
+                "type": "conversation_reply",
+                "entity": "conversation_thread",
+                "triggers": ["reply", "deadline"],
+                "terminal_states": ["closed", "dropped"],
+            }
+        ],
+        "approval_gates": [
+            {"key": "owner_external_action_approval", "required_before": ["external_action"]}
+        ],
+        "proof_requirements": ["mock_report"],
+        "side_effect_policy": {
+            "allowed": ["none", "read_only"],
+            "forbidden": ["unapproved_external_write"],
+        },
+        "escalation_paths": [
+            {"condition": "conversation commitment is unclear", "to": "owner"}
+        ],
+        "owner_summary": {
+            "summary": "The board tracks mock conversations through closed outcomes with proof."
         },
     }
 
 
 def _create_serious_root() -> str:
-    kb.create_board("serious", runtime="company", contract=_contract())
+    contract = _contract()
+    kb.review_business_launch_contract(
+        "serious",
+        contract=contract,
+        create_if_missing=True,
+    )
+    token = kb.issue_board_launch_approval_token(
+        "serious",
+        contract=contract,
+        approved_by="owner",
+        approval_evidence={"source": "reactive-entity-test"},
+        owner_authority_confirmed=True,
+    )["token"]
+    kb.review_business_launch_contract(
+        "serious",
+        contract=contract,
+        approve=True,
+        approval_token=token,
+    )
     with kb.connect(board="serious") as conn:
         task_id = kb.create_task(
             conn,

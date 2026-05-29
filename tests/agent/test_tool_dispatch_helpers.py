@@ -8,10 +8,13 @@ NOT a regex scan — it's an unconditional architectural mark on every result
 from a known-untrusted source.
 """
 
+import json
+
 import pytest
 
 from agent.tool_dispatch_helpers import (
     _is_untrusted_tool,
+    _maybe_append_assistant_next_action,
     _maybe_wrap_untrusted,
     make_tool_result_message,
 )
@@ -155,6 +158,43 @@ class TestMakeToolResultMessage:
         msg = make_tool_result_message("browser_snapshot", content_list, "call_3")
         # List content stays a list — provider adapters need that shape.
         assert msg["content"] is content_list
+
+    def test_assistant_next_action_is_appended_to_model_context(self):
+        payload = {
+            "ok": False,
+            "assistant_next_action": {
+                "required": True,
+                "instruction": "Ask the owner tailored clarification questions now.",
+                "response_style": "Keep it concise.",
+            },
+        }
+
+        msg = make_tool_result_message(
+            "kanban_business_launch_review",
+            json.dumps(payload),
+            "call_kanban",
+        )
+
+        assert "<assistant_next_action>" in msg["content"]
+        assert "Ask the owner tailored clarification questions now." in msg["content"]
+        assert "Keep it concise." in msg["content"]
+
+    def test_assistant_next_action_is_ignored_for_non_launch_tools(self):
+        payload = {
+            "ok": False,
+            "assistant_next_action": {
+                "required": True,
+                "instruction": "Do not append this.",
+            },
+        }
+
+        msg = make_tool_result_message("terminal", json.dumps(payload), "call_terminal")
+
+        assert "<assistant_next_action>" not in msg["content"]
+
+    def test_assistant_next_action_helper_ignores_plain_json(self):
+        content = json.dumps({"ok": True})
+        assert _maybe_append_assistant_next_action(content) == content
 
     def test_brainworm_payload_in_web_extract_gets_data_framing(self):
         """The whole point: even if a webpage embeds the Brainworm payload,

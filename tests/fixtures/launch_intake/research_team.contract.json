@@ -1,0 +1,215 @@
+{
+  "objective": {
+    "statement": "Run a continuous research-desk pipeline (intake -> source-gathering -> evidence-extraction -> synthesis -> peer-review -> published-brief) that turns owner research questions into cited, fact-checked briefs without fabricated citations or unreviewed publication.",
+    "success": [
+      "Every research question moves from intake through gathering, extraction, synthesis, peer-review, and a published brief with auditable evidence at each stage.",
+      "Each published brief cites at least 6 distinct primary sources with working URLs, retrieval dates, and verbatim supporting quotes.",
+      "A second reviewer agent fact-checks every claim against its cited source before a brief is marked published.",
+      "Conflicting or low-confidence findings are flagged with an explicit confidence label rather than presented as settled fact.",
+      "No brief is published until the owner approves the synthesis and the reviewer sign-off is recorded."
+    ],
+    "failure": [
+      "A brief cites a source that does not exist, was hallucinated, or does not support the claim attached to it.",
+      "A claim reaches a published brief without reviewer fact-check sign-off.",
+      "The pipeline paraphrases a paywalled or copyrighted source beyond fair-use snippet length.",
+      "Low-confidence speculation is published as a confident finding without a confidence label.",
+      "A brief is published before the owner approves the synthesis."
+    ],
+    "constraints": [
+      "Only owner-authorized sources may be used: arXiv, PubMed, Semantic Scholar, government statistics portals, and public company filings.",
+      "Outbound publication, emailing a brief, or posting externally is owner-approval-gated and never automatic.",
+      "Reviewer fact-check sign-off is required before any brief leaves draft status.",
+      "Personal scraping of paywalled databases or credential reuse is forbidden."
+    ]
+  },
+  "runtime": {
+    "mode": "company",
+    "dispatcher": {"profile": "research-desk"},
+    "profiles": {
+      "ceo": "research-desk",
+      "optimizer": "research-desk",
+      "worker": "research-desk-worker"
+    },
+    "require_provider_policy": true,
+    "require_worker_envelopes": true,
+    "provider_policy": {
+      "context_sources": {
+        "allowed": ["arxiv", "pubmed", "semantic_scholar", "government_statistics", "public_filings"],
+        "requires_owner_approval_for_new_sources": true
+      },
+      "external_side_effects": {
+        "allowed_after": "explicit owner approval",
+        "forbidden_without_approval": ["publish_brief", "email_brief", "external_post", "paywall_scrape"]
+      }
+    },
+    "source_policy": {
+      "citation_minimum": 6,
+      "require_working_urls": true,
+      "require_retrieval_date": true,
+      "require_supporting_quote": true,
+      "paywall_snippet_max_words": 90,
+      "forbidden_actions": ["fabricate_citation", "credential_reuse", "paywall_bypass"]
+    },
+    "tool_policy": {
+      "source_search": {"allowed": true, "side_effect_class": "read_only"},
+      "source_fetch": {"allowed": true, "side_effect_class": "read_only"},
+      "publish_brief": {"allowed": false, "requires_owner_approval": true},
+      "email_brief": {"allowed": false, "requires_owner_approval": true},
+      "external_post": {"allowed": false, "requires_owner_approval": true}
+    },
+    "worker_envelopes": {
+      "research-ceo": {
+        "capabilities": ["prioritize", "assign", "owner_review"],
+        "toolsets": ["kanban"],
+        "allowed_side_effects": ["read_only", "draft_only"],
+        "required_proof": ["assignment_decision_record"]
+      },
+      "research-gatherer-1": {
+        "capabilities": ["source_search", "source_fetch", "deduplicate", "rank_relevance"],
+        "toolsets": ["kanban", "web"],
+        "allowed_side_effects": ["read_only"],
+        "required_proof": ["source_bundle_with_urls"]
+      },
+      "research-synthesizer-1": {
+        "capabilities": ["extract_evidence", "synthesize", "label_confidence"],
+        "toolsets": ["kanban"],
+        "allowed_side_effects": ["draft_only"],
+        "required_proof": ["evidence_table"]
+      },
+      "research-reviewer-1": {
+        "capabilities": ["fact_check", "verify_citation", "approve_or_reject"],
+        "toolsets": ["kanban"],
+        "allowed_side_effects": ["draft_only"],
+        "required_proof": ["review_signoff_record"]
+      }
+    }
+  },
+  "workflow": {
+    "id": "research-desk-workflow",
+    "goal_id": "research-desk",
+    "require_semantics": true,
+    "workstreams": [
+      {"key": "discovery", "stages": ["intake", "gather"]},
+      {"key": "analysis", "stages": ["extract", "synthesize"]},
+      {"key": "assurance", "stages": ["peer_review", "publish"]}
+    ],
+    "stages": [
+      {
+        "key": "intake",
+        "allowed_lifecycle_states": ["todo", "ready"],
+        "actions": [
+          {"key": "clarify_question", "side_effect_class": "none"},
+          {"key": "define_scope", "side_effect_class": "none"},
+          {"key": "set_confidence_bar", "side_effect_class": "none"}
+        ],
+        "exit_criteria": [{"transition": "gather", "evidence_required": ["scoped_question_record"]}]
+      },
+      {
+        "key": "gather",
+        "allowed_lifecycle_states": ["ready", "running"],
+        "actions": [
+          {"key": "source_search", "side_effect_class": "none"},
+          {"key": "source_fetch", "side_effect_class": "none"},
+          {"key": "deduplicate_sources", "side_effect_class": "none"},
+          {"key": "rank_relevance", "side_effect_class": "none"}
+        ],
+        "exit_criteria": [{"transition": "extract", "evidence_required": ["source_bundle_with_urls", "retrieval_dates"]}]
+      },
+      {
+        "key": "extract",
+        "allowed_lifecycle_states": ["running"],
+        "actions": [
+          {"key": "extract_supporting_quotes", "side_effect_class": "none"},
+          {"key": "map_claims_to_sources", "side_effect_class": "none"},
+          {"key": "flag_conflicts", "side_effect_class": "none"}
+        ],
+        "exit_criteria": [{"transition": "synthesize", "evidence_required": ["evidence_table", "claim_source_map"]}]
+      },
+      {
+        "key": "synthesize",
+        "allowed_lifecycle_states": ["running", "review"],
+        "actions": [
+          {"key": "draft_brief", "side_effect_class": "internal"},
+          {"key": "label_confidence", "side_effect_class": "internal"},
+          {"key": "assemble_citations", "side_effect_class": "internal"}
+        ],
+        "exit_criteria": [{"transition": "peer_review", "evidence_required": ["draft_brief", "confidence_labels"]}]
+      },
+      {
+        "key": "peer_review",
+        "allowed_lifecycle_states": ["review"],
+        "actions": [
+          {"key": "fact_check_claims", "side_effect_class": "none"},
+          {"key": "verify_citation_urls", "side_effect_class": "none"},
+          {"key": "approve_or_reject", "side_effect_class": "internal"}
+        ],
+        "exit_criteria": [{"transition": "publish", "evidence_required": ["review_signoff_record", "owner_approval"]}]
+      },
+      {
+        "key": "publish",
+        "allowed_lifecycle_states": ["review", "done"],
+        "actions": [
+          {"key": "render_published_brief", "side_effect_class": "external_reversible"},
+          {"key": "archive_evidence", "side_effect_class": "none"}
+        ],
+        "terminal": true,
+        "exit_criteria": []
+      }
+    ]
+  },
+  "entities": [
+    {
+      "key": "research_question",
+      "type": "research_item",
+      "states": ["new", "scoped", "gathering", "extracting", "synthesizing", "under_review", "published", "shelved"],
+      "terminal_states": ["published", "shelved"]
+    }
+  ],
+  "event_loops": [
+    {
+      "type": "research_brief_loop",
+      "entity": "research_question",
+      "triggers": ["owner_question", "source_update", "reviewer_rejection", "deadline"],
+      "terminal_states": ["published", "shelved"],
+      "stop_conditions": [
+        "reviewer rejects the brief twice",
+        "no credible sources found after exhaustive search",
+        "owner shelves the question",
+        "a citation cannot be verified"
+      ]
+    }
+  ],
+  "approval_gates": [
+    {"key": "owner_synthesis_approval", "required_before": ["render_published_brief"]},
+    {"key": "reviewer_signoff_gate", "required_before": ["render_published_brief"]}
+  ],
+  "proof_requirements": [
+    "scoped_question_record",
+    "source_bundle_with_urls",
+    "retrieval_dates",
+    "evidence_table",
+    "claim_source_map",
+    "confidence_labels",
+    "review_signoff_record",
+    "owner_approval"
+  ],
+  "side_effect_policy": {
+    "allowed": ["none", "internal", "read_only", "draft_only"],
+    "forbidden": ["external_irreversible", "financial", "fabricate_citation", "paywall_bypass", "credential_reuse", "unreviewed_publication"],
+    "approval_required": ["external_reversible", "owner_approved_external_write", "publish_brief", "email_brief", "external_post"],
+    "owner_boundaries": [
+      "publication requires owner synthesis approval",
+      "reviewer fact-check sign-off required before publish"
+    ]
+  },
+  "escalation_paths": [
+    {"condition": "citation cannot be verified against its source", "to": "owner"},
+    {"condition": "reviewer and synthesizer disagree on a claim", "to": "owner"},
+    {"condition": "only paywalled sources are available", "to": "owner"},
+    {"condition": "owner approval needed before publication", "to": "owner"}
+  ],
+  "owner_summary": {
+    "summary": "A research desk that gathers cited sources, extracts supporting evidence, synthesizes a confidence-labeled brief, and requires reviewer fact-check plus owner approval before publishing.",
+    "pending_confirmation": true
+  }
+}

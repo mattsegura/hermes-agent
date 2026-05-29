@@ -1069,6 +1069,20 @@ DEFAULT_CONFIG = {
             "timeout": 180,
             "extra_body": {},
         },
+        # Kanban launch intake — server-side launch-intake orchestration
+        # (question generation, answer assessment, contract synthesis) for
+        # ``hermes kanban contract review`` / ``kanban_business_launch_review``.
+        # Left as "auto"/empty by default: while unconfigured, launch intake
+        # degrades to the deterministic universal drafter (no auxiliary call).
+        # Point this at a capable model to enable server-side synthesis.
+        "kanban_launch_intake": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 180,
+            "extra_body": {},
+        },
         # Profile describer — auto-generates a 1-2 sentence description
         # of what a profile is good at. Invoked by
         # ``hermes profile describe <name> --auto`` and the dashboard's

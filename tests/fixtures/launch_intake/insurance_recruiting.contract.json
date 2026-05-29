@@ -1,0 +1,211 @@
+{
+  "objective": {
+    "statement": "Run a licensed-agent recruiting pipeline for my life-insurance agency (source -> screen -> license-verify -> interview-schedule -> onboarding-handoff) with compliance-gated outreach and no unlicensed or misrepresented recruiting.",
+    "success": [
+      "Candidates move from sourcing through screening, license verification, interview scheduling, and onboarding handoff with auditable proof at each stage.",
+      "Every advancing candidate has a verified active state insurance license confirmed against the NIPR or state DOI registry.",
+      "At least 15 qualified licensed candidates and 4 owner-approved interview bookings are produced per month.",
+      "All outbound recruiting messages stay compliance-reviewed and owner-approval-gated before any candidate is contacted.",
+      "No candidate is told about compensation, contracts, or guarantees without owner-approved compliant language."
+    ],
+    "failure": [
+      "A candidate is advanced or onboarded without a verified active insurance license.",
+      "An outbound recruiting message is sent without compliance review and owner approval.",
+      "A worker promises income, leads, or contract terms that were not owner-approved.",
+      "A candidate is contacted through a personal channel instead of the approved business number.",
+      "Protected applicant data is stored or shared outside the approved CRM."
+    ],
+    "constraints": [
+      "Outbound SMS, email, and calls go only through the approved Twilio business line and are owner-approval-gated.",
+      "License verification against NIPR or the state DOI is mandatory before any interview is scheduled.",
+      "Income, lead-flow, and contract claims require owner-approved compliant scripting.",
+      "Personal channels and personal phone numbers are forbidden for candidate outreach."
+    ]
+  },
+  "runtime": {
+    "mode": "company",
+    "dispatcher": {"profile": "agency-recruiting"},
+    "profiles": {
+      "ceo": "agency-recruiting",
+      "optimizer": "agency-recruiting",
+      "worker": "agency-recruiting-worker"
+    },
+    "require_provider_policy": true,
+    "require_worker_envelopes": true,
+    "provider_policy": {
+      "context_sources": {
+        "allowed": ["linkedin_recruiter", "indeed", "agency_crm", "nipr_registry", "state_doi_lookup"],
+        "requires_owner_approval_for_new_sources": true
+      },
+      "external_side_effects": {
+        "allowed_after": "explicit owner approval and compliance review",
+        "forbidden_without_approval": ["outbound_sms", "outbound_email", "phone_call", "income_claim", "contract_offer"]
+      }
+    },
+    "channel_policy": {
+      "sms": {
+        "provider": "twilio",
+        "business_channel_required": true,
+        "outbound_enabled": false,
+        "outbound_requires_owner_approval": true,
+        "personal_channels_forbidden": ["personal_sms", "imessage", "whatsapp_personal"]
+      }
+    },
+    "tool_policy": {
+      "candidate_search": {"allowed": true, "side_effect_class": "read_only"},
+      "license_verify": {"allowed": true, "side_effect_class": "read_only"},
+      "outbound_sms": {"allowed": false, "requires_owner_approval": true},
+      "outbound_email": {"allowed": false, "requires_owner_approval": true},
+      "phone_call": {"allowed": false, "requires_owner_approval": true},
+      "income_or_contract_claim": {"allowed": false, "requires_owner_approval": true}
+    },
+    "worker_envelopes": {
+      "recruiting-ceo": {
+        "capabilities": ["prioritize", "assign", "owner_review"],
+        "toolsets": ["kanban"],
+        "allowed_side_effects": ["read_only", "draft_only"],
+        "required_proof": ["assignment_decision_record"]
+      },
+      "recruiting-sourcer-1": {
+        "capabilities": ["candidate_search", "profile_enrich", "rank_fit"],
+        "toolsets": ["kanban", "web"],
+        "allowed_side_effects": ["read_only"],
+        "required_proof": ["sourced_candidate_list"]
+      },
+      "recruiting-verifier-1": {
+        "capabilities": ["license_verify", "screen_candidate", "flag_ineligible"],
+        "toolsets": ["kanban"],
+        "allowed_side_effects": ["read_only"],
+        "required_proof": ["license_verification_record"]
+      },
+      "recruiting-coordinator-1": {
+        "capabilities": ["draft_outreach", "schedule_interview", "onboarding_handoff"],
+        "toolsets": ["kanban"],
+        "allowed_side_effects": ["draft_only", "owner_approved_external_write"],
+        "required_proof": ["interview_booking_record"]
+      }
+    }
+  },
+  "workflow": {
+    "id": "agency-recruiting-workflow",
+    "goal_id": "agency-recruiting",
+    "require_semantics": true,
+    "workstreams": [
+      {"key": "pipeline", "stages": ["source", "screen", "verify_license"]},
+      {"key": "conversion", "stages": ["schedule_interview", "onboard"]}
+    ],
+    "stages": [
+      {
+        "key": "source",
+        "allowed_lifecycle_states": ["todo", "ready"],
+        "actions": [
+          {"key": "candidate_search", "side_effect_class": "none"},
+          {"key": "profile_enrich", "side_effect_class": "none"},
+          {"key": "rank_fit", "side_effect_class": "none"}
+        ],
+        "exit_criteria": [{"transition": "screen", "evidence_required": ["sourced_candidate_list"]}]
+      },
+      {
+        "key": "screen",
+        "allowed_lifecycle_states": ["ready", "running"],
+        "actions": [
+          {"key": "screen_candidate", "side_effect_class": "none"},
+          {"key": "check_experience", "side_effect_class": "none"},
+          {"key": "flag_ineligible", "side_effect_class": "none"}
+        ],
+        "exit_criteria": [{"transition": "verify_license", "evidence_required": ["screening_record"]}]
+      },
+      {
+        "key": "verify_license",
+        "allowed_lifecycle_states": ["running"],
+        "actions": [
+          {"key": "nipr_lookup", "side_effect_class": "none"},
+          {"key": "state_doi_lookup", "side_effect_class": "none"},
+          {"key": "confirm_active_license", "side_effect_class": "none"}
+        ],
+        "exit_criteria": [{"transition": "schedule_interview", "evidence_required": ["license_verification_record"]}]
+      },
+      {
+        "key": "schedule_interview",
+        "allowed_lifecycle_states": ["running", "review"],
+        "actions": [
+          {"key": "draft_compliant_outreach", "side_effect_class": "internal"},
+          {"key": "send_after_approval", "side_effect_class": "external_reversible"},
+          {"key": "book_interview", "side_effect_class": "external_reversible"}
+        ],
+        "exit_criteria": [{"transition": "onboard", "evidence_required": ["interview_booking_record", "owner_approval"]}]
+      },
+      {
+        "key": "onboard",
+        "allowed_lifecycle_states": ["review", "done", "archived"],
+        "actions": [
+          {"key": "onboarding_handoff", "side_effect_class": "external_reversible"},
+          {"key": "archive_candidate", "side_effect_class": "none"}
+        ],
+        "terminal": true,
+        "exit_criteria": []
+      }
+    ]
+  },
+  "entities": [
+    {
+      "key": "candidate",
+      "type": "recruiting_candidate",
+      "states": ["new", "sourced", "screening", "license_check", "scheduling", "onboarded", "rejected", "ineligible"],
+      "terminal_states": ["onboarded", "rejected", "ineligible"]
+    }
+  ],
+  "event_loops": [
+    {
+      "type": "candidate_pipeline_loop",
+      "entity": "candidate",
+      "triggers": ["new_applicant", "candidate_reply", "follow_up_timer", "license_expiry", "owner_check_in"],
+      "terminal_states": ["onboarded", "rejected", "ineligible"],
+      "stop_conditions": [
+        "candidate has no active insurance license",
+        "candidate declines or stops responding after max follow-ups",
+        "owner rejects the candidate",
+        "compliance flag raised on outreach language"
+      ]
+    }
+  ],
+  "tunables": {
+    "follow_up_interval_hours": {"default": 72, "range": [24, 240]},
+    "max_nudges": {"default": 3, "range": [0, 8]},
+    "ghost_timeout_days": {"default": 21, "range": [7, 60]},
+    "fit_threshold": {"default": 70, "range": [0, 100]},
+    "monthly_qualified_target": {"default": 15, "min": 1, "max": 200}
+  },
+  "approval_gates": [
+    {"key": "owner_outreach_approval", "required_before": ["send_after_approval", "book_interview"]},
+    {"key": "license_verification_gate", "required_before": ["schedule_interview"]}
+  ],
+  "proof_requirements": [
+    "sourced_candidate_list",
+    "screening_record",
+    "license_verification_record",
+    "compliant_outreach_draft",
+    "owner_approval",
+    "interview_booking_record",
+    "onboarding_handoff_record"
+  ],
+  "side_effect_policy": {
+    "allowed": ["none", "internal", "read_only", "draft_only"],
+    "forbidden": ["external_irreversible", "financial", "unlicensed_advancement", "personal_channel_outreach", "unapproved_income_claim", "unapproved_contract_offer"],
+    "approval_required": ["external_reversible", "owner_approved_external_write", "outbound_sms", "outbound_email", "phone_call", "income_or_contract_claim"],
+    "owner_boundaries": [
+      "license verification required before interview scheduling",
+      "all outbound recruiting is owner-approval-gated and compliance-reviewed"
+    ]
+  },
+  "escalation_paths": [
+    {"condition": "candidate license cannot be verified", "to": "owner"},
+    {"condition": "candidate asks about income, leads, or contract terms", "to": "owner"},
+    {"condition": "compliance flag raised on outreach language", "to": "owner"},
+    {"condition": "owner approval needed before outbound", "to": "owner"}
+  ],
+  "owner_summary": {
+    "summary": "A licensed-agent recruiting pipeline that sources candidates, screens them, verifies active insurance licenses against NIPR or state DOI, drafts compliant outreach, and books interviews only after owner approval.",
+    "pending_confirmation": true
+  }
+}

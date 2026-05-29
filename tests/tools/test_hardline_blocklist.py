@@ -87,6 +87,9 @@ _HARDLINE_BLOCK = [
     "exec shutdown",
     "nohup reboot",
     "setsid poweroff",
+    # Owner approval token minting must not run through a model terminal.
+    "hermes kanban boards contract approval-token launch-board",
+    "python -m hermes_cli.main kanban boards contract approval-token launch-board",
 ]
 
 
@@ -191,7 +194,13 @@ def test_yolo_env_var_cannot_bypass_hardline(clean_session, monkeypatch):
     """HERMES_YOLO_MODE=1 must not bypass the hardline floor."""
     monkeypatch.setenv("HERMES_YOLO_MODE", "1")
 
-    for cmd in ["rm -rf /", "shutdown -h now", "mkfs.ext4 /dev/sda", "reboot"]:
+    for cmd in [
+        "rm -rf /",
+        "shutdown -h now",
+        "mkfs.ext4 /dev/sda",
+        "reboot",
+        "hermes kanban boards contract approval-token launch-board",
+    ]:
         r1 = check_dangerous_command(cmd, "local")
         assert r1["approved"] is False, f"yolo leaked hardline on {cmd!r} (check_dangerous_command)"
         assert r1.get("hardline") is True

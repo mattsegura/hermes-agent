@@ -59,6 +59,91 @@ def client(kanban_home):
     return TestClient(app)
 
 
+def _dashboard_launch_ready_contract():
+    return {
+        "objective": {
+            "statement": "Launch dashboard-managed seller ops",
+            "success": ["qualified seller leads reach signed agreements"],
+            "failure": ["seller conversations run without approval boundaries"],
+            "constraints": ["seller outreach requires owner-approved channels"],
+        },
+        "runtime": {
+            "mode": "company",
+            "dispatcher": {"profile": "land-ceo"},
+            "profiles": {"ceo": "land-ceo", "optimizer": "land-opt", "worker": "land-operator"},
+            "require_worker_envelopes": True,
+            "require_provider_policy": True,
+            "provider_policy": {"seller_outreach": {"provider": "approved_sms_gateway"}},
+            "worker_envelopes": {
+                "land-operator": {
+                    "capabilities": ["seller_outreach"],
+                    "toolsets": ["kanban"],
+                    "allowed_side_effects": ["owner_approved_external_write"],
+                }
+            },
+        },
+        "workflow": {
+            "id": "dashboard-flow",
+            "goal_id": "close-land-deals",
+            "require_semantics": True,
+            "workstreams": [{"key": "seller-conversion", "stages": ["source", "close"]}],
+            "stages": [
+                {
+                    "key": "source",
+                    "actions": [{"key": "capture_lead"}],
+                    "triggers": [{"type": "timer", "key": "daily_source"}],
+                    "exit_criteria": [{"transition": "close", "evidence_required": ["qualified_lead"]}],
+                },
+                {"key": "close", "actions": [{"key": "archive"}], "exit_criteria": []},
+            ],
+        },
+        "entities": [
+            {
+                "key": "seller_lead",
+                "type": "lead",
+                "states": ["new", "qualified", "closed"],
+                "terminal_states": ["closed"],
+            }
+        ],
+        "event_loops": [
+            {"type": "inbound_sms", "entity": "seller_lead", "terminal_states": ["closed"]}
+        ],
+        "approval_gates": [
+            {"key": "owner_outreach_approval", "required_before": ["capture_lead"]}
+        ],
+        "proof_requirements": ["qualified_lead"],
+        "side_effect_policy": {
+            "allowed": ["owner_approved_external_write"],
+            "forbidden": ["unapproved_external_write"],
+        },
+        "escalation_paths": [{"condition": "approval boundary is unclear", "to": "owner"}],
+        "owner_summary": {
+            "summary": "Dashboard-managed seller ops source leads and archive outcomes with proof."
+        },
+    }
+
+
+def _approve_dashboard_launch_contract(slug, contract, *, evidence_source="dashboard-test"):
+    kb.review_business_launch_contract(
+        slug,
+        contract=contract,
+        create_if_missing=not kb.board_exists(slug),
+    )
+    token = kb.issue_board_launch_approval_token(
+        slug,
+        contract=contract,
+        approved_by="owner",
+        approval_evidence={"source": evidence_source},
+        owner_authority_confirmed=True,
+    )["token"]
+    return kb.review_business_launch_contract(
+        slug,
+        contract=contract,
+        approve=True,
+        approval_token=token,
+    )
+
+
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
 # ---------------------------------------------------------------------------
@@ -385,6 +470,61 @@ def test_patch_drag_drop_move_todo_to_ready(client):
     # Now child auto-promoted by recompute_ready — already ready.
     child_after = client.get(f"/api/plugins/kanban/tasks/{child['id']}").json()["task"]
     assert child_after["status"] == "ready"
+
+
+def test_patch_ready_respects_closed_launch_gate(client):
+    kb.review_business_launch_contract(
+        kb.DEFAULT_BOARD,
+        rough_goal="Launch seller lead conversion",
+        create_if_missing=True,
+    )
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "launch backlog", "triage": True},
+    ).json()["task"]
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"status": "ready"},
+    )
+
+    assert r.status_code == 409
+    assert "status transition to 'ready'" in r.json()["detail"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, t["id"]).status == "triage"
+    finally:
+        conn.close()
+
+
+def test_patch_ready_allowed_after_launch_approval(client):
+    _approve_dashboard_launch_contract(
+        kb.DEFAULT_BOARD,
+        _dashboard_launch_ready_contract(),
+        evidence_source="dashboard-test",
+    )
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="approved launch backlog",
+            assignee="land-operator",
+            triage=True,
+            goal_id="close-land-deals",
+            workstream_id="seller-conversion",
+            stage_key="source",
+            action_key="capture_lead",
+        )
+    finally:
+        conn.close()
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={"status": "ready"},
+    )
+
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "ready"
 
 
 def test_reopening_parent_demotes_ready_child(client):
@@ -909,6 +1049,36 @@ def test_bulk_status_ready(client):
     ready = next(col for col in board["columns"] if col["name"] == "ready")
     ids = {t["id"] for t in ready["tasks"]}
     assert {a["id"], b["id"], c2["id"]}.issubset(ids)
+
+
+def test_bulk_ready_respects_closed_launch_gate(client):
+    kb.review_business_launch_contract(
+        kb.DEFAULT_BOARD,
+        rough_goal="Launch seller lead conversion",
+        create_if_missing=True,
+    )
+    a = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "a", "triage": True},
+    ).json()["task"]
+    b = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "b", "triage": True},
+    ).json()["task"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [a["id"], b["id"]], "status": "ready"},
+    )
+
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert all(not row["ok"] for row in results)
+    conn = kb.connect()
+    try:
+        assert {kb.get_task(conn, a["id"]).status, kb.get_task(conn, b["id"]).status} == {"triage"}
+    finally:
+        conn.close()
 
 
 def test_bulk_status_done_forwards_completion_summary(client):
@@ -1911,6 +2081,53 @@ def test_diagnostics_endpoint_empty_for_clean_board(client):
     data = r.json()
     assert data["count"] == 0
     assert data["diagnostics"] == []
+
+
+def test_dashboard_surfaces_launch_blocked_instead_of_ready_stranded(client):
+    board = "seller-launch"
+    kb.review_business_launch_contract(
+        board,
+        rough_goal="Launch seller lead conversion",
+        create_if_missing=True,
+    )
+    old_ts = int(time.time()) - 6 * 3600
+    conn = kb.connect(board=board)
+    try:
+        tid = kb.create_task(conn, title="launch work", assignee="worker", triage=True)
+        conn.execute(
+            "UPDATE tasks SET status='ready', created_at=? WHERE id=?",
+            (old_ts, tid),
+        )
+        conn.execute(
+            "UPDATE task_events SET created_at=? WHERE task_id=?",
+            (old_ts, tid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    board_response = client.get(f"/api/plugins/kanban/board?board={board}")
+    assert board_response.status_code == 200
+    board_payload = board_response.json()
+    assert board_payload["launch_gate"]["launch_phase"] == "contract_review"
+    assert board_payload["launch_gate"]["readiness"]["questions"] == []
+    assert board_payload["launch_gate"]["readiness"]["question_generation"]["mode"] == "model_generated"
+    tasks = [task for col in board_payload["columns"] for task in col["tasks"]]
+    task_payload = next(task for task in tasks if task["id"] == tid)
+    kinds = {diag["kind"] for diag in task_payload["diagnostics"]}
+    assert "launch_blocked" in kinds
+    assert "stranded_in_ready" not in kinds
+    assert task_payload["diagnostics"][0]["data"]["questions"] == []
+    assert task_payload["diagnostics"][0]["data"]["question_generation"]["mode"] == "model_generated"
+
+    diagnostics_response = client.get(f"/api/plugins/kanban/diagnostics?board={board}")
+    assert diagnostics_response.status_code == 200
+    diagnostics_payload = diagnostics_response.json()
+    assert diagnostics_payload["launch_gate"]["launch_phase"] == "contract_review"
+    row = next(row for row in diagnostics_payload["diagnostics"] if row["task_id"] == tid)
+    row_kinds = {diag["kind"] for diag in row["diagnostics"]}
+    assert "launch_blocked" in row_kinds
+    assert "stranded_in_ready" not in row_kinds
 
 
 def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):

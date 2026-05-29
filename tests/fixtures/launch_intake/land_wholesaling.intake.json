@@ -1,0 +1,14 @@
+{
+  "domain": "land_wholesaling",
+  "rough_goal": "Run my Florida vacant-land wholesaling pipeline end to end",
+  "golden_contract_file": "land_wholesaling.contract.json",
+  "answers": {
+    "success_criteria": "Success is a working pipeline that sources Florida vacant parcels, qualifies them with skip-trace and comp analysis, contacts sellers, negotiates, and reaches a signed assignment contract and close. I want at least 30 qualified parcels and 5 owner-approved seller conversations per week, and every closed deal must carry an Infobip delivery receipt and a signed contract artifact.",
+    "subject_scope": "The work is about Florida vacant land parcels, the property owners (sellers), cash buyers for assignment, and title companies that handle closing. Each parcel is scored on acreage, county, comps, and access.",
+    "allowed_context": "Hermes may use the Infobip business SMS number for outbound, the skip-trace data provider, county parcel records, and the comps database. Personal channels like iMessage, Apple Messages, BlueBubbles, and my personal SMS are forbidden for any outbound.",
+    "approval_boundaries": "Outbound SMS, email, phone calls, offers, contracts, and any payment or spend are owner-approval-gated and must wait for my explicit approval. Hermes may research, skip-trace, score, and draft outreach autonomously, but must never send to a seller or commit an offer without my approval.",
+    "workflow_path": "Source leads, then qualify with skip-trace and parcel verification, then prepare outreach, contact the seller after approval, negotiate replies, draft the assignment contract, get the seller signature, run title due diligence, assign to a cash buyer, and close with payout. Stop when a lead is dead, recycled, or disqualified.",
+    "proof_requirements": "Every card needs structured proof: a lead batch artifact, qualified-lead scores, contact paths, an outreach-sent receipt, the accepted offer, the signed contract, the closing path, and a weekly metrics refresh. No card is done from prose or stale metadata.",
+    "stop_and_escalation_rules": "Stop and escalate to me for any outbound before approval, any personal-channel use, any spend, any legal or title problem, any seller complaint, or any parcel that looks like a fraud or compliance risk."
+  }
+}

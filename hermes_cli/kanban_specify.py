@@ -137,6 +137,16 @@ def _profile_author() -> str:
     )
 
 
+def _launch_blocked_reason() -> Optional[str]:
+    gate = kb.board_dispatch_gate()
+    if gate.get("ok"):
+        return None
+    board = gate.get("board") or kb.DEFAULT_BOARD
+    phase = gate.get("launch_phase") or "unknown"
+    reason = gate.get("reason") or "board launch gate is closed"
+    return f"launch_blocked: {reason} (board={board}, launch_phase={phase})"
+
+
 def specify_task(
     task_id: str,
     *,
@@ -158,6 +168,10 @@ def specify_task(
         return SpecifyOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+
+    blocked = _launch_blocked_reason()
+    if blocked:
+        return SpecifyOutcome(task_id, False, blocked)
 
     try:
         from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client

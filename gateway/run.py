@@ -5568,6 +5568,28 @@ class GatewayRunner:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                #
+                # P1 reactive runtime: drive the declared timer follow-up
+                # loops one cadence step on the same tick that dispatches
+                # ready work. Best-effort — a reactive hiccup must never
+                # stop the dispatcher from spawning workers.
+                try:
+                    _kb.reactive_tick(conn, board=slug)
+                except Exception:
+                    logger.debug(
+                        "kanban reactive_tick failed on board %s", slug, exc_info=True
+                    )
+                # P2 closed learning loop: re-evaluate the board's managed
+                # bounded knob from realized outcomes and (within declared
+                # bounds) tune it autonomously. Self-throttling so it does not
+                # thrash the knob every tick. Best-effort — an optimizer hiccup
+                # must never stop the dispatcher from spawning workers.
+                try:
+                    _kb.optimizer_tick(conn, board=slug)
+                except Exception:
+                    logger.debug(
+                        "kanban optimizer_tick failed on board %s", slug, exc_info=True
+                    )
                 return _kb.dispatch_once(
                     conn,
                     board=slug,
@@ -5644,6 +5666,14 @@ class GatewayRunner:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 conn = None
                 try:
+                    launch_gate = _kb.board_dispatch_gate(slug)
+                    if not launch_gate.get("ok"):
+                        logger.debug(
+                            "kanban dispatcher: board %s launch_blocked for ready probe: %s",
+                            slug,
+                            launch_gate.get("reason"),
+                        )
+                        continue
                     conn = _kb.connect(board=slug)
                     if _kb.has_spawnable_ready(conn):
                         return True
@@ -5694,6 +5724,22 @@ class GatewayRunner:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
                     break
+                try:
+                    launch_gate = _kb.board_dispatch_gate(slug)
+                except Exception as exc:
+                    logger.warning(
+                        "kanban auto-decompose: launch gate failed on board %s (%s); skipping",
+                        slug,
+                        exc,
+                    )
+                    continue
+                if not launch_gate.get("ok"):
+                    logger.debug(
+                        "kanban auto-decompose [%s]: launch_blocked: %s",
+                        slug,
+                        launch_gate.get("reason"),
+                    )
+                    continue
                 # Pin this board for the duration of the call — same
                 # pattern as the dashboard specify endpoint. The
                 # decomposer module connects with no board kwarg and

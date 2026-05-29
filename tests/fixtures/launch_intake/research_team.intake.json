@@ -1,0 +1,14 @@
+{
+  "domain": "research_team",
+  "rough_goal": "Stand up a small research team that answers my questions with cited, fact-checked briefs",
+  "golden_contract_file": "research_team.contract.json",
+  "answers": {
+    "success_criteria": "Success is a research desk that turns each question into a published brief citing at least 6 distinct primary sources with working URLs, retrieval dates, and verbatim supporting quotes, and a second reviewer fact-checks every claim before publish.",
+    "subject_scope": "The work is about research questions I submit, the primary sources behind them (arXiv papers, PubMed studies, Semantic Scholar entries, government statistics, public filings), the extracted claims, and the final published brief.",
+    "allowed_context": "Hermes may use arXiv, PubMed, Semantic Scholar, government statistics portals, and public company filings. It may not scrape paywalled databases, reuse my credentials, or bypass a paywall.",
+    "approval_boundaries": "Hermes may search, fetch, extract evidence, and draft a brief autonomously, but publishing a brief, emailing it, or posting it externally is owner-approval-gated. A reviewer fact-check sign-off is required before any brief leaves draft status.",
+    "workflow_path": "Intake and scope the question, gather and rank sources, extract supporting quotes and map claims to sources, synthesize a confidence-labeled draft brief, run peer review and citation verification, then publish only after my approval. Shelve the question if no credible sources exist.",
+    "proof_requirements": "Each stage needs structured proof: a scoped-question record, a source bundle with URLs and retrieval dates, an evidence table, a claim-to-source map, confidence labels, and a reviewer sign-off record. No brief is published from prose alone.",
+    "stop_and_escalation_rules": "Stop and escalate to me when a citation cannot be verified, when the reviewer and synthesizer disagree, when only paywalled sources exist, or before any publication."
+  }
+}

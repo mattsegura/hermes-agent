@@ -239,6 +239,106 @@ def _generic_recovery_actions(task: Any, *, running: bool) -> list[DiagnosticAct
 RuleFn = Callable[[Any, list[Any], list[Any], int, dict], list[Diagnostic]]
 
 
+def _launch_gate_from_config(cfg: dict) -> Optional[dict]:
+    gate = cfg.get("launch_gate") if isinstance(cfg, dict) else None
+    if not isinstance(gate, dict):
+        return None
+    if gate.get("ok") is not False:
+        return None
+    return gate
+
+
+def _launch_gate_closed(cfg: dict) -> bool:
+    return _launch_gate_from_config(cfg) is not None
+
+
+def _launch_gate_readiness(gate: dict) -> dict:
+    readiness = gate.get("readiness")
+    return readiness if isinstance(readiness, dict) else {}
+
+
+def _rule_launch_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Board launch gate is closed, so task-level execution advice is secondary."""
+    gate = _launch_gate_from_config(cfg)
+    if gate is None:
+        return []
+    status = str(_task_field(task, "status") or "").strip().lower()
+    if status in {"done", "archived"}:
+        return []
+
+    board = str(gate.get("board") or "default")
+    phase = str(gate.get("launch_phase") or "unknown")
+    reason = str(gate.get("reason") or "board launch gate is closed")
+    readiness = _launch_gate_readiness(gate)
+    missing = [str(v) for v in (readiness.get("missing") or gate.get("missing") or [])]
+    errors = [str(v) for v in (readiness.get("errors") or gate.get("errors") or [])]
+    questions = [
+        str(v) for v in (readiness.get("questions") or gate.get("questions") or [])
+    ]
+    question_generation = readiness.get("question_generation")
+    if not isinstance(question_generation, dict):
+        question_generation = None
+    answer_assessment = readiness.get("answer_assessment")
+    if not isinstance(answer_assessment, dict):
+        answer_assessment = None
+    blockers = gate.get("blockers") if isinstance(gate.get("blockers"), list) else []
+    blocker_codes = [
+        str(b.get("code"))
+        for b in blockers
+        if isinstance(b, dict) and b.get("code")
+    ]
+
+    detail_parts = [
+        (
+            f"Board {board!r} cannot dispatch executable work while "
+            f"launch_phase={phase!r}. {reason}."
+        )
+    ]
+    if missing:
+        detail_parts.append("Missing contract fields: " + ", ".join(missing))
+    if errors:
+        detail_parts.append("Contract errors: " + "; ".join(errors))
+    if questions:
+        detail_parts.append("Contract questions: " + " | ".join(questions[:5]))
+    elif question_generation:
+        detail_parts.append("Launch intake requires model-generated owner clarification questions.")
+    elif answer_assessment:
+        detail_parts.append("Launch intake answers require model assessment before contract drafting.")
+
+    actions = [
+        DiagnosticAction(
+            kind="cli_hint",
+            label="Show launch contract status",
+            payload={"command": f"hermes kanban boards contract status {board}"},
+            suggested=True,
+        ),
+    ]
+
+    return [Diagnostic(
+        kind="launch_blocked",
+        severity="error",
+        title=f"launch_blocked: board launch gate is closed ({phase})",
+        detail=" ".join(detail_parts),
+        actions=actions,
+        first_seen_at=now,
+        last_seen_at=now,
+        count=1,
+        data={
+            "board": board,
+            "launch_phase": phase,
+            "reason": reason,
+            "blockers": blocker_codes,
+            "readiness_status": readiness.get("status"),
+            "missing": missing,
+            "errors": errors,
+            "questions": questions,
+            "question_generation": question_generation,
+            "answer_assessment": answer_assessment,
+            "dispatch_enabled": False,
+        },
+    )]
+
+
 def _aux_slot_explicit(slot: Any) -> bool:
     """Return True if the auxiliary slot has user-supplied non-default fields.
 
@@ -404,6 +504,8 @@ def _rule_triage_aux_unavailable(task, events, runs, now, cfg) -> list[Diagnosti
     Config context is required; pass {} from tests to keep the rule silent.
     """
     if _task_field(task, "status") != "triage":
+        return []
+    if _launch_gate_closed(cfg):
         return []
 
     status = triage_aux_status(cfg)
@@ -824,6 +926,8 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     status = _task_field(task, "status")
     if status != "ready":
         return []
+    if _launch_gate_closed(cfg):
+        return []
     # Skip tasks with a live claim — they're being worked on, even if
     # the worker hasn't reported progress yet (run-level liveness
     # extends the claim TTL; we don't want to second-guess that here).
@@ -917,6 +1021,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
+    _rule_launch_blocked,
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
@@ -930,6 +1035,7 @@ _RULES: list[RuleFn] = [
 # Known kinds (for the UI's filter / legend / i18n keys). Update when
 # rules are added.
 DIAGNOSTIC_KINDS = (
+    "launch_blocked",
     "hallucinated_cards",
     "triage_aux_unavailable",
     "prose_phantom_refs",

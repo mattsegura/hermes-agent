@@ -222,6 +222,13 @@ HARDLINE_PATTERNS = [
     (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
     (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
     (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
+    # Owner approval boundary: model-controlled terminal sessions must not mint
+    # Kanban launch/amendment approval tokens. A real owner/operator should run
+    # this from their own interactive terminal or approved UI surface.
+    (r'\bhermes\b[^\n;|&]*\bkanban\b[^\n;|&]*\bboards\b[^\n;|&]*\bcontract\b[^\n;|&]*\bapproval-token\b',
+     "mint Kanban launch approval token"),
+    (r'\bpython[23]?\s+-m\s+hermes_cli\.main\b[^\n;|&]*\bkanban\b[^\n;|&]*\bboards\b[^\n;|&]*\bcontract\b[^\n;|&]*\bapproval-token\b',
+     "mint Kanban launch approval token"),
 ]
 
 # Pre-compiled variant used by the hot-path matcher. Building these at module

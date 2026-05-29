@@ -117,6 +117,46 @@ def _parse_json_object_flag(raw: Optional[str], flag_name: str) -> tuple[Optiona
     return parsed, None
 
 
+def _current_user_label() -> str:
+    return (
+        os.environ.get("HERMES_PROFILE")
+        or get_active_profile_name()
+        or os.environ.get("USER")
+        or "user"
+    )
+
+
+_OWNER_LAUNCH_INTAKE_PROFILES = {"default", "personal-assistant"}
+
+
+def _is_owner_launch_intake_profile() -> bool:
+    profile = str(os.environ.get("HERMES_PROFILE") or get_active_profile_name() or "default").strip()
+    return profile in _OWNER_LAUNCH_INTAKE_PROFILES
+
+
+def _owner_approval_authority_confirmed() -> bool:
+    if (
+        os.environ.get("HERMES_TEST_OWNER_APPROVAL_AUTHORITY") == "1"
+        and os.environ.get("PYTEST_CURRENT_TEST")
+    ):
+        return True
+    return bool(sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def _parse_text_or_file_flag(raw: Optional[str], flag_name: str) -> tuple[Optional[str], Optional[str]]:
+    if raw is None:
+        return None, None
+    text = str(raw).strip()
+    if not text:
+        return None, None
+    if text.startswith("@"):
+        try:
+            text = Path(text[1:]).expanduser().read_text(encoding="utf-8")
+        except OSError as exc:
+            return None, f"{flag_name}: could not read {text[1:]!r}: {exc}"
+    return text, None
+
+
 def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
     """Parse ``--workspace`` into ``(kind, path|None)``.
 
@@ -363,6 +403,95 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     bw_set.add_argument("workflow", help="JSON object or @/path/to/workflow.json")
     bw_clear = b_workflow_sub.add_parser("clear", help="Clear workflow schema")
     bw_clear.add_argument("slug")
+
+    b_contract = boards_sub.add_parser(
+        "contract",
+        help="Review, activate, and amend a board business contract",
+    )
+    b_contract_sub = b_contract.add_subparsers(dest="contract_action")
+    bc_status = b_contract_sub.add_parser("status", help="Show launch readiness")
+    bc_status.add_argument("slug", nargs="?", default=None,
+                           help="Board slug (defaults to current board)")
+    bc_status.add_argument("--json", action="store_true")
+    bc_review = b_contract_sub.add_parser("review", help="Review/store a draft launch contract")
+    bc_review.add_argument("slug", help="Board slug")
+    bc_review.add_argument("--rough-goal", default=None,
+                           help="Owner's rough business goal or launch request")
+    bc_review.add_argument("--contract", default=None,
+                           help="JSON object or @file path defining the business contract")
+    bc_review.add_argument("--intake-answers", default=None,
+                           help="Owner answers to generated intake questions, or @file")
+    bc_review.add_argument("--create", action="store_true",
+                           help="Create the board if it does not exist")
+    bc_review.add_argument("--approve", action="store_true",
+                           help="Activate only if readiness validation passes")
+    bc_review.add_argument("--approval-token", default=None,
+                           help="One-time approval token from contract approval-token")
+    bc_review.add_argument("--approved-by", default=None,
+                           help="Legacy approver metadata; use contract approval-token for activation")
+    bc_review.add_argument("--approval-evidence", default=None,
+                           help="Legacy approval evidence string or JSON object/@file")
+    bc_review.add_argument("--approval-reason", default=None,
+                           help="Optional approval rationale")
+    bc_review.add_argument("--name", default=None)
+    bc_review.add_argument("--description", default=None)
+    bc_review.add_argument(
+        "--operator-override",
+        action="store_true",
+        help=(
+            "Operator-only bypass for importing a complete direct contract without "
+            "saved owner launch intake"
+        ),
+    )
+    bc_review.add_argument("--json", action="store_true")
+    bc_token = b_contract_sub.add_parser(
+        "approval-token",
+        help="Issue a one-time owner approval token for an exact contract/version",
+    )
+    bc_token.add_argument("slug", help="Board slug")
+    bc_token.add_argument("--rough-goal", default=None,
+                          help="Owner's rough business goal or launch request")
+    bc_token.add_argument("--contract", default=None,
+                          help="JSON object or @file path defining the business contract")
+    bc_token.add_argument("--amendment-id", default=None,
+                          help="Pending amendment id when approving an amendment")
+    bc_token.add_argument("--approved-by", required=True,
+                          help="Explicit owner/approver identity")
+    bc_token.add_argument("--approval-evidence", required=True,
+                          help="Owner approval evidence string or JSON object/@file")
+    bc_token.add_argument("--approval-reason", default=None,
+                          help="Optional approval rationale")
+    bc_token.add_argument("--ttl-seconds", type=int, default=None,
+                          help="Token lifetime in seconds (default: 900)")
+    bc_token.add_argument(
+        "--operator-override",
+        action="store_true",
+        help=(
+            "Operator-only bypass for issuing a token for a complete direct "
+            "contract without saved owner launch intake"
+        ),
+    )
+    bc_token.add_argument("--json", action="store_true")
+    bc_propose = b_contract_sub.add_parser("propose", help="Propose a contract amendment")
+    bc_propose.add_argument("slug", help="Board slug")
+    bc_propose.add_argument("patch", help="JSON object or @file path patch")
+    bc_propose.add_argument("--reason", required=True, help="Why the contract needs to change")
+    bc_propose.add_argument("--risk", choices=["low", "medium", "high"], default="medium")
+    bc_propose.add_argument("--json", action="store_true")
+    bc_apply = b_contract_sub.add_parser("apply", help="Apply a pending contract amendment")
+    bc_apply.add_argument("slug", help="Board slug")
+    bc_apply.add_argument("amendment_id", help="Pending amendment id")
+    bc_apply.add_argument("--approval-token", default=None,
+                          help="One-time approval token from contract approval-token")
+    bc_apply.add_argument("--approved-by", default=None,
+                          help="Legacy approver metadata; use contract approval-token for activation")
+    bc_apply.add_argument("--approval-evidence", default=None,
+                          help="Legacy owner approval evidence string or JSON object/@file")
+    bc_apply.add_argument("--force", action="store_true",
+                          help="Deprecated; non-ready amendments are rejected")
+    bc_apply.add_argument("--no-activate", action="store_true",
+                          help="Do not set launch_phase=active after apply")
+    bc_apply.add_argument("--json", action="store_true")
 
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
@@ -1217,6 +1346,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_set_default_workdir(args)
     if sub == "workflow":
         return _cmd_boards_workflow(args)
+    if sub == "contract":
+        return _cmd_boards_contract(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1491,6 +1622,296 @@ def _cmd_boards_workflow(args: argparse.Namespace) -> int:
     return 2
 
 
+def _print_contract_readiness(status: dict[str, Any]) -> None:
+    readiness = status.get("readiness") or {}
+    print(f"Board:            {status.get('board')}")
+    print(f"Launch phase:     {status.get('launch_phase')}")
+    print(f"Contract version: {status.get('contract_version')}")
+    print(f"Dispatch enabled: {'yes' if status.get('dispatch_enabled') else 'no'}")
+    print(f"Readiness:        {readiness.get('status')}")
+    missing = readiness.get("missing") or []
+    if missing:
+        print(f"Missing:          {', '.join(missing)}")
+    errors = readiness.get("errors") or []
+    if errors:
+        print(f"Errors:           {'; '.join(errors)}")
+    questions = readiness.get("questions") or []
+    if questions:
+        print("Questions:")
+        for question in questions:
+            print(f"  - {question}")
+
+
+def _contract_apply_output(
+    result: dict[str, Any],
+    board: str,
+    *,
+    force: bool,
+    activate: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    status = kb.validate_board_launch_readiness(board)
+    enriched = dict(result)
+    enriched.update({
+        "launch_phase": status.get("launch_phase"),
+        "dispatch_enabled": bool(status.get("dispatch_enabled")),
+        "launch_blocked": not bool(status.get("dispatch_enabled")),
+        "forced": bool(force),
+        "activate_requested": bool(activate),
+        "launch_status": status,
+    })
+    return enriched, status
+
+
+def _print_contract_apply_result(
+    result: dict[str, Any],
+    status: dict[str, Any],
+    *,
+    board: str,
+    amendment_id: str,
+    force: bool,
+    activate: bool,
+) -> None:
+    readiness = status.get("readiness") or {}
+    dispatch_enabled = bool(status.get("dispatch_enabled"))
+    print(
+        f"Applied {amendment_id} to board {board!r}; "
+        f"contract_version={result.get('contract_version')}."
+    )
+    print(f"Launch phase:     {status.get('launch_phase')}")
+    print(f"Dispatch enabled: {'yes' if dispatch_enabled else 'no'}")
+    print(f"launch_blocked:   {'no' if dispatch_enabled else 'yes'}")
+    print(f"Readiness:        {readiness.get('status')}")
+    if force:
+        print("Forced:           yes (deprecated)")
+    if not activate:
+        print("Activate:         no (--no-activate)")
+    missing = readiness.get("missing") or []
+    if missing:
+        print(f"Missing:          {', '.join(missing)}")
+    errors = readiness.get("errors") or []
+    if errors:
+        print(f"Errors:           {'; '.join(errors)}")
+    questions = readiness.get("questions") or []
+    if questions:
+        print("Questions:")
+        for question in questions:
+            print(f"  - {question}")
+
+
+def _cmd_boards_contract(args: argparse.Namespace) -> int:
+    sub = getattr(args, "contract_action", None) or "status"
+    slug = getattr(args, "slug", None) or kb.get_current_board()
+    try:
+        normed = kb._normalize_board_slug(slug)
+    except ValueError as exc:
+        print(f"kanban boards contract: {exc}", file=sys.stderr)
+        return 2
+    if not normed:
+        print("kanban boards contract: board slug is required", file=sys.stderr)
+        return 2
+
+    if sub == "status":
+        if not kb.board_exists(normed):
+            print(f"kanban boards contract status: board {slug!r} does not exist", file=sys.stderr)
+            return 1
+        status = kb.validate_board_launch_readiness(normed)
+        if getattr(args, "json", False):
+            print(json.dumps(status, indent=2, ensure_ascii=False))
+        else:
+            _print_contract_readiness(status)
+        return 0
+
+    if sub == "review":
+        contract, error = _parse_json_object_flag(getattr(args, "contract", None), "--contract")
+        if error:
+            print(f"kanban boards contract review: {error}", file=sys.stderr)
+            return 2
+        approval_evidence, error = _parse_text_or_file_flag(
+            getattr(args, "approval_evidence", None),
+            "--approval-evidence",
+        )
+        if error:
+            print(f"kanban boards contract review: {error}", file=sys.stderr)
+            return 2
+        intake_answers, error = _parse_text_or_file_flag(
+            getattr(args, "intake_answers", None),
+            "--intake-answers",
+        )
+        if error:
+            print(f"kanban boards contract review: {error}", file=sys.stderr)
+            return 2
+        if contract is None and not getattr(args, "rough_goal", None) and intake_answers is None:
+            print("kanban boards contract review: --contract, --rough-goal, or --intake-answers is required", file=sys.stderr)
+            return 2
+        approve = bool(getattr(args, "approve", False))
+        try:
+            result = kb.review_business_launch_contract(
+                normed,
+                contract=contract,
+                rough_goal=getattr(args, "rough_goal", None),
+                intake_answers=intake_answers,
+                create_if_missing=bool(getattr(args, "create", False)),
+                approve=approve,
+                name=getattr(args, "name", None),
+                description=getattr(args, "description", None),
+                author=_current_user_label(),
+                approved_by=getattr(args, "approved_by", None),
+                approval_evidence=approval_evidence,
+                approval_reason=getattr(args, "approval_reason", None),
+                approval_token=getattr(args, "approval_token", None),
+                require_launch_intake=_is_owner_launch_intake_profile(),
+                operator_override=bool(getattr(args, "operator_override", False)),
+            )
+        except ValueError as exc:
+            print(f"kanban boards contract review: {exc}", file=sys.stderr)
+            return 2
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print(f"Board {normed!r} launch phase: {result.get('launch_phase')}")
+            readiness = result.get("readiness") or {}
+            print(f"Readiness: {readiness.get('status')}")
+            questions = result.get("questions") or []
+            if questions:
+                print("Questions:")
+                for question in questions:
+                    print(f"  - {question}")
+            else:
+                intake = result.get("launch_intake") or {}
+                assessment = intake.get("answer_assessment") or {}
+                generation = intake.get("question_generation") or {}
+                if assessment.get("required"):
+                    print(
+                        "Next step: Hermes must assess these answers and either ask "
+                        "follow-up questions or draft the board contract."
+                    )
+                elif generation.get("required"):
+                    print(
+                        "Next step: Hermes must ask tailored clarification questions "
+                        "from this rough goal before drafting the board contract."
+                    )
+        return 0
+
+    if sub == "approval-token":
+        contract, error = _parse_json_object_flag(getattr(args, "contract", None), "--contract")
+        if error:
+            print(f"kanban boards contract approval-token: {error}", file=sys.stderr)
+            return 2
+        approval_evidence, error = _parse_text_or_file_flag(
+            getattr(args, "approval_evidence", None),
+            "--approval-evidence",
+        )
+        if error:
+            print(f"kanban boards contract approval-token: {error}", file=sys.stderr)
+            return 2
+        amendment_id = getattr(args, "amendment_id", None)
+        if amendment_id and (contract is not None or getattr(args, "rough_goal", None)):
+            print(
+                "kanban boards contract approval-token: --amendment-id cannot be combined with --contract or --rough-goal",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            result = kb.issue_board_launch_approval_token(
+                normed,
+                contract=contract,
+                rough_goal=getattr(args, "rough_goal", None),
+                amendment_id=amendment_id,
+                approved_by=getattr(args, "approved_by", None),
+                approval_evidence=approval_evidence,
+                approval_reason=getattr(args, "approval_reason", None),
+                ttl_seconds=getattr(args, "ttl_seconds", None),
+                owner_authority_confirmed=_owner_approval_authority_confirmed(),
+                require_launch_intake=_is_owner_launch_intake_profile(),
+                operator_override=bool(getattr(args, "operator_override", False)),
+            )
+        except ValueError as exc:
+            print(f"kanban boards contract approval-token: {exc}", file=sys.stderr)
+            return 2
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print(result["token"])
+        return 0
+
+    if sub == "propose":
+        patch, error = _parse_json_object_flag(getattr(args, "patch", None), "patch")
+        if error:
+            print(f"kanban boards contract propose: {error}", file=sys.stderr)
+            return 2
+        try:
+            amendment = kb.propose_board_contract_amendment(
+                normed,
+                patch=patch,
+                reason=getattr(args, "reason", ""),
+                author=_current_user_label(),
+                risk=getattr(args, "risk", None),
+            )
+        except ValueError as exc:
+            print(f"kanban boards contract propose: {exc}", file=sys.stderr)
+            return 2
+        if getattr(args, "json", False):
+            print(json.dumps(amendment, indent=2, ensure_ascii=False))
+        else:
+            readiness = amendment.get("readiness") or {}
+            print(f"Amendment {amendment.get('id')} pending for board {normed!r}.")
+            print(f"Candidate readiness: {readiness.get('status')}")
+            for question in readiness.get("questions") or []:
+                print(f"  - {question}")
+        return 0
+
+    if sub == "apply":
+        force = bool(getattr(args, "force", False))
+        activate = not bool(getattr(args, "no_activate", False))
+        if force:
+            print(
+                "kanban boards contract apply: --force has been retired; "
+                "submit a launch-ready amendment and owner approval-token",
+                file=sys.stderr,
+            )
+            return 2
+        approval_evidence, error = _parse_text_or_file_flag(
+            getattr(args, "approval_evidence", None),
+            "--approval-evidence",
+        )
+        if error:
+            print(f"kanban boards contract apply: {error}", file=sys.stderr)
+            return 2
+        try:
+            result = kb.apply_board_contract_amendment(
+                normed,
+                getattr(args, "amendment_id", ""),
+                approved_by=getattr(args, "approved_by", None),
+                approval_evidence=approval_evidence,
+                approval_token=getattr(args, "approval_token", None),
+                activate=activate,
+            )
+        except ValueError as exc:
+            print(f"kanban boards contract apply: {exc}", file=sys.stderr)
+            return 2
+        result, launch_status = _contract_apply_output(
+            result,
+            normed,
+            force=force,
+            activate=activate,
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            _print_contract_apply_result(
+                result,
+                launch_status,
+                board=normed,
+                amendment_id=getattr(args, "amendment_id", ""),
+                force=force,
+                activate=activate,
+            )
+        return 0
+
+    print(f"kanban boards contract: unknown action {sub!r}", file=sys.stderr)
+    return 2
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -1757,6 +2178,32 @@ def _cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _diagnostics_config_for_current_board() -> dict[str, Any]:
+    from hermes_cli import kanban_diagnostics as kd
+    from hermes_cli.config import load_config
+
+    diag_config = kd.config_from_runtime_config(load_config())
+    board = kb.get_current_board()
+    try:
+        diag_config["launch_gate"] = kb.board_dispatch_gate(board)
+    except Exception as exc:
+        diag_config["launch_gate"] = {
+            "ok": False,
+            "board": board or kb.DEFAULT_BOARD,
+            "launch_phase": "unknown",
+            "reason": f"launch gate check failed: {exc}",
+            "blockers": [{"code": "launch_gate_check_failed", "error": str(exc)}],
+            "readiness": {
+                "ok": False,
+                "status": "invalid",
+                "errors": [str(exc)],
+                "missing": [],
+                "questions": [],
+            },
+        }
+    return diag_config
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     rsk = _run_state_kwargs(args)
     if rsk is None:
@@ -1858,7 +2305,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
     # of show output so CLI users see them before scrolling through
     # comments / runs.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs)
+    diags = kd.compute_task_diagnostics(
+        task,
+        events,
+        runs,
+        config=_diagnostics_config_for_current_board(),
+    )
     if diags:
         sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
         print(f"\n  Diagnostics ({len(diags)}):")
@@ -1996,9 +2448,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     the dashboard uses, so CLI output matches what the UI shows.
     """
     from hermes_cli import kanban_diagnostics as kd
-    from hermes_cli.config import load_config
 
-    diag_config = kd.config_from_runtime_config(load_config())
+    diag_config = _diagnostics_config_for_current_board()
 
     with kb.connect() as conn:
         # Either one-task mode or fleet mode.
@@ -2687,6 +3138,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "blockers": blockers}
                 for (tid, blockers) in res.contract_blocked
             ],
+            "launch_blocked": res.launch_blocked,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2718,6 +3170,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print("Contract-blocked:")
         for tid, blockers in res.contract_blocked:
             print(f"  - {tid}: {', '.join(blockers) if blockers else 'blocked'}")
+    if res.launch_blocked:
+        print("Launch-blocked:")
+        for gate in res.launch_blocked:
+            board = gate.get("board") or kb.DEFAULT_BOARD
+            phase = gate.get("launch_phase") or "unknown"
+            reason = gate.get("reason") or "blocked"
+            print(f"  - {board}: {reason} (launch_phase={phase})")
     return 0
 
 

@@ -1,10 +1,11 @@
 """Kanban tools — structured tool-call surface for worker + orchestrator agents.
 
-These tools are registered into the model's schema when the agent is
+Task execution tools are registered into the model's schema when the agent is
 running under the dispatcher (env var ``HERMES_KANBAN_TASK`` set) or when
-the active profile explicitly enables the ``kanban`` toolset for
-orchestrator work. A normal ``hermes chat`` session still sees **zero**
-kanban tools in its schema unless configured.
+the active profile explicitly enables the full ``kanban`` toolset for
+orchestrator work. Launch-intake tools live in a narrower
+``kanban_launch_intake`` toolset so owner-facing profiles can review a
+business launch contract without seeing task creation/execution tools.
 
 Why tools instead of just shelling out to ``hermes kanban``?
 
@@ -45,18 +46,81 @@ logger = logging.getLogger(__name__)
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
 
+KANBAN_FULL_TOOLSET = "kanban"
+KANBAN_LAUNCH_INTAKE_TOOLSET = "kanban_launch_intake"
+KANBAN_OWNER_LAUNCH_INTAKE_PROFILES = {"default", "personal-assistant"}
 
-def _profile_has_kanban_toolset() -> bool:
-    # Uses load_config() which has mtime-based caching, so this adds
-    # negligible overhead. The check_fn results are further TTL-cached
-    # (~30s) by the tool registry.
+
+def _configured_toolsets() -> set[str]:
+    """Return toolsets configured anywhere in the active profile config."""
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
-        toolsets = cfg.get("toolsets", [])
-        return "kanban" in toolsets
     except Exception:
-        return False
+        return set()
+
+    names: set[str] = set()
+
+    def _add(raw: Any) -> None:
+        if isinstance(raw, str):
+            values = raw.split(",")
+        elif isinstance(raw, (list, tuple, set)):
+            values = raw
+        else:
+            return
+        for value in values:
+            text = str(value).strip()
+            if text:
+                names.add(text)
+
+    _add(cfg.get("toolsets", []))
+    platform_toolsets = cfg.get("platform_toolsets") or {}
+    if isinstance(platform_toolsets, dict):
+        for value in platform_toolsets.values():
+            _add(value)
+
+    return names
+
+
+def _env_profile_name() -> str:
+    for key in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        value = str(os.environ.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _active_profile_name() -> str:
+    env_profile = _env_profile_name()
+    if env_profile:
+        return env_profile
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
+def _is_owner_launch_intake_profile() -> bool:
+    return _active_profile_name() in KANBAN_OWNER_LAUNCH_INTAKE_PROFILES
+
+
+def _profile_has_toolset(*toolsets: str) -> bool:
+    configured = _configured_toolsets()
+    return any(toolset in configured for toolset in toolsets)
+
+
+def _profile_has_kanban_toolset() -> bool:
+    return _profile_has_toolset(KANBAN_FULL_TOOLSET)
+
+
+def _profile_has_launch_intake_toolset() -> bool:
+    if _profile_has_toolset(KANBAN_LAUNCH_INTAKE_TOOLSET, KANBAN_FULL_TOOLSET):
+        return True
+    return (
+        _active_profile_name() in KANBAN_OWNER_LAUNCH_INTAKE_PROFILES
+        and _profile_has_toolset("hermes-cli")
+    )
 
 
 def _check_kanban_mode() -> bool:
@@ -66,13 +130,15 @@ def _check_kanban_mode() -> bool:
     2. The current profile has ``kanban`` in its toolsets config
        (orchestrator profiles like techlead that route work via Kanban).
 
-    Humans running ``hermes chat`` without the kanban toolset see zero
-    kanban tools. Workers spawned by the kanban dispatcher (gateway-
-    embedded by default) and orchestrator profiles with the kanban
+    Owner intake profiles without the full kanban toolset only see the
+    launch-review tools. Workers spawned by the kanban dispatcher (gateway-
+    embedded by default) and non-owner orchestrator profiles with the kanban
     toolset enabled see the Kanban lifecycle tool surface.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         return True
+    if _is_owner_launch_intake_profile():
+        return False
     return _profile_has_kanban_toolset()
 
 
@@ -87,7 +153,21 @@ def _check_kanban_orchestrator_mode() -> bool:
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
+    if _is_owner_launch_intake_profile():
+        return False
     return _profile_has_kanban_toolset()
+
+
+def _check_kanban_launch_intake_mode() -> bool:
+    """Launch-intake tools are read/review/amend-only.
+
+    They are never exposed to dispatcher-spawned task workers. Owner-facing
+    default/personal-assistant sessions may receive them as a narrow intake
+    surface, and full Kanban orchestrators keep them for contract review.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return False
+    return _profile_has_launch_intake_toolset()
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +258,201 @@ def _connect(board: Optional[str] = None):
 
 def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields})
+
+
+def _public_launch_approval(kb, board: Any, approval: Any) -> Optional[dict[str, Any]]:
+    if isinstance(board, dict):
+        summary = kb._public_launch_approval_summary(board)
+        if summary:
+            return summary
+    if not isinstance(approval, dict):
+        return None
+    return {
+        "id": str(approval.get("id") or "").strip() or None,
+        "status": str(approval.get("status") or "").strip() or None,
+        "approved_by": str(approval.get("approved_by") or "").strip() or None,
+        "reason": str(approval.get("reason") or "").strip() or None,
+        "contract_version": kb._normalize_contract_version(approval.get("contract_version")),
+        "amendment_id": approval.get("amendment_id") or None,
+        "created_at": approval.get("created_at"),
+    }
+
+
+def _public_launch_board(kb, meta: Any) -> Any:
+    if not isinstance(meta, dict):
+        return meta
+    return {
+        "slug": meta.get("slug"),
+        "name": meta.get("name"),
+        "description": meta.get("description"),
+        "runtime": meta.get("runtime"),
+        "objective": meta.get("objective"),
+        "workflow": meta.get("workflow"),
+        "business_contract": meta.get("business_contract"),
+        "launch_phase": meta.get("launch_phase"),
+        "contract_version": meta.get("contract_version"),
+        "contract_readiness": meta.get("contract_readiness"),
+        "launch_review_id": meta.get("launch_review_id"),
+        "launch_approval": kb._public_launch_approval_summary(meta),
+    }
+
+
+def _sanitize_launch_tool_result(kb, result: dict[str, Any]) -> dict[str, Any]:
+    """Remove approval-token authority from model-facing launch tools."""
+    sanitized = dict(result)
+    board = sanitized.get("board")
+    approval = sanitized.get("approval")
+    sanitized["board"] = _public_launch_board(kb, board)
+    if approval is not None:
+        sanitized["approval"] = _public_launch_approval(kb, board, approval)
+    _attach_launch_intake_followup(sanitized)
+    return sanitized
+
+
+def _extract_launch_question_generation(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    intake = payload.get("launch_intake")
+    if isinstance(intake, dict) and isinstance(intake.get("question_generation"), dict):
+        return dict(intake["question_generation"])
+    readiness = payload.get("readiness")
+    if isinstance(readiness, dict) and isinstance(readiness.get("question_generation"), dict):
+        return dict(readiness["question_generation"])
+    return None
+
+
+def _extract_launch_answer_assessment(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    intake = payload.get("launch_intake")
+    if isinstance(intake, dict) and isinstance(intake.get("answer_assessment"), dict):
+        return dict(intake["answer_assessment"])
+    readiness = payload.get("readiness")
+    if isinstance(readiness, dict) and isinstance(readiness.get("answer_assessment"), dict):
+        return dict(readiness["answer_assessment"])
+    return None
+
+
+def _attach_launch_intake_followup(payload: dict[str, Any]) -> None:
+    """Tell the model what to say next after a launch-intake tool call."""
+    questions = payload.get("questions")
+    question_list = [str(q) for q in questions] if isinstance(questions, list) else []
+    intake = payload.get("launch_intake")
+    if isinstance(intake, dict):
+        intake_state = str(intake.get("state") or "").strip().lower()
+        answer_quality = intake.get("answer_quality")
+        answer_sufficient = (
+            isinstance(answer_quality, dict)
+            and (
+                bool(answer_quality.get("sufficient"))
+                or str(answer_quality.get("status") or "").strip().lower()
+                in {"sufficient", "ready"}
+            )
+        )
+        if intake_state == "ready_for_owner_review" and answer_sufficient:
+            payload["assistant_next_action"] = {
+                "type": "launch_contract_owner_review",
+                "required": True,
+                "must_show_owner_review_now": True,
+                "instruction": (
+                    "Your next assistant response must summarize the drafted board operating "
+                    "contract for owner review in plain language. State that the board is still "
+                    "in contract_review, dispatch is disabled, and owner approval is required "
+                    "before activation. Do not call intake_answers again. Do not approve or "
+                    "activate launch."
+                ),
+                "response_style": (
+                    "Keep it owner-facing and concise. Include the outcome, allowed work, "
+                    "approval boundaries, proof, and stop conditions."
+                ),
+            }
+            return
+    server_orchestrated = False
+    if isinstance(intake, dict):
+        gen = intake.get("question_generation")
+        server_orchestrated = (
+            str(intake.get("source") or "").strip().lower() == "server_generated"
+            or (isinstance(gen, dict) and str(gen.get("mode") or "").strip().lower() == "server_generated")
+        )
+    assessment = _extract_launch_answer_assessment(payload)
+    server_assessed = isinstance(assessment, dict) and (
+        bool(assessment.get("result"))
+        or str(
+            (intake.get("answer_quality") or {}).get("assessed_by")
+            if isinstance(intake, dict)
+            else ""
+        ).strip().lower()
+        == "server"
+    )
+    if assessment and not server_assessed:
+        mode = str(assessment.get("mode") or "").strip().lower()
+        if assessment.get("required") and mode == "model_assessed":
+            payload["assistant_next_action"] = {
+                "type": "launch_intake_answer_assessment",
+                "required": True,
+                "must_assess_answers_now": True,
+                "mode": "model_assessed_answers",
+                "source": "launch_intake.answer_assessment",
+                "instruction": (
+                    "Your next assistant response must use launch_intake.answer_assessment.system_prompt "
+                    "to assess the owner's answers. If the answers are vague, incomplete, risky, or "
+                    "contradictory, ask 1-4 sharper follow-up questions now. If the answers are sufficient, "
+                    "do not merely summarize; draft the board contract and call kanban_business_launch_review "
+                    "again with that contract and launch_intake.answer_quality.sufficient=true. Do not call "
+                    "kanban_business_launch_review again with the same intake_answers; repeated answer "
+                    "submissions are rejected until the owner changes the answers. Do not approve or activate "
+                    "launch from this answer assessment."
+                ),
+                "response_style": (
+                    "Be direct and owner-facing. Do not expose internal schema names unless drafting the "
+                    "actual contract tool payload."
+                ),
+            }
+            return
+    generation = _extract_launch_question_generation(payload)
+    if question_list:
+        if server_orchestrated:
+            instruction = (
+                "Relay the server-generated clarification questions below to the owner "
+                "verbatim (lightly rephrasing for tone only). Hermes already generated "
+                "these server-side; do NOT invent your own questions, and do not draft or "
+                "approve the board contract yet. Collect the owner's answers and submit "
+                "them back via kanban_business_launch_review intake_answers."
+            )
+            mode = "relay_server_generated_questions"
+        else:
+            instruction = (
+                "Ask the owner the provided clarification questions now. "
+                "Do not draft or approve the board contract yet."
+            )
+            mode = "provided_questions"
+        payload["assistant_next_action"] = {
+            "type": "launch_intake_clarification",
+            "required": True,
+            "must_ask_owner_now": True,
+            "mode": mode,
+            "instruction": instruction,
+            "questions": question_list[:6],
+        }
+        return
+    if not generation:
+        return
+    mode = str(generation.get("mode") or "").strip().lower()
+    if not generation.get("required") or mode != "model_generated":
+        return
+    payload["assistant_next_action"] = {
+        "type": "launch_intake_clarification",
+        "required": True,
+        "must_ask_owner_now": True,
+        "mode": "model_generated_questions",
+        "source": "launch_intake.question_generation",
+        "instruction": (
+            "Your next assistant response must use launch_intake.question_generation.system_prompt "
+            "to generate and ask 2-6 tailored, owner-facing clarification questions from the rough "
+            "goal and conversation context. Ask the questions now; do not say Hermes will ask later. "
+            "Do not draft the board contract, create stages, or approve launch until the owner answers."
+        ),
+        "response_style": (
+            "Ask concise plain-language questions only. Avoid internal terms such as schemas, "
+            "profiles, dispatchers, event loops, provider policies, and worker envelopes."
+        ),
+    }
 
 
 def _normalize_profile(value: Any) -> Optional[str]:
@@ -370,7 +645,11 @@ def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     return default, f"{name} must be a boolean or 'true'/'false'"
 
 
-def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
+def _require_orchestrator_tool(
+    tool_name: str,
+    *,
+    allow_launch_intake: bool = False,
+) -> Optional[str]:
     """Belt-and-suspenders runtime guard for orchestrator-only handlers.
 
     The check_fn (`_check_kanban_orchestrator_mode`) keeps these tools
@@ -384,6 +663,12 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
             "must use kanban_complete, kanban_block, kanban_watch, "
             "kanban_heartbeat, or kanban_comment for their assigned task."
+        )
+    if _is_owner_launch_intake_profile() and not allow_launch_intake:
+        return tool_error(
+            f"{tool_name} requires the full kanban orchestrator surface; "
+            "owner launch-intake profiles are limited to launch status, "
+            "review, and contract amendment tools."
         )
     return None
 
@@ -622,6 +907,167 @@ def _handle_funnel(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_funnel failed")
         return tool_error(f"kanban_funnel: {e}")
+
+
+def _handle_board_launch_status(args: dict, **kw) -> str:
+    """Read board launch phase, contract readiness, and clarity questions."""
+    guard = _require_orchestrator_tool(
+        "kanban_board_launch_status",
+        allow_launch_intake=True,
+    )
+    if guard:
+        return guard
+    board = args.get("board")
+    try:
+        from hermes_cli import kanban_db as kb
+        meta = kb.read_board_metadata(board)
+        status = kb.validate_board_launch_readiness(board)
+        board_summary = {
+            "slug": meta.get("slug"),
+            "name": meta.get("name"),
+            "description": meta.get("description"),
+            "runtime": meta.get("runtime"),
+            "objective": meta.get("objective"),
+            "workflow": meta.get("workflow"),
+            "business_contract": meta.get("business_contract"),
+            "launch_phase": meta.get("launch_phase"),
+            "contract_version": meta.get("contract_version"),
+            "contract_readiness": meta.get("contract_readiness"),
+            "launch_review_id": meta.get("launch_review_id"),
+        }
+        return json.dumps({
+            "ok": True,
+            "board": board_summary,
+            "launch": status,
+        }, ensure_ascii=False)
+    except ValueError as e:
+        return tool_error(f"kanban_board_launch_status: {e}")
+    except Exception as e:
+        logger.exception("kanban_board_launch_status failed")
+        return tool_error(f"kanban_board_launch_status: {e}")
+
+
+def _handle_business_launch_review(args: dict, **kw) -> str:
+    """Store/review a draft business board contract before launch."""
+    guard = _require_orchestrator_tool(
+        "kanban_business_launch_review",
+        allow_launch_intake=True,
+    )
+    if guard:
+        return guard
+    board = args.get("board")
+    contract = args.get("contract")
+    rough_goal = args.get("rough_goal")
+    intake_answers = args.get("intake_answers")
+    if not contract and not rough_goal and intake_answers is None:
+        return tool_error("contract, rough_goal, or intake_answers is required")
+    create_if_missing, bool_error = _parse_bool_arg(args, "create_if_missing")
+    if bool_error:
+        return tool_error(bool_error)
+    approve, bool_error = _parse_bool_arg(args, "approve")
+    if bool_error:
+        return tool_error(bool_error)
+    try:
+        from hermes_cli import kanban_db as kb
+        result = kb.review_business_launch_contract(
+            board,
+            contract=contract,
+            rough_goal=rough_goal,
+            intake_answers=intake_answers,
+            create_if_missing=create_if_missing,
+            approve=approve,
+            name=args.get("name"),
+            description=args.get("description"),
+            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+            approved_by=args.get("approved_by"),
+            approval_evidence=args.get("approval_evidence"),
+            approval_reason=args.get("approval_reason"),
+            approval_token=args.get("approval_token"),
+            require_launch_intake=_is_owner_launch_intake_profile(),
+        )
+        return json.dumps(_sanitize_launch_tool_result(kb, result), ensure_ascii=False)
+    except ValueError as e:
+        return tool_error(f"kanban_business_launch_review: {e}")
+    except Exception as e:
+        logger.exception("kanban_business_launch_review failed")
+        return tool_error(f"kanban_business_launch_review: {e}")
+
+
+def _handle_contract_amendment_propose(args: dict, **kw) -> str:
+    """Create a pending board contract amendment."""
+    guard = _require_orchestrator_tool(
+        "kanban_contract_amendment_propose",
+        allow_launch_intake=True,
+    )
+    if guard:
+        return guard
+    board = args.get("board")
+    patch = args.get("patch")
+    reason = args.get("reason")
+    if not board:
+        return tool_error("board is required")
+    if not isinstance(patch, dict):
+        return tool_error("patch must be an object/dict")
+    if not str(reason or "").strip():
+        return tool_error("reason is required")
+    try:
+        from hermes_cli import kanban_db as kb
+        amendment = kb.propose_board_contract_amendment(
+            board,
+            patch=patch,
+            reason=str(reason),
+            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+            risk=args.get("risk"),
+        )
+        return _ok(amendment=amendment)
+    except ValueError as e:
+        return tool_error(f"kanban_contract_amendment_propose: {e}")
+    except Exception as e:
+        logger.exception("kanban_contract_amendment_propose failed")
+        return tool_error(f"kanban_contract_amendment_propose: {e}")
+
+
+def _handle_contract_amendment_apply(args: dict, **kw) -> str:
+    """Apply a pending board contract amendment after approval."""
+    guard = _require_orchestrator_tool(
+        "kanban_contract_amendment_apply",
+        allow_launch_intake=True,
+    )
+    if guard:
+        return guard
+    board = args.get("board")
+    amendment_id = args.get("amendment_id")
+    if not board:
+        return tool_error("board is required")
+    if not amendment_id:
+        return tool_error("amendment_id is required")
+    force, bool_error = _parse_bool_arg(args, "force")
+    if bool_error:
+        return tool_error(bool_error)
+    if force:
+        return tool_error(
+            "kanban_contract_amendment_apply: force apply is not available; "
+            "submit a launch-ready amendment and owner approval_token"
+        )
+    activate, bool_error = _parse_bool_arg(args, "activate", default=True)
+    if bool_error:
+        return tool_error(bool_error)
+    try:
+        from hermes_cli import kanban_db as kb
+        result = kb.apply_board_contract_amendment(
+            board,
+            str(amendment_id),
+            approved_by=args.get("approved_by"),
+            approval_evidence=args.get("approval_evidence"),
+            approval_token=args.get("approval_token"),
+            activate=activate,
+        )
+        return json.dumps(_sanitize_launch_tool_result(kb, result), ensure_ascii=False)
+    except ValueError as e:
+        return tool_error(f"kanban_contract_amendment_apply: {e}")
+    except Exception as e:
+        logger.exception("kanban_contract_amendment_apply failed")
+        return tool_error(f"kanban_contract_amendment_apply: {e}")
 
 
 def _handle_complete(args: dict, **kw) -> str:
@@ -1289,6 +1735,166 @@ KANBAN_FUNNEL_SCHEMA = {
     },
 }
 
+KANBAN_BOARD_LAUNCH_STATUS_SCHEMA = {
+    "name": "kanban_board_launch_status",
+    "description": (
+        "Read a board's launch phase, contract version, business contract "
+        "readiness, missing clarity fields, and follow-up questions. Use before "
+        "creating execution cards for a new business/runtime board."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
+KANBAN_BUSINESS_LAUNCH_REVIEW_SCHEMA = {
+    "name": "kanban_business_launch_review",
+    "description": (
+        "Review and optionally store a draft business-runtime contract before "
+        "launching a board. If the owner gives a vague business idea, call this "
+        "with rough_goal and create_if_missing=true. For a rough goal, the tool "
+        "returns a mandatory model-generated launch-intake prompt instead of "
+        "hardcoded questions; use that prompt to ask tailored owner clarification "
+        "questions in your next response before drafting the contract. When the "
+        "owner answers, call this with intake_answers so the answer quality is "
+        "assessed recursively before any contract draft. Set "
+        "approve=true only after the owner has approved a launch-ready contract "
+        "through an external approval token; otherwise the board remains in "
+        "contract_review and dispatch is gated."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "board": _board_schema_prop(),
+            "rough_goal": {
+                "type": "string",
+                "description": "Owner's rough business goal or launch request.",
+            },
+            "intake_answers": {
+                "type": ["object", "array", "string"],
+                "description": (
+                    "Owner answers to the generated launch-intake clarification "
+                    "questions. Use this before drafting the contract so Hermes "
+                    "can assess answer quality and ask recursive follow-ups if needed."
+                ),
+            },
+            "contract": {
+                "type": "object",
+                "description": (
+                    "Draft business contract with objective, runtime, workflow, "
+                    "entities, event loops, and approval/proof policy."
+                ),
+            },
+            "create_if_missing": {
+                "type": "boolean",
+                "description": "Create the board if it does not exist. Defaults to false.",
+            },
+            "approve": {
+                "type": "boolean",
+                "description": (
+                    "Activate dispatch only if the contract is launch-ready and "
+                    "approval_token matches the exact contract/version. Defaults to false."
+                ),
+            },
+            "approval_token": {
+                "type": "string",
+                "description": (
+                    "Required with approve=true for a launch-ready contract. "
+                    "This one-time token must be minted outside model-callable "
+                    "launch tools from explicit owner approval."
+                ),
+            },
+            "approved_by": {
+                "type": "string",
+                "description": "Legacy approver metadata; does not activate without approval_token.",
+            },
+            "approval_evidence": {
+                "type": "object",
+                "description": (
+                    "Legacy approval evidence metadata; does not activate without approval_token."
+                ),
+            },
+            "approval_reason": {
+                "type": "string",
+                "description": "Optional rationale for the owner approval.",
+            },
+            "name": {"type": "string", "description": "Optional display name for a new board."},
+            "description": {"type": "string", "description": "Optional board description."},
+        },
+        "required": [],
+    },
+}
+
+KANBAN_CONTRACT_AMENDMENT_PROPOSE_SCHEMA = {
+    "name": "kanban_contract_amendment_propose",
+    "description": (
+        "Propose a versioned patch to a board's business contract. This does "
+        "not change the active runtime; it stores a pending amendment, validates "
+        "the candidate contract, and returns any missing clarity questions."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "board": _board_schema_prop(),
+            "patch": {
+                "type": "object",
+                "description": "Deep-merge patch for objective/runtime/workflow/entities/policy.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Why the board contract needs to change.",
+            },
+            "risk": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "description": "Estimated operational risk for the amendment.",
+            },
+        },
+        "required": ["board", "patch", "reason"],
+    },
+}
+
+KANBAN_CONTRACT_AMENDMENT_APPLY_SCHEMA = {
+    "name": "kanban_contract_amendment_apply",
+    "description": (
+        "Apply a pending board contract amendment after owner-token approval. The old "
+        "contract is preserved in history, contract_version increments, and "
+        "the exact amendment/version must be launch-ready and approved with "
+        "approval_token."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "board": _board_schema_prop(),
+            "amendment_id": {"type": "string", "description": "Pending amendment id."},
+            "approval_token": {
+                "type": "string",
+                "description": (
+                    "Required for ready amendments. This one-time token must be "
+                    "minted outside model-callable launch tools from explicit owner approval."
+                ),
+            },
+            "approved_by": {
+                "type": "string",
+                "description": "Legacy approver metadata; does not activate without approval_token.",
+            },
+            "approval_evidence": {
+                "type": "object",
+                "description": "Legacy approval evidence metadata; does not activate without approval_token.",
+            },
+            "activate": {
+                "type": "boolean",
+                "description": "Set launch_phase=active when readiness passes. Defaults to true.",
+            },
+        },
+        "required": ["board", "amendment_id"],
+    },
+}
+
 KANBAN_COMPLETE_SCHEMA = {
     "name": "kanban_complete",
     "description": (
@@ -1783,6 +2389,42 @@ registry.register(
     schema=KANBAN_FUNNEL_SCHEMA,
     handler=_handle_funnel,
     check_fn=_check_kanban_orchestrator_mode,
+    emoji="🧭",
+)
+
+registry.register(
+    name="kanban_board_launch_status",
+    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    schema=KANBAN_BOARD_LAUNCH_STATUS_SCHEMA,
+    handler=_handle_board_launch_status,
+    check_fn=_check_kanban_launch_intake_mode,
+    emoji="🧭",
+)
+
+registry.register(
+    name="kanban_business_launch_review",
+    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    schema=KANBAN_BUSINESS_LAUNCH_REVIEW_SCHEMA,
+    handler=_handle_business_launch_review,
+    check_fn=_check_kanban_launch_intake_mode,
+    emoji="🧭",
+)
+
+registry.register(
+    name="kanban_contract_amendment_propose",
+    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    schema=KANBAN_CONTRACT_AMENDMENT_PROPOSE_SCHEMA,
+    handler=_handle_contract_amendment_propose,
+    check_fn=_check_kanban_launch_intake_mode,
+    emoji="🧭",
+)
+
+registry.register(
+    name="kanban_contract_amendment_apply",
+    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    schema=KANBAN_CONTRACT_AMENDMENT_APPLY_SCHEMA,
+    handler=_handle_contract_amendment_apply,
+    check_fn=_check_kanban_launch_intake_mode,
     emoji="🧭",
 )
 

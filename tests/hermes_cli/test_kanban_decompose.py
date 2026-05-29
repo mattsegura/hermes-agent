@@ -328,6 +328,26 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_decompose_task_respects_board_launch_gate(kanban_home):
+    kb.write_board_metadata(kb.DEFAULT_BOARD, launch_phase="contract_review")
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", triage=True)
+
+    client = _mock_client_returning("unused")
+    with patch(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        return_value=(client, "test-model"),
+    ):
+        outcome = decomp.decompose_task(tid, author="me")
+
+    assert outcome.ok is False
+    assert "launch_blocked" in outcome.reason
+    assert "contract_review" in outcome.reason
+    assert client.chat.completions.create.call_count == 0
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+
+
 def test_decompose_no_aux_client_configured(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x", triage=True)

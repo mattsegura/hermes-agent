@@ -222,6 +222,7 @@ _WARNING_EVENT_KINDS = (
 def _compute_task_diagnostics(
     conn: sqlite3.Connection,
     task_ids: Optional[list[str]] = None,
+    board: Optional[str] = None,
 ) -> dict[str, list[dict]]:
     """Run the diagnostic rule engine against every task (or a subset)
     and return ``{task_id: [diagnostic_dict, ...]}``.
@@ -234,6 +235,7 @@ def _compute_task_diagnostics(
     from hermes_cli.config import load_config
 
     diag_config = kd.config_from_runtime_config(load_config())
+    diag_config["launch_gate"] = _launch_gate_for_board(board)
 
     # Build the candidate task list. We need each task's row + its
     # events + its runs. Doing N separate queries works but scales
@@ -285,6 +287,28 @@ def _compute_task_diagnostics(
         if diags:
             out[tid] = [d.to_dict() for d in diags]
     return out
+
+
+def _launch_gate_for_board(board: Optional[str]) -> dict[str, Any]:
+    resolved_board = board or kanban_db.get_current_board()
+    try:
+        return kanban_db.board_dispatch_gate(resolved_board)
+    except Exception as exc:
+        log.warning("kanban launch gate check failed: %s", exc)
+        return {
+            "ok": False,
+            "board": resolved_board or kanban_db.DEFAULT_BOARD,
+            "launch_phase": "unknown",
+            "reason": f"launch gate check failed: {exc}",
+            "blockers": [{"code": "launch_gate_check_failed", "error": str(exc)}],
+            "readiness": {
+                "ok": False,
+                "status": "invalid",
+                "errors": [str(exc)],
+                "missing": [],
+                "questions": [],
+            },
+        }
 
 
 def _warnings_summary_from_diagnostics(
@@ -417,7 +441,12 @@ def get_board(
         # We get the full structured list per task AND a compact
         # summary for the card badge (so cards don't carry the detail
         # text; the drawer fetches that via /tasks/:id or /diagnostics).
-        diagnostics_per_task = _compute_task_diagnostics(conn, task_ids=None)
+        launch_gate = _launch_gate_for_board(board)
+        diagnostics_per_task = _compute_task_diagnostics(
+            conn,
+            task_ids=None,
+            board=board,
+        )
 
         latest_event_id = conn.execute(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
@@ -477,6 +506,7 @@ def get_board(
             ],
             "tenants": tenants,
             "assignees": assignees,
+            "launch_gate": launch_gate,
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }
@@ -522,7 +552,7 @@ def get_task(
         task_d = _task_dict(task, latest_summary=full_summary)
         # Attach diagnostics so the drawer's Diagnostics section can
         # render recovery actions without a second round-trip.
-        diags = _compute_task_diagnostics(conn, task_ids=[task_id])
+        diags = _compute_task_diagnostics(conn, task_ids=[task_id], board=board)
         diag_list = diags.get(task_id) or []
         if diag_list:
             task_d["diagnostics"] = diag_list
@@ -816,6 +846,9 @@ def _set_status_direct(
         # Prevents the dispatcher from spawning a child whose upstream work
         # hasn't completed (e.g. T4 dispatched while T3 is still blocked).
         if new_status == "ready":
+            gate = kanban_db.board_dispatch_gate(kanban_db._connection_board(conn))
+            if not gate.get("ok"):
+                return False
             parent_statuses = conn.execute(
                 "SELECT t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
@@ -1100,9 +1133,14 @@ def list_diagnostics(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        diags_by_task = _compute_task_diagnostics(conn, task_ids=None)
+        launch_gate = _launch_gate_for_board(board)
+        diags_by_task = _compute_task_diagnostics(
+            conn,
+            task_ids=None,
+            board=board,
+        )
         if not diags_by_task:
-            return {"diagnostics": [], "count": 0}
+            return {"diagnostics": [], "count": 0, "launch_gate": launch_gate}
 
         # Narrow by severity if asked.
         if severity:
@@ -1113,7 +1151,7 @@ def list_diagnostics(
                     filtered[tid] = keep
             diags_by_task = filtered
             if not diags_by_task:
-                return {"diagnostics": [], "count": 0}
+                return {"diagnostics": [], "count": 0, "launch_gate": launch_gate}
 
         # Pull the task rows we need in one query so we can include
         # titles/statuses without a per-task lookup.
@@ -1151,6 +1189,7 @@ def list_diagnostics(
         return {
             "diagnostics": out,
             "count": sum(len(d["diagnostics"]) for d in out),
+            "launch_gate": launch_gate,
         }
     finally:
         conn.close()
@@ -1655,6 +1694,28 @@ def get_stats(board: Optional[str] = Query(None)):
     conn = _conn(board=board)
     try:
         return kanban_db.board_stats(conn)
+    finally:
+        conn.close()
+
+
+@router.get("/learned-state")
+def get_learned_state(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    knob: Optional[str] = Query(None, description="Restrict to a single managed knob"),
+):
+    """"What Hermes learned" — the optimizer's per-knob learned state.
+
+    The running-phase analog of the launch coverage report: for each managed
+    knob it returns the current value + declared bounds, the posterior mean
+    +/- uncertainty per arm (from the same learner the optimizer samples), the
+    last change (autonomous vs approved) from the knob audit log, the per-arm
+    reward trend, and whether a cross-business prior is currently influencing
+    the knob and how strongly (the shrinkage weight). Pure read-model.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        return kanban_db.build_learned_state_read_model(conn, board=board, knob=knob)
     finally:
         conn.close()
 

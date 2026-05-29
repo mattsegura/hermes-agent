@@ -2,7 +2,7 @@
 
 Verifies:
   - Tools are gated on HERMES_KANBAN_TASK: a normal chat session sees
-    zero kanban tools in its schema; a worker session sees the kanban set.
+    only launch-intake Kanban tools; a worker session sees the kanban set.
   - Each handler's happy path.
   - Error paths (missing required args, bad metadata type, etc).
 """
@@ -14,14 +14,74 @@ import os
 import pytest
 
 
+LAUNCH_INTAKE_TOOLS = {
+    "kanban_board_launch_status",
+    "kanban_business_launch_review",
+    "kanban_contract_amendment_propose",
+    "kanban_contract_amendment_apply",
+}
+
+FULL_KANBAN_EXECUTION_TOOLS = {
+    "kanban_show",
+    "kanban_list",
+    "kanban_funnel",
+    "kanban_complete",
+    "kanban_block",
+    "kanban_watch",
+    "kanban_trigger",
+    "kanban_transition",
+    "kanban_heartbeat",
+    "kanban_comment",
+    "kanban_create",
+    "kanban_link",
+    "kanban_unblock",
+}
+
+
+def _tool_definition_names(enabled_toolsets, disabled_toolsets=None):
+    import tools.kanban_tools  # ensure registered
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    schema = get_tool_definitions(
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+        quiet_mode=True,
+    )
+    return {s["function"].get("name") for s in schema if "function" in s}
+
+
+def _cached_tool_definition_names(enabled_toolsets):
+    import tools.kanban_tools  # ensure registered
+    from model_tools import get_tool_definitions
+
+    schema = get_tool_definitions(
+        enabled_toolsets=enabled_toolsets,
+        quiet_mode=True,
+    )
+    return {s["function"].get("name") for s in schema if "function" in s}
+
+
+def _registry_tool_definition_names(toolset):
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import registry
+    from toolsets import resolve_toolset
+
+    schema = registry.get_definitions(set(resolve_toolset(toolset)), quiet=True)
+    return {s["function"].get("name") for s in schema if "function" in s}
+
+
 # ---------------------------------------------------------------------------
 # Gating
 # ---------------------------------------------------------------------------
 
-def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
-    """Normal `hermes chat` sessions (no HERMES_KANBAN_TASK) must have
-    zero kanban_* tools in their schema."""
+def test_default_chat_only_gets_launch_intake_without_env_var(monkeypatch, tmp_path):
+    """Default owner chat can start launch intake, but not create work."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -34,9 +94,8 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
-    assert kanban == set(), (
-        f"kanban tools leaked into normal chat schema: {kanban}"
-    )
+    assert kanban == LAUNCH_INTAKE_TOOLS
+    assert FULL_KANBAN_EXECUTION_TOOLS.isdisjoint(kanban)
 
 
 def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
@@ -88,6 +147,30 @@ def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_pat
     assert "kanban_list" not in names
 
 
+def test_worker_task_env_overrides_disabled_kanban_toolset(monkeypatch, tmp_path):
+    """Owner chat can disable Kanban without breaking task worker handoff tools."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("toolsets:\n  - hermes-cli\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    names = _tool_definition_names(["hermes-cli"], disabled_toolsets=["kanban"])
+    kanban = {n for n in names if n and n.startswith("kanban_")}
+    expected = {
+        "kanban_show",
+        "kanban_complete",
+        "kanban_block",
+        "kanban_watch",
+        "kanban_heartbeat",
+        "kanban_comment",
+        "kanban_create",
+        "kanban_link",
+    }
+
+    assert kanban == expected
+
+
 def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_path):
     """Task scope wins over profile config for board-routing tools.
 
@@ -112,18 +195,23 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
     assert {
         "kanban_list",
         "kanban_funnel",
+        "kanban_board_launch_status",
+        "kanban_business_launch_review",
+        "kanban_contract_amendment_propose",
+        "kanban_contract_amendment_apply",
         "kanban_trigger",
         "kanban_transition",
         "kanban_unblock",
     }.isdisjoint(kanban), (
         f"Board-routing tools leaked into worker schema: "
-        f"{kanban & {'kanban_list', 'kanban_funnel', 'kanban_trigger', 'kanban_transition', 'kanban_unblock'}}"
+        f"{kanban & {'kanban_list', 'kanban_funnel', 'kanban_board_launch_status', 'kanban_business_launch_review', 'kanban_contract_amendment_propose', 'kanban_contract_amendment_apply', 'kanban_trigger', 'kanban_transition', 'kanban_unblock'}}"
     )
 
 
 def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     """Orchestrator profiles with toolsets: [kanban] see all kanban tools."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text("toolsets:\n  - kanban\n")
@@ -140,6 +228,10 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     expected = {
         "kanban_list",
         "kanban_funnel",
+        "kanban_board_launch_status",
+        "kanban_business_launch_review",
+        "kanban_contract_amendment_propose",
+        "kanban_contract_amendment_apply",
         "kanban_trigger",
         "kanban_transition",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_watch", "kanban_heartbeat",
@@ -147,6 +239,210 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_unblock",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
+
+
+def test_launch_tools_registered_under_launch_intake_toolset():
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import registry
+
+    for name in LAUNCH_INTAKE_TOOLS:
+        assert registry.get_toolset_for_tool(name) == "kanban_launch_intake"
+
+
+def test_personal_assistant_launch_intake_hides_full_kanban_execution(monkeypatch, tmp_path):
+    """Owner intake gets launch review/amendment tools, not kanban_create."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "personal-assistant")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "    - kanban\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    names = _tool_definition_names(["kanban"])
+    kanban = {n for n in names if n and n.startswith("kanban_")}
+
+    assert kanban == LAUNCH_INTAKE_TOOLS
+    assert "kanban_create" not in kanban
+    assert FULL_KANBAN_EXECUTION_TOOLS.isdisjoint(kanban)
+
+
+def test_default_hermes_cli_launch_intake_hides_full_kanban_execution(monkeypatch, tmp_path):
+    """Default profile can intake launches through hermes-cli without full Kanban."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("toolsets:\n  - hermes-cli\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    names = _tool_definition_names(["hermes-cli"])
+    kanban = {n for n in names if n and n.startswith("kanban_")}
+
+    assert kanban == LAUNCH_INTAKE_TOOLS
+    assert FULL_KANBAN_EXECUTION_TOOLS.isdisjoint(kanban)
+
+
+def test_disabled_kanban_preserves_default_launch_intake(monkeypatch, tmp_path):
+    """Disabling full Kanban should not remove the review-only intake tools."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("toolsets:\n  - hermes-cli\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    names = _tool_definition_names(["hermes-cli"], disabled_toolsets=["kanban"])
+    kanban = {n for n in names if n and n.startswith("kanban_")}
+
+    assert kanban == LAUNCH_INTAKE_TOOLS
+    assert FULL_KANBAN_EXECUTION_TOOLS.isdisjoint(kanban)
+
+
+def test_disabled_launch_intake_removes_default_launch_tools(monkeypatch, tmp_path):
+    """Owners can still explicitly disable the narrow launch-intake surface."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("toolsets:\n  - hermes-cli\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    names = _tool_definition_names(
+        ["hermes-cli"],
+        disabled_toolsets=["kanban", "kanban_launch_intake"],
+    )
+    kanban = {n for n in names if n and n.startswith("kanban_")}
+
+    assert kanban == set()
+
+
+def test_active_owner_profile_without_env_still_gets_launch_intake(monkeypatch, tmp_path):
+    """Launch intake must not depend on gateway exporting HERMES_PROFILE."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("toolsets:\n  - hermes-cli\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools as kt
+    monkeypatch.setattr(kt, "_active_profile_name", lambda: "personal-assistant")
+
+    names = _tool_definition_names(["hermes-cli"])
+    kanban = {n for n in names if n and n.startswith("kanban_")}
+
+    assert kanban == LAUNCH_INTAKE_TOOLS
+    assert FULL_KANBAN_EXECUTION_TOOLS.isdisjoint(kanban)
+
+
+def test_check_fn_cache_varies_by_kanban_task_env_without_invalidation(monkeypatch, tmp_path):
+    """Switching into worker task env must not reuse owner intake check_fn results."""
+    from model_tools import _clear_tool_defs_cache
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("toolsets:\n  - kanban\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    owner_kanban = {
+        n for n in _registry_tool_definition_names("hermes-cli")
+        if n and n.startswith("kanban_")
+    }
+    assert owner_kanban == LAUNCH_INTAKE_TOOLS
+
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_cache_profile_switch")
+
+    worker_kanban = {
+        n for n in _registry_tool_definition_names("hermes-cli")
+        if n and n.startswith("kanban_")
+    }
+    assert worker_kanban == {
+        "kanban_show",
+        "kanban_complete",
+        "kanban_block",
+        "kanban_watch",
+        "kanban_heartbeat",
+        "kanban_comment",
+        "kanban_create",
+        "kanban_link",
+    }
+    assert LAUNCH_INTAKE_TOOLS.isdisjoint(worker_kanban)
+
+
+def test_tool_definition_cache_varies_by_profile_env_without_invalidation(monkeypatch, tmp_path):
+    """Quiet tool-definition cache must not leak owner intake into full Kanban."""
+    from model_tools import _clear_tool_defs_cache
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("toolsets:\n  - kanban\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    owner_kanban = {
+        n for n in _cached_tool_definition_names(["hermes-cli"])
+        if n and n.startswith("kanban_")
+    }
+    assert owner_kanban == LAUNCH_INTAKE_TOOLS
+
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+
+    orchestrator_kanban = {
+        n for n in _cached_tool_definition_names(["hermes-cli"])
+        if n and n.startswith("kanban_")
+    }
+    assert orchestrator_kanban == LAUNCH_INTAKE_TOOLS | FULL_KANBAN_EXECUTION_TOOLS
+
+
+def test_tool_definition_cache_varies_by_hermes_home_without_invalidation(monkeypatch, tmp_path):
+    """HERMES_HOME-driven active-profile changes must get distinct schemas."""
+    from pathlib import Path as _Path
+
+    from model_tools import _clear_tool_defs_cache
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+
+    default_home = tmp_path / ".hermes"
+    profile_home = default_home / "profiles" / "test-orchestrator"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+    default_kanban = {
+        n for n in _cached_tool_definition_names(["hermes-cli"])
+        if n and n.startswith("kanban_")
+    }
+    assert default_kanban == LAUNCH_INTAKE_TOOLS
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    profile_kanban = {
+        n for n in _cached_tool_definition_names(["hermes-cli"])
+        if n and n.startswith("kanban_")
+    }
+    assert profile_kanban == set()
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +474,79 @@ def worker_env(monkeypatch, tmp_path):
     return tid
 
 
+def _tool_launch_contract():
+    return {
+        "objective": {
+            "statement": "Launch seller conversion",
+            "success": ["signed agreements are produced"],
+            "failure": ["unapproved outreach is attempted"],
+            "constraints": ["external outreach requires owner approval"],
+        },
+        "runtime": {
+            "mode": "company",
+            "dispatcher": {"profile": "ceo"},
+            "profiles": {"worker": "operator", "optimizer": "optimizer"},
+            "provider_policy": {"seller_outreach": {"provider": "approved_business_channel"}},
+            "worker_envelopes": {
+                "operator": {
+                    "capabilities": ["seller_outreach"],
+                    "toolsets": ["kanban"],
+                    "allowed_side_effects": ["owner_approved_external_write"],
+                    "required_proof": ["seller_outcome"],
+                }
+            },
+        },
+        "workflow": {
+            "id": "seller-flow",
+            "goal_id": "seller-conversion",
+            "require_semantics": True,
+            "workstreams": [{"key": "ops", "stages": ["contact", "closed"]}],
+            "stages": [
+                {
+                    "key": "contact",
+                    "actions": [{"key": "reply"}],
+                    "triggers": [{"type": "inbound_sms"}],
+                    "exit_criteria": [
+                        {"transition": "closed", "evidence_required": ["seller_outcome"]}
+                    ],
+                },
+                {"key": "closed", "actions": [{"key": "archive"}], "exit_criteria": []},
+            ],
+        },
+        "entities": [{"key": "seller", "type": "lead", "states": ["open", "closed"], "terminal_states": ["closed"]}],
+        "event_loops": [{"type": "inbound_sms", "entity": "seller", "terminal_states": ["closed"]}],
+        "approval_gates": [{"key": "owner_outreach_approval", "required_before": ["reply"]}],
+        "proof_requirements": ["seller_outcome"],
+        "side_effect_policy": {
+            "allowed": ["owner_approved_external_write"],
+            "forbidden": ["unapproved_external_write"],
+        },
+        "escalation_paths": [{"condition": "unclear seller commitment", "to": "owner"}],
+        "owner_summary": {"summary": "The board converts seller replies into closed outcomes with proof."},
+    }
+
+
+def _approve_tool_contract(kb, slug, contract, *, evidence_source="tool-test"):
+    kb.review_business_launch_contract(
+        slug,
+        contract=contract,
+        create_if_missing=True,
+    )
+    token = kb.issue_board_launch_approval_token(
+        slug,
+        contract=contract,
+        approved_by="owner",
+        approval_evidence={"source": evidence_source},
+        owner_authority_confirmed=True,
+    )["token"]
+    return kb.review_business_launch_contract(
+        slug,
+        contract=contract,
+        approve=True,
+        approval_token=token,
+    )
+
+
 def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_show({})
@@ -187,6 +556,374 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert d["task"]["status"] == "running"
     assert "worker_context" in d
     assert "runs" in d
+
+
+def test_business_launch_review_tool_stores_draft_and_intake_prompt(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+
+    out = kt._handle_business_launch_review({
+        "board": "seller-draft",
+        "rough_goal": "Launch seller lead conversion",
+        "create_if_missing": True,
+    })
+    payload = json.loads(out)
+
+    assert payload["ok"] is False
+    assert payload["launch_phase"] == "contract_review"
+    assert payload["questions"] == []
+    assert payload["board"]["contract_readiness"]["questions"] == []
+    assert payload["launch_intake"]["question_generation"]["required"] is True
+    assert payload["assistant_next_action"]["must_ask_owner_now"] is True
+    assert payload["assistant_next_action"]["mode"] == "model_generated_questions"
+    assert "Ask the questions now" in payload["assistant_next_action"]["instruction"]
+    assert kb.read_board_metadata("seller-draft")["launch_phase"] == "contract_review"
+
+
+def test_business_launch_review_tool_uses_universal_intake(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+
+    out = kt._handle_business_launch_review({
+        "board": "seller-draft",
+        "rough_goal": "Launch a land whole selling business",
+        "create_if_missing": True,
+    })
+    payload = json.loads(out)
+
+    assert payload["ok"] is False
+    assert payload["status"] == "needs_clarification"
+    assert payload["launch_phase"] == "contract_review"
+    assert payload["questions"] == []
+    assert payload["launch_intake"]["state"] == "clarifying"
+    assert payload["launch_intake"]["workflow_type"] == "agentic_workflow"
+    assert payload["launch_intake"]["question_generation"]["required"] is True
+    assert payload["launch_intake"]["question_generation"]["mode"] == "model_generated"
+    assert payload["assistant_next_action"]["required"] is True
+    assert payload["assistant_next_action"]["must_ask_owner_now"] is True
+    assert "do not say Hermes will ask later" in payload["assistant_next_action"]["instruction"]
+    assert payload["launch_intake"]["assumptions"]
+    contract = payload["contract"]
+    assert "runtime" not in contract
+    assert "workflow" not in contract
+    assert "land_wholesaling_v1" not in json.dumps(contract)
+    assert kb.read_board_metadata("seller-draft")["launch_phase"] == "contract_review"
+
+
+def test_business_launch_review_tool_recursively_assesses_intake_answers(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+
+    kt._handle_business_launch_review({
+        "board": "recruiting-draft",
+        "rough_goal": "I want to get more recruits for my life insurance business",
+        "create_if_missing": True,
+    })
+    out = kt._handle_business_launch_review({
+        "board": "recruiting-draft",
+        "intake_answers": "I just want more people, do whatever.",
+    })
+    payload = json.loads(out)
+
+    assert payload["ok"] is False
+    assert payload["launch_phase"] == "contract_review"
+    assert payload["launch_intake"]["state"] == "assessing_answers"
+    assert payload["launch_intake"]["answer_assessment"]["required"] is True
+    assert payload["assistant_next_action"]["type"] == "launch_intake_answer_assessment"
+    assert payload["assistant_next_action"]["must_assess_answers_now"] is True
+    assert "ask 1-4 sharper follow-up questions" in payload["assistant_next_action"]["instruction"]
+    assert "launch_intake.answer_quality.sufficient=true" in payload["assistant_next_action"]["instruction"]
+    assert "same intake_answers" in payload["assistant_next_action"]["instruction"]
+
+
+def test_business_launch_review_tool_rejects_duplicate_intake_answers(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+
+    kt._handle_business_launch_review({
+        "board": "duplicate-answer-tool",
+        "rough_goal": "I want to get more recruits for my life insurance business",
+        "create_if_missing": True,
+    })
+    kt._handle_business_launch_review({
+        "board": "duplicate-answer-tool",
+        "intake_answers": "I want 10 qualified recruiting conversations per month.",
+    })
+    out = kt._handle_business_launch_review({
+        "board": "duplicate-answer-tool",
+        "intake_answers": "I want 10 qualified recruiting conversations per month.",
+    })
+    payload = json.loads(out)
+
+    assert "intake_answers already submitted" in payload["error"]
+    intake = kb.read_board_metadata("duplicate-answer-tool")["business_contract"]["launch_intake"]
+    assert intake["clarification_round"] == 1
+
+
+def test_business_launch_review_tool_returns_owner_review_action_for_clear_answers(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+
+    kt._handle_business_launch_review({
+        "board": "clear-answer-tool",
+        "rough_goal": "Launch an ongoing referral partner workflow",
+        "create_if_missing": True,
+    })
+    out = kt._handle_business_launch_review({
+        "board": "clear-answer-tool",
+        "intake_answers": {
+            "success_criteria": "Book 5 qualified partner conversations per month.",
+            "good_partners": "CPAs, tax preparers, payroll firms, attorneys, and local coaches.",
+            "allowed_sources": "LinkedIn, Google Maps, public websites, and existing notes.",
+            "prohibited_actions": "No outreach, spending, pricing promises, or identity use without approval.",
+            "workflow": (
+                "Find prospects, qualify fit, draft messages, wait for owner approval, "
+                "send only after approved channel authorization, track replies, and close terminal outcomes."
+            ),
+            "proof_requirements": "Prospect list, fit rationale, message draft, approval status, reply log.",
+            "owner_escalation_rules": "Escalate complaints, unclear fit, legal claims, money, or negative replies.",
+        },
+    })
+    payload = json.loads(out)
+
+    assert payload["ok"] is True
+    assert payload["launch_phase"] == "contract_review"
+    assert payload["launch_intake"]["state"] == "ready_for_owner_review"
+    assert payload["launch_intake"]["answer_quality"]["sufficient"] is True
+    assert payload["assistant_next_action"]["type"] == "launch_contract_owner_review"
+    assert "Do not call intake_answers again" in payload["assistant_next_action"]["instruction"]
+
+
+def test_business_launch_review_tool_requires_approval_token(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+    contract = _tool_launch_contract()
+    kb.review_business_launch_contract(
+        "seller-active",
+        contract=contract,
+        create_if_missing=True,
+    )
+
+    out = kt._handle_business_launch_review({
+        "board": "seller-active",
+        "contract": contract,
+        "approve": True,
+    })
+
+    payload = json.loads(out)
+    assert payload.get("ok") is not True
+    assert "approval_token is required" in payload["error"]
+    assert kb.read_board_metadata("seller-active")["launch_phase"] == "contract_review"
+
+
+def test_business_launch_review_tool_activates_with_approval_token(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+    contract = _tool_launch_contract()
+    kb.review_business_launch_contract(
+        "seller-active",
+        contract=contract,
+        create_if_missing=True,
+    )
+    token = kb.issue_board_launch_approval_token(
+        "seller-active",
+        contract=contract,
+        approved_by="owner",
+        approval_evidence={"source": "tool-test"},
+        owner_authority_confirmed=True,
+    )["token"]
+
+    out = kt._handle_business_launch_review({
+        "board": "seller-active",
+        "contract": contract,
+        "approve": True,
+        "approval_token": token,
+    })
+
+    payload = json.loads(out)
+    encoded = json.dumps(payload)
+    assert payload["ok"] is True
+    assert payload["launch_phase"] == "active"
+    assert payload["approval"]["status"] == "approved"
+    assert payload["approval"]["approved_by"] == "owner"
+    assert "launch_approval_tokens" not in payload["board"]
+    assert "token_hash" not in encoded
+    assert "approval_token_id" not in encoded
+    assert "contract_hash" not in encoded
+    assert "\"evidence\"" not in encoded
+
+
+def test_board_launch_status_tool_sanitizes_approval_authority(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+    contract = _tool_launch_contract()
+    _approve_tool_contract(kb, "seller-active", contract)
+
+    out = kt._handle_board_launch_status({"board": "seller-active"})
+    payload = json.loads(out)
+    encoded = json.dumps(payload)
+
+    assert payload["ok"] is True
+    assert payload["launch"]["launch_approved"] is True
+    assert "launch_approval_tokens" not in payload["board"]
+    assert "token_hash" not in encoded
+    assert "approval_token_id" not in encoded
+    assert "\"evidence\"" not in encoded
+
+
+def test_contract_amendment_tools_version_contract(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+    _approve_tool_contract(kb, "seller-active", _tool_launch_contract())
+
+    proposed = json.loads(kt._handle_contract_amendment_propose({
+        "board": "seller-active",
+        "patch": {"objective": {"success": ["three signed agreements"]}},
+        "reason": "update success target",
+        "risk": "low",
+    }))
+    amendment_id = proposed["amendment"]["id"]
+    token = kb.issue_board_launch_approval_token(
+        "seller-active",
+        amendment_id=amendment_id,
+        approved_by="owner",
+        approval_evidence={"source": "tool-amendment-test"},
+        owner_authority_confirmed=True,
+    )["token"]
+    applied = json.loads(kt._handle_contract_amendment_apply({
+        "board": "seller-active",
+        "amendment_id": amendment_id,
+        "approval_token": token,
+    }))
+
+    assert proposed["ok"] is True
+    assert applied["ok"] is True
+    assert applied["contract_version"] == 2
+    encoded = json.dumps(applied)
+    assert applied["approval"]["status"] == "approved"
+    assert "launch_approval_tokens" not in encoded
+    assert "token_hash" not in encoded
+    assert "approval_token_id" not in encoded
+    assert "contract_hash" not in encoded
+    assert "\"evidence\"" not in encoded
+    assert kb.read_board_metadata("seller-active")["objective"]["success"] == [
+        "three signed agreements"
+    ]
+
+
+def test_contract_amendment_tool_apply_requires_approval_token(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+    _approve_tool_contract(kb, "seller-active", _tool_launch_contract())
+    proposed = json.loads(kt._handle_contract_amendment_propose({
+        "board": "seller-active",
+        "patch": {"objective": {"success": ["three signed agreements"]}},
+        "reason": "update success target",
+        "risk": "low",
+    }))
+
+    applied = json.loads(kt._handle_contract_amendment_apply({
+        "board": "seller-active",
+        "amendment_id": proposed["amendment"]["id"],
+    }))
+
+    assert applied.get("ok") is not True
+    assert "approval_token is required" in applied["error"]
+
+
+def test_contract_amendment_tool_rejects_force_apply(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    kb._INITIALIZED_PATHS.clear()
+    _approve_tool_contract(kb, "seller-active", _tool_launch_contract())
+    proposed = json.loads(kt._handle_contract_amendment_propose({
+        "board": "seller-active",
+        "patch": {
+            "workflow": {
+                "id": "incomplete",
+                "require_semantics": False,
+                "workstreams": [],
+                "stages": [{"key": "only", "actions": [], "exit_criteria": []}],
+            }
+        },
+        "reason": "simulate an incomplete amendment",
+        "risk": "medium",
+    }))
+
+    applied = json.loads(kt._handle_contract_amendment_apply({
+        "board": "seller-active",
+        "amendment_id": proposed["amendment"]["id"],
+        "force": True,
+    }))
+
+    assert applied.get("ok") is not True
+    assert "force apply is not available" in applied["error"]
+    assert kb.read_board_metadata("seller-active")["contract_version"] == 1
 
 
 def test_show_explicit_task_id(worker_env):

@@ -26,6 +26,14 @@ Usage:
 from typing import List, Dict, Any, Set, Optional
 
 
+_KANBAN_LAUNCH_INTAKE_TOOLS = [
+    "kanban_board_launch_status",
+    "kanban_business_launch_review",
+    "kanban_contract_amendment_propose",
+    "kanban_contract_amendment_apply",
+]
+
+
 # Shared tool list for CLI and all messaging platform toolsets.
 # Edit this once to update all platforms simultaneously.
 _HERMES_CORE_TOOLS = [
@@ -60,11 +68,12 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-    # Kanban multi-agent coordination — only in schema when the agent is
-    # spawned as a kanban worker (HERMES_KANBAN_TASK env set) or the current
-    # profile explicitly enables the kanban toolset. Gated via check_fn in
+    # Kanban multi-agent coordination — full execution tools are only in
+    # schema for dispatcher workers or profiles with the full kanban toolset.
+    # Launch-intake tools have their own narrower check gate. See
     # tools/kanban_tools.py.
     "kanban_show", "kanban_list", "kanban_funnel",
+    *_KANBAN_LAUNCH_INTAKE_TOOLS,
     "kanban_complete", "kanban_block", "kanban_watch", "kanban_trigger", "kanban_transition", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
@@ -260,11 +269,22 @@ TOOLSETS = {
             "orchestrators) list, unblock, and fan out tasks."
         ),
         "tools": [
-            "kanban_show", "kanban_list", "kanban_funnel", "kanban_complete", "kanban_block",
+            "kanban_show", "kanban_list", "kanban_funnel", *_KANBAN_LAUNCH_INTAKE_TOOLS,
+            "kanban_complete", "kanban_block",
             "kanban_watch", "kanban_trigger", "kanban_transition", "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock",
         ],
+        "includes": [],
+    },
+
+    "kanban_launch_intake": {
+        "description": (
+            "Narrow Kanban business launch intake — review launch contracts, "
+            "read launch status, and propose/apply contract amendments without "
+            "task creation or execution tools."
+        ),
+        "tools": _KANBAN_LAUNCH_INTAKE_TOOLS,
         "includes": [],
     },
 

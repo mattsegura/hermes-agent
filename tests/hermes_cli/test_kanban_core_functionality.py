@@ -932,6 +932,38 @@ def test_run_slash_every_verb_returns_sensible_output(kanban_home):
         assert out.strip() != "", f"empty output for `/kanban {cmd}`"
 
 
+def test_dispatch_json_reports_launch_blocked(kanban_home):
+    kb.write_board_metadata(kb.DEFAULT_BOARD, launch_phase="contract_review")
+    with kb.connect() as conn:
+        kb.create_task(conn, title="blocked launch work", assignee="worker", triage=True)
+
+    out = run_slash("dispatch --dry-run --json")
+    payload = json.loads(out)
+
+    assert payload["spawned"] == []
+    assert payload["launch_blocked"]
+    assert payload["launch_blocked"][0]["launch_phase"] == "contract_review"
+
+
+def test_diagnostics_reports_launch_blocked_contract_questions(kanban_home):
+    board = "seller-launch"
+    kb.review_business_launch_contract(
+        board,
+        rough_goal="Launch seller lead conversion",
+        create_if_missing=True,
+    )
+    kb.set_current_board(board)
+    with kb.connect(board=board) as conn:
+        kb.create_task(conn, title="blocked launch work", assignee="worker", triage=True)
+
+    out = run_slash("diagnostics")
+
+    assert "launch_blocked" in out
+    assert "missing=" in out
+    assert "questions=" in out
+    assert "triage_aux_unavailable" not in out
+
+
 # ---------------------------------------------------------------------------
 # Max-runtime enforcement (item 1 from the Multica audit)
 # ---------------------------------------------------------------------------
@@ -3777,6 +3809,112 @@ def test_gateway_dispatcher_config_allowlist_overrides_runtime_owner(
     asyncio.run(asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=3.0))
 
     assert dispatched == ["owned", "other"]
+
+
+def test_gateway_auto_decompose_skips_launch_blocked_boards(monkeypatch, tmp_path):
+    """Auto-decompose must not turn contract-review boards into executable work."""
+    import asyncio
+
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as _cfg_mod
+    import hermes_cli.kanban_db as _kb
+    import hermes_cli.kanban_decompose as _decomp
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    monkeypatch.setattr(GatewayRunner, "_active_profile_name", lambda self: "default")
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": True,
+                "auto_decompose_per_tick": 3,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        _kb,
+        "list_boards",
+        lambda include_archived=False: [
+            {
+                "slug": "active",
+                "runtime": {"dispatcher": {"profile": "default"}},
+            },
+            {
+                "slug": "review",
+                "runtime": {"dispatcher": {"profile": "default"}},
+            },
+        ],
+    )
+    monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: tmp_path / f"{board}.db")
+    monkeypatch.setattr(
+        _kb,
+        "board_dispatch_gate",
+        lambda board=None: {
+            "ok": board == "active",
+            "board": board,
+            "launch_phase": "active" if board == "active" else "contract_review",
+            "reason": None if board == "active" else "board launch_phase is contract_review",
+        },
+    )
+
+    class FakeConn:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(_kb, "connect", lambda board=None: FakeConn())
+    monkeypatch.setattr(
+        _kb,
+        "dispatch_once",
+        lambda conn, **kwargs: SimpleNamespace(
+            spawned=[],
+            reclaimed=0,
+            crashed=[],
+            timed_out=[],
+            promoted=0,
+            auto_blocked=[],
+        ),
+    )
+    monkeypatch.setattr(_kb, "has_spawnable_ready", lambda conn: False)
+    monkeypatch.setattr(_kb, "has_spawnable_review", lambda conn: False)
+
+    listed_boards: list[str | None] = []
+    decomposed: list[tuple[str | None, str]] = []
+
+    def _list_triage_ids(tenant=None):
+        board = os.environ.get("HERMES_KANBAN_BOARD")
+        listed_boards.append(board)
+        return [f"{board}-triage"]
+
+    def _decompose_task(task_id, author=None):
+        decomposed.append((os.environ.get("HERMES_KANBAN_BOARD"), task_id))
+        return SimpleNamespace(ok=True, fanout=False, child_ids=[], reason="")
+
+    monkeypatch.setattr(_decomp, "list_triage_ids", _list_triage_ids)
+    monkeypatch.setattr(_decomp, "decompose_task", _decompose_task)
+
+    calls = {"to_thread": 0}
+
+    async def _to_thread(fn, *args, **kwargs):
+        calls["to_thread"] += 1
+        result = fn(*args, **kwargs)
+        if calls["to_thread"] >= 4:
+            runner._running = False
+        return result
+
+    async def _sleep(_delay):
+        return None
+
+    monkeypatch.setattr("gateway.run.asyncio.to_thread", _to_thread)
+    monkeypatch.setattr("gateway.run.asyncio.sleep", _sleep)
+
+    asyncio.run(asyncio.wait_for(runner._kanban_dispatcher_watcher(), timeout=3.0))
+
+    assert listed_boards == ["active"]
+    assert decomposed == [("active", "active-triage")]
 
 
 @pytest.mark.parametrize("corrupt_exc", ["sqlite", "guard"])

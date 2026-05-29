@@ -169,6 +169,16 @@ def _profile_author() -> str:
     )
 
 
+def _launch_blocked_reason() -> Optional[str]:
+    gate = kb.board_dispatch_gate()
+    if gate.get("ok"):
+        return None
+    board = gate.get("board") or kb.DEFAULT_BOARD
+    phase = gate.get("launch_phase") or "unknown"
+    reason = gate.get("reason") or "board launch gate is closed"
+    return f"launch_blocked: {reason} (board={board}, launch_phase={phase})"
+
+
 def _load_config() -> dict:
     try:
         from hermes_cli.config import load_config
@@ -289,6 +299,10 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+
+    blocked = _launch_blocked_reason()
+    if blocked:
+        return DecomposeOutcome(task_id, False, blocked)
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)

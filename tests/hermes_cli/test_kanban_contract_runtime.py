@@ -72,6 +72,12 @@ def _contract(
         },
         "runtime": {
             "mode": "company",
+            "dispatcher": {"profile": "mock-ceo"},
+            "profiles": {
+                "ceo": "mock-ceo",
+                "optimizer": "mock-optimizer",
+                "worker": "mock-worker",
+            },
             "require_worker_envelopes": True,
             "require_provider_policy": True,
             "provider_policy": (
@@ -87,7 +93,7 @@ def _contract(
             "id": "contract-flow",
             "goal_id": "mock-goal",
             "require_semantics": True,
-            "workstreams": [{"key": "ops", "stages": ["execute"]}],
+            "workstreams": [{"key": "ops", "stages": ["execute", "done"]}],
             "stages": [
                 {
                     "key": "execute",
@@ -100,14 +106,73 @@ def _contract(
                             "side_effect_class": side_effect_class,
                         }
                     ],
+                    "triggers": [{"type": "timer", "key": "contract_tick"}],
+                    "exit_criteria": [
+                        {"transition": "done", "evidence_required": [required_proof]}
+                    ],
+                },
+                {
+                    "key": "done",
+                    "actions": [{"key": "archive"}],
+                    "exit_criteria": [],
                 }
             ],
+        },
+        "entities": [
+            {
+                "key": "mock_work_item",
+                "type": "work_item",
+                "states": ["open", "done"],
+                "terminal_states": ["done"],
+            }
+        ],
+        "event_loops": [
+            {"type": "timer", "entity": "mock_work_item", "terminal_states": ["done"]}
+        ],
+        "approval_gates": [
+            {"key": "side_effect_approval", "required_before": ["research"]}
+        ],
+        "proof_requirements": [required_proof],
+        "side_effect_policy": {
+            "allowed": [side_effect_class],
+            "forbidden": ["undeclared_side_effect"],
+        },
+        "escalation_paths": [
+            {"condition": "contract proof or side-effect authority is unclear", "to": "mock-ceo"}
+        ],
+        "owner_summary": {
+            "summary": "The board runs mock contracted work and advances only with declared proof."
         },
     }
 
 
+def _approve_contract_board(slug, contract):
+    kb.review_business_launch_contract(
+        slug,
+        contract=contract,
+        create_if_missing=True,
+    )
+    token = kb.issue_board_launch_approval_token(
+        slug,
+        contract=contract,
+        approved_by="test-owner",
+        approval_evidence={"source": "contract-runtime-test"},
+        owner_authority_confirmed=True,
+    )["token"]
+    result = kb.review_business_launch_contract(
+        slug,
+        contract=contract,
+        approve=True,
+        author="test-owner",
+        approval_token=token,
+    )
+    assert result["ok"] is True
+    assert result["launch_phase"] == "active"
+    assert result["launch_review_id"]
+
+
 def _create_contract_board(contract):
-    kb.create_board("serious", runtime="company", contract=contract)
+    _approve_contract_board("serious", contract)
     with kb.connect(board="serious") as conn:
         tid = kb.create_task(
             conn,
@@ -127,7 +192,7 @@ def test_dispatch_blocks_missing_capability_and_provider_policy(fresh_home):
         _contract(
             worker_capabilities=["other_capability"],
             worker_toolsets=["kanban"],
-            provider_policy={},
+            provider_policy={"other_capability": {"provider": "fixture"}},
         )
     )
 
@@ -280,8 +345,10 @@ def test_worker_envelope_required_proof_is_merged(fresh_home):
 
 def test_missing_worker_envelope_blocks_toolset_only_contract(fresh_home):
     contract = _contract(required_capability="")
-    contract["runtime"]["provider_policy"] = {}
-    contract["runtime"]["worker_envelopes"] = {}
+    contract["runtime"]["provider_policy"] = {"kanban_dispatch": {"provider": "fixture"}}
+    contract["runtime"]["worker_envelopes"] = {
+        "other-worker": {"toolsets": ["kanban"], "capabilities": []}
+    }
     action = contract["workflow"]["stages"][0]["actions"][0]
     action["required_capabilities"] = []
     action["required_toolsets"] = ["kanban"]
@@ -313,7 +380,7 @@ def test_provider_policy_allowed_for_denies_wrong_worker_and_is_not_route(fresh_
 
 def test_task_local_contract_cannot_weaken_board_side_effect_policy(fresh_home):
     contract = _contract(side_effect_class="external_write", allowed_side_effects=["none"])
-    kb.create_board("serious", contract=contract)
+    _approve_contract_board("serious", contract)
     with kb.connect(board="serious") as conn:
         tid = kb.create_task(
             conn,
@@ -478,7 +545,7 @@ def test_windows_connection_wrapper_preserves_board_identity(fresh_home, monkeyp
 
 
 def test_create_task_uses_connected_board_contract_when_board_omitted(fresh_home):
-    kb.create_board("serious", contract=_contract())
+    _approve_contract_board("serious", _contract())
     with kb.connect(board="serious") as conn:
         with pytest.raises(ValueError, match="requires workstream_id"):
             kb.create_task(conn, title="unstructured bypass", assignee="mock-worker")
@@ -495,6 +562,36 @@ def test_create_task_uses_connected_board_contract_when_board_omitted(fresh_home
         verdict = kb.evaluate_dispatch_eligibility(conn, tid)
         assert verdict["contract"]["board"] == "serious"
         assert verdict["contract"]["required_proof"] == ["mock_report"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_code"),
+    [
+        ("action_key", None, "missing_semantic_action"),
+        ("stage_key", "unknown", "unknown_stage"),
+    ],
+)
+def test_dispatch_blocks_strict_workflow_semantic_drift(
+    fresh_home, field, value, expected_code,
+):
+    tid = _create_contract_board(_contract())
+    with kb.connect(board="serious") as conn:
+        with kb.write_txn(conn):
+            conn.execute(f"UPDATE tasks SET {field} = ? WHERE id = ?", (value, tid))
+
+        verdict = kb.evaluate_dispatch_eligibility(conn, tid)
+        assert verdict["ok"] is False
+        assert expected_code in {b["code"] for b in verdict["blockers"]}
+
+        dry = kb.dispatch_once(conn, dry_run=True, board="serious")
+        assert dry.contract_blocked == [(tid, [expected_code])]
+
+        live = kb.dispatch_once(conn, dry_run=False, board="serious")
+        assert live.contract_blocked == [(tid, [expected_code])]
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert "dispatch_contract_blocked" in [event.kind for event in kb.list_events(conn, tid)]
 
 
 def test_non_object_board_metadata_fails_closed(fresh_home):
@@ -551,4 +648,3 @@ def test_malformed_worker_envelope_dict_fields_fail_closed(fresh_home):
         codes = {b["code"] for b in verdict["blockers"]}
         assert verdict["ok"] is False
         assert {"missing_capabilities", "missing_toolsets", "side_effect_not_allowed"} <= codes
-

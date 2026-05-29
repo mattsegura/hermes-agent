@@ -1,0 +1,14 @@
+{
+  "domain": "insurance_recruiting",
+  "rough_goal": "Recruit more licensed agents for my life-insurance agency",
+  "golden_contract_file": "insurance_recruiting.contract.json",
+  "answers": {
+    "success_criteria": "Success is a recruiting pipeline that sources, screens, and license-verifies candidates and books interviews. I want at least 15 qualified licensed candidates and 4 owner-approved interview bookings per month, and every advancing candidate must have a verified active state insurance license confirmed against NIPR or the state DOI.",
+    "subject_scope": "The work is about prospective insurance agents (candidates), their state licenses, the interview pipeline, and onboarding. Candidates are screened on licensing, experience, and fit.",
+    "allowed_context": "Hermes may use LinkedIn Recruiter, Indeed, the agency CRM, the NIPR registry, and the state DOI lookup. Outbound goes only through the approved Twilio business line. Personal SMS, iMessage, and WhatsApp personal are forbidden for candidate outreach.",
+    "approval_boundaries": "Hermes may search, enrich, screen, and verify licenses autonomously, and draft outreach, but sending any outbound SMS, email, or call and booking an interview is owner-approval-gated and compliance-reviewed. It may never promise income, leads, or contract terms without owner-approved compliant language.",
+    "workflow_path": "Source candidates, screen for experience and fit, verify the active license against NIPR or state DOI, draft compliant outreach, send only after approval, book the interview, and hand off to onboarding. Reject candidates with no active license or who stop responding.",
+    "proof_requirements": "Each stage needs structured proof: a sourced-candidate list, a screening record, a license-verification record, a compliant-outreach draft, an interview-booking record, and an onboarding-handoff record. No candidate advances from prose.",
+    "stop_and_escalation_rules": "Stop and escalate to me when a license cannot be verified, when a candidate asks about income or contract terms, when a compliance flag is raised on outreach language, or before any outbound message."
+  }
+}

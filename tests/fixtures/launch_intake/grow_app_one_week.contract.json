@@ -1,0 +1,1027 @@
+{
+  "objective": {
+    "statement": "Grow the iOS and Android habit-tracking mobile app for busy professionals from 200 to 600 active paying subscribers and from $4,000 to $12,000 MRR within 7 days by rapidly improving activation, trial starts, trial-to-paid conversion, ASO, lifecycle messaging drafts, approved paid acquisition, and approved pricing or offer experiments.",
+    "success": [
+      "Active paying subscribers increase from 200 to at least 600 by the end of day 7, verified in Stripe.",
+      "MRR increases from $4,000 to at least $12,000 by the end of day 7, verified in Stripe.",
+      "Activation rate improves from approximately 30% to at least 40% of new installs within the 7-day launch window, verified in Mixpanel.",
+      "Paid trial start rate improves from approximately 4% to at least 8% of activated users, verified in Mixpanel.",
+      "Trial-to-paid conversion rate is maintained at or above 50% while scaling trial starts, verified through Mixpanel and Stripe cohort reporting.",
+      "At least one owner-approved ASO, lifecycle email, paid campaign, or pricing/offer experiment produces a measurable lift against its primary metric with before/after evidence.",
+      "Daily summary and Mixpanel dashboard evidence are delivered every day during the 7-day sprint."
+    ],
+    "failure": [
+      "Active paying subscribers remain below 600 at the end of day 7.",
+      "MRR remains below $12,000 at the end of day 7.",
+      "Any paid ad spend exceeds $50/day without owner approval or violates the $2,000/month hard cap.",
+      "Any mass email, live pricing change, discount, or direct user message is sent without owner approval.",
+      "Any campaign, ASO copy, lifecycle message, or ad creative makes health claims or targets under-18 users.",
+      "Discounting exceeds 30% on any offer, promotion, campaign, lifecycle message, or pricing test.",
+      "Daily proof is missing for any sprint day, including Mixpanel dashboard evidence, before/after metrics, and campaign or experiment logs."
+    ],
+    "constraints": [
+      "Time horizon is exactly 7 days; speed matters more than caution within the stated approval limits.",
+      "No health claims may be made in any App Store, Play Store, lifecycle, ad, social, Intercom, or in-app copy.",
+      "Never target under-18 users in paid ads, organic content, messaging, segmentation, or experimentation.",
+      "Ad spend is capped at $2,000/month total and any ad spend above $50/day requires owner approval before launch.",
+      "No discount may exceed 30%.",
+      "Owner approval is required before any mass email in Customer.io.",
+      "Owner approval is required before any direct user messaging through Intercom, Customer.io, or in-app messaging.",
+      "Owner approval is required before any live pricing change.",
+      "The assistant may draft ASO copy, analyze Mixpanel funnels, draft lifecycle emails, and propose A/B and pricing experiments without external side effects.",
+      "External side effects must stay approval-gated unless explicitly allowed by the owner."
+    ]
+  },
+  "runtime": {
+    "mode": "company",
+    "dispatcher": {
+      "profile": "personal-assistant"
+    },
+    "profiles": {
+      "ceo": "Owns the 7-day subscriber and MRR outcome, prioritizes speed, decides which growth bets to propose for owner approval, and enforces all approval gates and hard stops.",
+      "optimizer": "Continuously reviews Mixpanel, Stripe, campaign, and lifecycle evidence; adjusts safe tunables within approved bounds to maximize activation, trial starts, and trial-to-paid conversion.",
+      "worker": "Executes analysis, drafts assets, prepares experiment plans, assembles proof, and queues approval-ready changes for App Store, Play Store, Customer.io, Meta, Google Ads, Instagram, TikTok, Intercom, and Stripe."
+    },
+    "require_provider_policy": true,
+    "require_worker_envelopes": true,
+    "provider_policy": {
+      "systems": {
+        "Mixpanel": {
+          "use": "Read-only funnel, cohort, activation, trial-start, and conversion analysis; dashboard screenshots or links for proof.",
+          "side_effect_level": "read_only",
+          "approval_required": false
+        },
+        "Stripe": {
+          "use": "Read-only verification of active paying subscribers, MRR, trials, conversions, churn, and pricing state unless owner approves pricing changes.",
+          "side_effect_level": "read_only_by_default",
+          "approval_required_for": [
+            "live pricing changes",
+            "discounts",
+            "coupon creation",
+            "subscription plan changes"
+          ]
+        },
+        "Customer.io": {
+          "use": "Draft lifecycle emails and segmentation plans; queue but do not send mass emails without owner approval.",
+          "side_effect_level": "approval_gated",
+          "approval_required_for": [
+            "mass email send",
+            "new live journey",
+            "direct user messaging",
+            "segment activation"
+          ]
+        },
+        "Meta Ads": {
+          "use": "Draft and configure campaigns, audiences, budget pacing, and creatives for busy professionals; launching or spending above limits is gated.",
+          "side_effect_level": "approval_gated",
+          "approval_required_for": [
+            "ad spend above $50/day",
+            "any campaign that could exceed $2,000/month cap",
+            "new live campaign launch if not pre-approved"
+          ]
+        },
+        "Google Ads": {
+          "use": "Draft and configure search/app campaigns, keywords, negative targeting, budgets, and creatives; launching or spending above limits is gated.",
+          "side_effect_level": "approval_gated",
+          "approval_required_for": [
+            "ad spend above $50/day",
+            "any campaign that could exceed $2,000/month cap",
+            "new live campaign launch if not pre-approved"
+          ]
+        },
+        "App Store": {
+          "use": "Draft ASO copy, keyword hypotheses, screenshots messaging, and conversion experiment plans for the iOS app.",
+          "side_effect_level": "approval_gated",
+          "approval_required_for": [
+            "publishing metadata changes",
+            "live store listing changes",
+            "claims about health outcomes"
+          ]
+        },
+        "Play Store": {
+          "use": "Draft ASO copy, keyword hypotheses, screenshots messaging, and conversion experiment plans for the Android app.",
+          "side_effect_level": "approval_gated",
+          "approval_required_for": [
+            "publishing metadata changes",
+            "live store listing changes",
+            "claims about health outcomes"
+          ]
+        },
+        "Instagram": {
+          "use": "Draft organic content ideas and captions for busy professionals focused on streaks, smart nudges, and weekly AI coaching.",
+          "side_effect_level": "approval_gated",
+          "approval_required_for": [
+            "posting",
+            "commenting",
+            "direct messaging users"
+          ]
+        },
+        "TikTok": {
+          "use": "Draft organic short-form scripts and content hooks for busy professionals focused on habit consistency and productivity.",
+          "side_effect_level": "approval_gated",
+          "approval_required_for": [
+            "posting",
+            "commenting",
+            "direct messaging users"
+          ]
+        },
+        "Intercom": {
+          "use": "Analyze support themes if available and draft targeted messages; no direct user messaging without approval.",
+          "side_effect_level": "approval_gated",
+          "approval_required_for": [
+            "direct user messaging",
+            "broadcasts",
+            "automated outbound messages"
+          ]
+        }
+      },
+      "global_rules": [
+        "Use read-only access whenever possible.",
+        "Do not target under-18s in any provider.",
+        "Do not make health claims in any provider.",
+        "Do not exceed 30% discount.",
+        "Do not exceed $50/day ad spend without owner approval.",
+        "Do not exceed $2,000/month ad spend under any circumstance.",
+        "Keep audit logs of all drafts, proposed changes, approvals, launches, and measured outcomes."
+      ]
+    },
+    "worker_envelopes": {
+      "growth_analyst": {
+        "capabilities": [
+          "Analyze Mixpanel activation, trial-start, and trial-to-paid funnels.",
+          "Compare pre-sprint baselines to daily changes.",
+          "Segment users by install source, platform, activation status, trial status, and conversion status.",
+          "Identify the largest drop-offs at activation and trial-to-paid."
+        ],
+        "toolsets": [
+          "Mixpanel",
+          "Stripe",
+          "campaign logs",
+          "daily summary template"
+        ],
+        "allowed_side_effects": [
+          "Read Mixpanel data.",
+          "Read Stripe subscription and MRR data.",
+          "Create internal reports, dashboards, and recommendations."
+        ],
+        "required_proof": [
+          "Mixpanel dashboard link or screenshot",
+          "Stripe subscriber and MRR snapshot",
+          "before/after funnel table",
+          "segment-level finding with sample size and date range"
+        ]
+      },
+      "lifecycle_copywriter": {
+        "capabilities": [
+          "Draft Customer.io lifecycle emails for activation, trial-start nudges, trial conversion, and weekly AI coaching value communication.",
+          "Draft Intercom or in-app message copy for owner review.",
+          "Draft subject lines, preview text, calls to action, and segmentation rules."
+        ],
+        "toolsets": [
+          "Customer.io",
+          "Intercom",
+          "app positioning notes",
+          "Mixpanel segment insights"
+        ],
+        "allowed_side_effects": [
+          "Create draft copy.",
+          "Create internal campaign briefs.",
+          "Prepare send plans for approval."
+        ],
+        "required_proof": [
+          "message objective",
+          "target segment",
+          "draft copy",
+          "CTA",
+          "approval status",
+          "expected metric impact",
+          "compliance check for no health claims, no under-18 targeting, and discount cap"
+        ]
+      },
+      "aso_specialist": {
+        "capabilities": [
+          "Draft App Store and Play Store listing copy improvements.",
+          "Propose keyword tests for busy professionals, habit streaks, smart nudges, and weekly AI coaching.",
+          "Prepare store conversion experiment plans."
+        ],
+        "toolsets": [
+          "App Store",
+          "Play Store",
+          "ASO draft documents",
+          "organic install metrics"
+        ],
+        "allowed_side_effects": [
+          "Draft metadata.",
+          "Draft experiment plan.",
+          "Prepare owner approval packet."
+        ],
+        "required_proof": [
+          "current listing baseline",
+          "proposed title/subtitle/short description/long description changes",
+          "keyword rationale",
+          "compliance review",
+          "expected impact on install-to-activation or store conversion"
+        ]
+      },
+      "paid_acquisition_manager": {
+        "capabilities": [
+          "Draft Meta and Google Ads campaign structures.",
+          "Propose budget pacing within the $50/day approval-free ceiling and $2,000/month hard cap.",
+          "Draft creatives and copy for busy professionals.",
+          "Monitor CAC, trial-start rate, and paid subscriber conversion for approved campaigns."
+        ],
+        "toolsets": [
+          "Meta Ads",
+          "Google Ads",
+          "Mixpanel",
+          "Stripe",
+          "campaign logs"
+        ],
+        "allowed_side_effects": [
+          "Draft campaigns.",
+          "Prepare budget plans.",
+          "Analyze approved campaign performance.",
+          "Pause or recommend pausing campaigns that breach stop conditions if access and approval policy allow non-expansive risk reduction."
+        ],
+        "required_proof": [
+          "campaign name",
+          "audience definition excluding under-18s",
+          "daily budget",
+          "monthly cap projection",
+          "creative copy",
+          "approval status",
+          "spend log",
+          "CAC and subscriber outcome"
+        ]
+      },
+      "pricing_experiment_planner": {
+        "capabilities": [
+          "Propose pricing, trial, and discount experiments designed to increase trial starts and MRR quickly.",
+          "Model MRR impact and risk for discounts up to 30%.",
+          "Prepare Stripe implementation instructions for owner approval."
+        ],
+        "toolsets": [
+          "Stripe",
+          "Mixpanel",
+          "pricing model spreadsheet",
+          "experiment brief"
+        ],
+        "allowed_side_effects": [
+          "Create pricing recommendations.",
+          "Model scenarios.",
+          "Prepare approval request."
+        ],
+        "required_proof": [
+          "current price baseline",
+          "proposed offer",
+          "discount percentage not exceeding 30%",
+          "MRR impact estimate",
+          "owner approval status before any live pricing change",
+          "post-test Stripe and Mixpanel results"
+        ]
+      }
+    }
+  },
+  "workflow": {
+    "id": "habit_app_7_day_paid_growth_sprint",
+    "goal_id": "grow_paid_subscribers_200_to_600_and_mrr_4k_to_12k_in_7_days",
+    "require_semantics": true,
+    "workstreams": [
+      {
+        "key": "funnel_diagnostics",
+        "purpose": "Find and prioritize the fastest fixes for activation and trial-start drop-offs using Mixpanel and Stripe."
+      },
+      {
+        "key": "activation_and_trial_lifecycle",
+        "purpose": "Draft Customer.io and Intercom messaging to move activated and unactivated users toward paid trial and paid conversion."
+      },
+      {
+        "key": "aso_conversion",
+        "purpose": "Improve App Store and Play Store acquisition quality and install intent with draft ASO changes."
+      },
+      {
+        "key": "paid_acquisition",
+        "purpose": "Use capped Meta and Google Ads experiments to add qualified busy professional users without breaching spend limits."
+      },
+      {
+        "key": "pricing_and_offer",
+        "purpose": "Propose owner-approved trial, pricing, and discount experiments that can lift paid conversion and MRR within 7 days."
+      },
+      {
+        "key": "daily_proof_and_control",
+        "purpose": "Maintain daily summary, Mixpanel dashboard, campaign logs, approval logs, and hard-stop monitoring."
+      }
+    ],
+    "stages": [
+      {
+        "key": "day_0_baseline_and_instrumentation_check",
+        "actions": [
+          "Capture baseline active paying subscribers from Stripe: current target baseline is 200.",
+          "Capture baseline MRR from Stripe: current target baseline is $4,000.",
+          "Capture baseline funnel in Mixpanel: installs, activation rate around 30%, paid trial start rate around 4%, and trial-to-paid conversion around 50%.",
+          "Create or verify daily Mixpanel dashboard for installs, activation, trial starts, paid conversions, active paid subscribers, MRR proxy, and source/platform cohorts.",
+          "Create hard-stop tracker for $2,000/month ad cap, $50/day approval threshold, 30% discount limit, no health claims, and no under-18 targeting."
+        ],
+        "exit_criteria": {
+          "criteria": [
+            "Baseline subscriber, MRR, and funnel metrics are recorded.",
+            "Daily dashboard is available for owner review.",
+            "Approval gates and hard stops are visible to all workers."
+          ],
+          "evidence_required": [
+            "Stripe snapshot showing active paying subscribers and MRR",
+            "Mixpanel dashboard link or screenshot",
+            "baseline funnel table",
+            "hard-stop checklist"
+          ]
+        }
+      },
+      {
+        "key": "day_1_prioritize_growth_bets",
+        "actions": [
+          "Analyze Mixpanel activation drop-off by platform, source, first session behavior, and exposure to streaks, smart nudges, and weekly AI coaching.",
+          "Analyze trial-start drop-off and trial-to-paid cohorts by source and platform.",
+          "Identify the top 3 fastest opportunities likely to move activation, trial starts, or MRR within 7 days.",
+          "Draft a ranked sprint plan covering ASO copy, lifecycle emails, paid ads, and pricing or offer experiments.",
+          "Prepare owner approval requests for any mass email, direct user messaging, paid spend above $50/day, or live pricing change."
+        ],
+        "exit_criteria": {
+          "criteria": [
+            "Top growth bets are ranked by expected speed, impact, effort, and approval need.",
+            "No live external side effect is scheduled without approval.",
+            "Each recommended bet has a metric target and stop condition."
+          ],
+          "evidence_required": [
+            "prioritized growth bet table",
+            "Mixpanel segment analysis",
+            "Stripe cohort analysis where relevant",
+            "approval request packet for gated actions"
+          ]
+        }
+      },
+      {
+        "key": "days_1_to_2_asset_drafting_and_approval_queue",
+        "actions": [
+          "Draft App Store and Play Store ASO copy emphasizing habit streaks, smart nudges, weekly AI coaching, and busy professional use cases without health claims.",
+          "Draft Customer.io activation emails for users who installed but did not activate.",
+          "Draft Customer.io trial-start nudges for activated users who have not started paid trial.",
+          "Draft trial-to-paid conversion emails emphasizing consistency, streak protection, smart reminders, and weekly AI coaching value.",
+          "Draft Meta and Google Ads campaign copy and audiences excluding under-18s.",
+          "Draft pricing or discount experiment proposals with discounts at or below 30%.",
+          "Submit approval packets for mass email, direct messaging, ad spend above $50/day, live pricing changes, and store listing publication."
+        ],
+        "exit_criteria": {
+          "criteria": [
+            "All draft assets are complete and compliance-checked.",
+            "Every side-effecting action is either held as draft or has explicit owner approval.",
+            "No draft contains health claims, under-18 targeting, or a discount over 30%."
+          ],
+          "evidence_required": [
+            "ASO draft packet",
+            "Customer.io email drafts",
+            "Intercom or in-app message drafts if proposed",
+            "Meta and Google Ads draft campaign briefs",
+            "pricing experiment brief",
+            "compliance checklist",
+            "owner approval log"
+          ]
+        }
+      },
+      {
+        "key": "days_2_to_5_launch_approved_experiments",
+        "actions": [
+          "Launch only owner-approved Customer.io mass emails, Intercom messages, store listing changes, pricing changes, or paid campaigns.",
+          "For paid campaigns, enforce daily spend at or below approved levels and never above the $2,000/month hard cap.",
+          "Monitor Mixpanel activation, trial starts, and trial-to-paid movement by campaign, source, platform, and cohort.",
+          "Monitor Stripe active paying subscribers and MRR at least daily.",
+          "Adjust safe tunables within declared bounds, including follow-up timing, nudge count, trial-start score threshold, budget pacing within approved caps, and experiment sample allocation.",
+          "Stop or escalate any experiment that approaches a hard stop or produces materially negative conversion signals."
+        ],
+        "exit_criteria": {
+          "criteria": [
+            "Approved experiments are live or documented as blocked pending approval.",
+            "Daily metrics show whether each experiment is improving, neutral, or harmful.",
+            "Spend, discounting, claims, and targeting remain within owner boundaries."
+          ],
+          "evidence_required": [
+            "launch log with timestamps",
+            "approval records for each live action",
+            "campaign spend log",
+            "Customer.io send log if emails are approved and sent",
+            "Mixpanel before/after dashboard",
+            "Stripe daily subscriber and MRR snapshot",
+            "stop/escalation log"
+          ]
+        }
+      },
+      {
+        "key": "days_5_to_6_double_down_or_cut",
+        "actions": [
+          "Compare each live experiment against baseline and its primary metric: activation rate, trial-start rate, trial-to-paid conversion, paid subscribers, MRR, CAC, or revenue per user.",
+          "Scale winning paid acquisition only within owner-approved daily spend and the $2,000/month cap.",
+          "Prepare urgent owner approval request if scaling requires more than $50/day ad spend.",
+          "Cut or pause underperforming campaigns, messages, or offers where allowed as a risk-reducing action.",
+          "Draft final 48-hour push assets for the highest-performing lifecycle, ASO, paid, or pricing angle."
+        ],
+        "exit_criteria": {
+          "criteria": [
+            "Winners and losers are identified with evidence.",
+            "Recommended scale-up actions stay inside approval gates.",
+            "Final 48-hour plan is ready and approval requests are submitted where needed."
+          ],
+          "evidence_required": [
+            "experiment scorecard",
+            "before/after metric comparison",
+            "CAC and spend analysis",
+            "Stripe MRR and subscriber trend",
+            "owner approval request for any gated scale-up"
+          ]
+        }
+      },
+      {
+        "key": "day_7_final_push_and_closeout",
+        "actions": [
+          "Execute only approved final-day actions designed to maximize paid subscriber and MRR lift.",
+          "Verify active paying subscribers and MRR in Stripe.",
+          "Verify final activation, trial-start, and trial-to-paid metrics in Mixpanel.",
+          "Compile final proof packet with before/after metrics, campaign logs, lifecycle send logs, approval logs, and results.",
+          "Deliver final owner summary with target attainment, failed bets, winning bets, and recommended next steps."
+        ],
+        "exit_criteria": {
+          "criteria": [
+            "Final subscriber and MRR outcomes are verified.",
+            "All proof artifacts are complete.",
+            "Any missed target is explained by metric bottleneck and experiment outcome."
+          ],
+          "evidence_required": [
+            "final Stripe snapshot",
+            "final Mixpanel dashboard",
+            "before/after funnel table",
+            "campaign and lifecycle logs",
+            "approval log",
+            "final 7-day summary"
+          ]
+        }
+      }
+    ]
+  },
+  "entities": [
+    {
+      "key": "install",
+      "type": "mobile_app_install",
+      "states": [
+        "new_install",
+        "opened_app",
+        "activated",
+        "dormant",
+        "trial_started",
+        "paid_subscriber"
+      ],
+      "terminal_states": [
+        "paid_subscriber",
+        "uninstalled_or_inactive_after_sprint"
+      ]
+    },
+    {
+      "key": "user_cohort",
+      "type": "mixpanel_cohort",
+      "states": [
+        "baseline_measured",
+        "segmented_by_source",
+        "targeted_in_draft",
+        "approved_for_message",
+        "messaged",
+        "converted",
+        "non_converter"
+      ],
+      "terminal_states": [
+        "converted",
+        "non_converter",
+        "blocked_by_no_approval"
+      ]
+    },
+    {
+      "key": "lifecycle_campaign",
+      "type": "customer_io_or_intercom_campaign",
+      "states": [
+        "idea",
+        "drafted",
+        "compliance_checked",
+        "approval_requested",
+        "approved",
+        "launched",
+        "measured",
+        "stopped"
+      ],
+      "terminal_states": [
+        "measured",
+        "stopped",
+        "rejected_by_owner"
+      ]
+    },
+    {
+      "key": "aso_update",
+      "type": "app_store_or_play_store_listing_change",
+      "states": [
+        "hypothesis",
+        "drafted",
+        "compliance_checked",
+        "approval_requested",
+        "approved",
+        "published",
+        "measured"
+      ],
+      "terminal_states": [
+        "measured",
+        "rejected_by_owner",
+        "not_published"
+      ]
+    },
+    {
+      "key": "paid_campaign",
+      "type": "meta_or_google_ads_campaign",
+      "states": [
+        "drafted",
+        "compliance_checked",
+        "budget_checked",
+        "approval_requested",
+        "approved",
+        "live",
+        "scaled",
+        "paused",
+        "measured"
+      ],
+      "terminal_states": [
+        "measured",
+        "paused",
+        "rejected_by_owner",
+        "stopped_by_spend_cap"
+      ]
+    },
+    {
+      "key": "pricing_offer",
+      "type": "stripe_pricing_or_discount_experiment",
+      "states": [
+        "modeled",
+        "discount_checked",
+        "approval_requested",
+        "approved",
+        "implemented",
+        "measured",
+        "rolled_back"
+      ],
+      "terminal_states": [
+        "measured",
+        "rolled_back",
+        "rejected_by_owner",
+        "blocked_by_discount_cap"
+      ]
+    },
+    {
+      "key": "daily_proof_packet",
+      "type": "operating_evidence",
+      "states": [
+        "opened",
+        "metrics_collected",
+        "logs_attached",
+        "summary_written",
+        "delivered_to_owner"
+      ],
+      "terminal_states": [
+        "delivered_to_owner"
+      ]
+    }
+  ],
+  "event_loops": [
+    {
+      "type": "daily_metric_review",
+      "entity": "daily_proof_packet",
+      "triggers": [
+        "Every sprint day",
+        "After any approved campaign, message, store update, or pricing experiment launches",
+        "When Mixpanel or Stripe shows a material change in activation, trial starts, paid subscribers, or MRR"
+      ],
+      "terminal_states": [
+        "delivered_to_owner"
+      ],
+      "stop_conditions": [
+        "Day 7 final summary delivered",
+        "Required Mixpanel or Stripe evidence unavailable and escalated to owner",
+        "Owner pauses sprint"
+      ]
+    },
+    {
+      "type": "funnel_optimization_loop",
+      "entity": "user_cohort",
+      "triggers": [
+        "Activation rate remains near or below 30%",
+        "Paid trial start rate remains near or below 4%",
+        "Trial-to-paid conversion drops below 50%",
+        "A source or platform cohort materially outperforms the baseline"
+      ],
+      "terminal_states": [
+        "converted",
+        "non_converter",
+        "blocked_by_no_approval"
+      ],
+      "stop_conditions": [
+        "Target of 600 active paying subscribers and $12,000 MRR is reached",
+        "Day 7 ends",
+        "Next action requires owner approval and approval is not granted",
+        "Proposed action would violate no health claims, no under-18 targeting, ad spend cap, or discount cap"
+      ]
+    },
+    {
+      "type": "campaign_monitoring_loop",
+      "entity": "paid_campaign",
+      "triggers": [
+        "Approved Meta or Google Ads campaign goes live",
+        "Daily spend approaches approved daily budget",
+        "Monthly projected spend approaches $2,000",
+        "CAC, trial-start rate, or paid conversion materially underperforms"
+      ],
+      "terminal_states": [
+        "measured",
+        "paused",
+        "stopped_by_spend_cap"
+      ],
+      "stop_conditions": [
+        "Spend would exceed approved daily budget",
+        "Spend would exceed $2,000/month",
+        "Audience includes or could target under-18s",
+        "Creative contains health claims",
+        "Owner rejects or withdraws approval"
+      ]
+    },
+    {
+      "type": "lifecycle_experiment_loop",
+      "entity": "lifecycle_campaign",
+      "triggers": [
+        "Owner approves Customer.io mass email",
+        "Owner approves Intercom or direct user messaging",
+        "New Mixpanel cohort is identified for activation, trial-start, or trial conversion"
+      ],
+      "terminal_states": [
+        "measured",
+        "stopped",
+        "rejected_by_owner"
+      ],
+      "stop_conditions": [
+        "Message send lacks owner approval",
+        "Message includes health claims",
+        "Message targets under-18s",
+        "Discount in message exceeds 30%",
+        "Trial-to-paid conversion drops materially below baseline"
+      ]
+    },
+    {
+      "type": "pricing_offer_control_loop",
+      "entity": "pricing_offer",
+      "triggers": [
+        "Pricing or discount experiment is proposed",
+        "Owner approves a live pricing or discount change",
+        "Stripe shows MRR or conversion impact after implementation"
+      ],
+      "terminal_states": [
+        "measured",
+        "rolled_back",
+        "rejected_by_owner",
+        "blocked_by_discount_cap"
+      ],
+      "stop_conditions": [
+        "No owner approval for live pricing change",
+        "Discount would exceed 30%",
+        "MRR impact is negative beyond agreed experiment tolerance",
+        "Day 7 ends"
+      ]
+    }
+  ],
+  "approval_gates": [
+    {
+      "key": "ad_spend_above_50_per_day",
+      "required_before": "Any Meta or Google Ads campaign launch, budget edit, or scaling action that would spend more than $50/day."
+    },
+    {
+      "key": "monthly_ad_spend_cap_risk",
+      "required_before": "Any paid acquisition action that could cause total ad spend to approach or exceed the $2,000/month hard cap."
+    },
+    {
+      "key": "mass_customer_io_email",
+      "required_before": "Sending any mass email, lifecycle campaign, or automated journey in Customer.io."
+    },
+    {
+      "key": "direct_user_messaging",
+      "required_before": "Sending any direct user message through Intercom, Customer.io, in-app messaging, Instagram, TikTok, or another user-facing channel."
+    },
+    {
+      "key": "live_pricing_change",
+      "required_before": "Changing live Stripe pricing, trial terms, coupons, plan configuration, or any user-facing price."
+    },
+    {
+      "key": "discount_offer",
+      "required_before": "Publishing or sending any discount offer; discount must be at or below 30% even with approval."
+    },
+    {
+      "key": "store_listing_publication",
+      "required_before": "Publishing App Store or Play Store ASO metadata, screenshots, descriptions, or experiment variants."
+    },
+    {
+      "key": "organic_social_posting",
+      "required_before": "Posting, commenting, or direct messaging from Instagram or TikTok accounts."
+    }
+  ],
+  "proof_requirements": [
+    {
+      "artifact": "daily_owner_summary",
+      "fields": [
+        "date",
+        "active_paying_subscribers",
+        "MRR",
+        "installs",
+        "activation_rate",
+        "paid_trial_start_rate",
+        "trial_to_paid_conversion_rate",
+        "actions_taken",
+        "approvals_requested",
+        "approvals_received",
+        "blocked_actions",
+        "next_24_hour_plan"
+      ]
+    },
+    {
+      "artifact": "mixpanel_dashboard_evidence",
+      "fields": [
+        "dashboard_link_or_screenshot",
+        "date_range",
+        "install_count",
+        "activation_rate",
+        "trial_start_rate",
+        "trial_to_paid_conversion_rate",
+        "source_breakdown",
+        "platform_breakdown",
+        "before_after_comparison"
+      ]
+    },
+    {
+      "artifact": "stripe_revenue_snapshot",
+      "fields": [
+        "timestamp",
+        "active_paying_subscribers",
+        "MRR",
+        "new_trials",
+        "trial_conversions",
+        "cancellations_or_churn",
+        "pricing_or_coupon_state"
+      ]
+    },
+    {
+      "artifact": "campaign_log",
+      "fields": [
+        "channel",
+        "campaign_name",
+        "approval_status",
+        "launch_timestamp",
+        "daily_budget",
+        "monthly_spend_projection",
+        "actual_spend",
+        "audience_exclusion_under_18_confirmed",
+        "creative_compliance_confirmed",
+        "clicks_or_installs",
+        "trials",
+        "paid_subscribers",
+        "CAC"
+      ]
+    },
+    {
+      "artifact": "lifecycle_message_log",
+      "fields": [
+        "system",
+        "campaign_or_message_name",
+        "target_segment",
+        "approval_status",
+        "send_timestamp",
+        "recipient_count",
+        "subject_or_message_summary",
+        "discount_percent_if_any",
+        "health_claims_absent",
+        "under_18_targeting_absent",
+        "activation_or_trial_or_paid_conversion_result"
+      ]
+    },
+    {
+      "artifact": "experiment_scorecard",
+      "fields": [
+        "hypothesis",
+        "workstream",
+        "primary_metric",
+        "baseline",
+        "result",
+        "sample_size",
+        "date_range",
+        "decision",
+        "evidence_link",
+        "next_action"
+      ]
+    },
+    {
+      "artifact": "approval_audit_log",
+      "fields": [
+        "approval_gate_key",
+        "requested_action",
+        "risk_or_boundary",
+        "timestamp_requested",
+        "owner_decision",
+        "timestamp_decided",
+        "conditions",
+        "execution_status"
+      ]
+    },
+    {
+      "artifact": "compliance_checklist",
+      "fields": [
+        "asset_or_campaign_name",
+        "no_health_claims_confirmed",
+        "no_under_18_targeting_confirmed",
+        "discount_at_or_below_30_percent_confirmed",
+        "ad_spend_within_cap_confirmed",
+        "approval_required",
+        "approval_received"
+      ]
+    }
+  ],
+  "side_effect_policy": {
+    "allowed": [
+      "Analyze Mixpanel funnel, cohort, source, and platform data.",
+      "Analyze Stripe active paid subscribers, MRR, trials, conversions, and pricing state in read-only mode.",
+      "Draft ASO copy for App Store and Play Store.",
+      "Draft lifecycle emails for Customer.io.",
+      "Draft Intercom, in-app, Instagram, and TikTok messages without sending or posting.",
+      "Draft Meta and Google Ads campaigns, budgets, audiences, and creatives without launching above approval limits.",
+      "Propose A/B tests and pricing experiments.",
+      "Create internal dashboards, daily summaries, experiment scorecards, and approval packets."
+    ],
+    "forbidden": [
+      "Make health claims in any copy, ad, message, store listing, or social post.",
+      "Target under-18 users in any channel or segment.",
+      "Offer or publish any discount over 30%.",
+      "Exceed the $2,000/month ad spend hard cap.",
+      "Send mass emails without owner approval.",
+      "Send direct user messages without owner approval.",
+      "Change live pricing without owner approval.",
+      "Publish App Store or Play Store changes without owner approval.",
+      "Post, comment, or DM on Instagram or TikTok without owner approval."
+    ],
+    "approval_required": [
+      "Ad spend above $50/day.",
+      "Any action that risks approaching the $2,000/month ad spend cap.",
+      "Mass email through Customer.io.",
+      "Direct user messaging through Intercom, Customer.io, in-app messaging, Instagram, TikTok, or similar channels.",
+      "Live pricing changes in Stripe.",
+      "Coupons, discounts, or promotional offers, capped at 30%.",
+      "Publishing App Store or Play Store ASO changes.",
+      "Launching or scaling paid campaigns on Meta or Google Ads beyond pre-approved limits.",
+      "Posting organic content on Instagram or TikTok."
+    ],
+    "owner_boundaries": [
+      "7-day sprint to reach 600 active paying subscribers and $12,000 MRR.",
+      "Speed is prioritized within approval limits.",
+      "Ad spend cap is $2,000/month.",
+      "Ad spend above $50/day requires approval.",
+      "No discount over 30%.",
+      "No health claims.",
+      "Never target under-18s.",
+      "Daily summary and Mixpanel dashboard proof are mandatory.",
+      "Proof must include before/after metrics, campaign logs, and results."
+    ]
+  },
+  "escalation_paths": [
+    {
+      "condition": "Any proposed or running action would exceed $50/day in ad spend.",
+      "to": "owner for explicit budget approval before launch or scale"
+    },
+    {
+      "condition": "Projected or actual ad spend approaches the $2,000/month hard cap.",
+      "to": "ceo profile and owner; pause scale-up until owner confirms compliant plan"
+    },
+    {
+      "condition": "Any mass email, direct message, Intercom message, in-app message, Instagram post, TikTok post, or social DM is ready to send.",
+      "to": "owner for approval before sending or posting"
+    },
+    {
+      "condition": "Any live Stripe pricing, coupon, trial, or discount change is recommended.",
+      "to": "owner for explicit approval before implementation"
+    },
+    {
+      "condition": "Any draft contains possible health claims or ambiguous wellness claims.",
+      "to": "ceo profile for compliance rewrite, then owner if still ambiguous"
+    },
+    {
+      "condition": "Any audience, segment, campaign, or content could target under-18s.",
+      "to": "ceo profile for immediate block and owner notification"
+    },
+    {
+      "condition": "Discount proposal exceeds 30%.",
+      "to": "ceo profile for rejection or redesign within cap"
+    },
+    {
+      "condition": "Mixpanel or Stripe proof is unavailable, inconsistent, or insufficient for daily summary.",
+      "to": "owner for data access or instrumentation clarification"
+    },
+    {
+      "condition": "Trial-to-paid conversion falls materially below the approximately 50% baseline after an experiment.",
+      "to": "optimizer for immediate diagnosis and ceo profile for cut/rollback recommendation"
+    },
+    {
+      "condition": "Subscriber or MRR trajectory is off pace by day 3 or day 5.",
+      "to": "owner with an urgent ranked list of approval-gated acceleration options"
+    }
+  ],
+  "tunables": {
+    "lifecycle_followup_delay_hours": {
+      "default": 24,
+      "range": [
+        4,
+        72
+      ],
+      "controls": "How long to wait after install, activation, or trial start before triggering the next drafted lifecycle follow-up once the campaign is owner-approved."
+    },
+    "max_lifecycle_nudges_per_user_7_days": {
+      "default": 3,
+      "range": [
+        1,
+        5
+      ],
+      "controls": "Maximum number of owner-approved lifecycle nudges a user can receive during the 7-day sprint to improve activation, trial starts, or trial-to-paid conversion."
+    },
+    "trial_start_priority_score_threshold": {
+      "default": 70,
+      "range": [
+        50,
+        90
+      ],
+      "controls": "Minimum lead score for prioritizing activated users for trial-start messaging drafts based on app engagement, source, platform, and exposure to streaks, smart nudges, or weekly AI coaching."
+    },
+    "activation_dropoff_alert_threshold_percent": {
+      "default": 10,
+      "range": [
+        5,
+        25
+      ],
+      "controls": "Percentage-point drop or underperformance threshold that triggers optimizer review of activation cohorts in Mixpanel."
+    },
+    "paid_campaign_daily_budget_pacing_percent_of_approved": {
+      "default": 90,
+      "range": [
+        50,
+        100
+      ],
+      "controls": "How aggressively approved Meta and Google Ads budgets are paced against the owner-approved daily budget while staying within the $50/day approval threshold unless additional approval is granted."
+    },
+    "experiment_min_sample_size_per_variant": {
+      "default": 250,
+      "range": [
+        100,
+        1000
+      ],
+      "controls": "Minimum users or sessions per variant before judging ASO, lifecycle, paid, or funnel experiment results when traffic volume allows during the 7-day window."
+    },
+    "winning_experiment_lift_threshold_percent": {
+      "default": 15,
+      "range": [
+        5,
+        40
+      ],
+      "controls": "Minimum relative lift in activation, trial-start rate, paid conversion, or MRR contribution required for the optimizer to recommend doubling down."
+    },
+    "paid_campaign_underperformance_cutoff_hours": {
+      "default": 24,
+      "range": [
+        12,
+        72
+      ],
+      "controls": "Number of hours an approved paid campaign may run before being reviewed for pause or revision if spend occurs without sufficient installs, trials, or paid subscribers."
+    },
+    "discount_test_percent": {
+      "default": 20,
+      "range": [
+        0,
+        30
+      ],
+      "controls": "Discount percentage to model in pricing or offer experiments; any live use still requires owner approval and can never exceed 30%."
+    },
+    "target_platform_focus": {
+      "default": "best_converting_platform",
+      "allowed": [
+        "ios",
+        "android",
+        "both",
+        "best_converting_platform"
+      ],
+      "controls": "Which platform receives priority in analysis, ASO drafting, lifecycle segmentation, and approved campaign focus based on Mixpanel and Stripe performance."
+    }
+  },
+  "owner_summary": {
+    "summary": "This contract runs a 7-day high-speed growth sprint for the habit-tracking mobile app to move from 200 to 600 active paying subscribers and from $4,000 to $12,000 MRR. The board may analyze Mixpanel and Stripe, draft ASO, lifecycle, ad, social, Intercom, and pricing experiments, and optimize safe tunables. All major external side effects remain gated: ad spend above $50/day, any mass email, direct user messaging, live pricing changes, store listing publication, discounts, and social posting require owner approval. Hard stops are no health claims, never target under-18s, no discounts over 30%, and no ad spend above $2,000/month. Daily proof must include a summary, Mixpanel dashboard evidence, before/after metrics, campaign logs, and results.",
+    "pending_confirmation": true
+  }
+}

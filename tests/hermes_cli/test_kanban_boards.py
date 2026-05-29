@@ -19,6 +19,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -62,6 +64,128 @@ def fresh_home(tmp_path, monkeypatch):
     # Kanban module-level init cache must not leak between tests.
     kb._INITIALIZED_PATHS.clear()
     return home
+
+
+def _launch_ready_contract():
+    return {
+        "objective": {
+            "statement": "Launch a land wholesaling business",
+            "success": ["qualified seller leads reach signed purchase agreements"],
+            "failure": ["seller conversations continue without approval boundaries"],
+            "constraints": ["owner approves outbound offers"],
+        },
+        "runtime": {
+            "mode": "company",
+            "dispatcher": {"profile": "land-ceo"},
+            "profiles": {"ceo": "land-ceo", "optimizer": "land-opt", "worker": "land-operator"},
+            "require_worker_envelopes": True,
+            "require_provider_policy": True,
+            "provider_policy": {"seller_outreach": {"provider": "approved_sms_gateway"}},
+            "worker_envelopes": {
+                "land-operator": {
+                    "capabilities": ["seller_outreach"],
+                    "toolsets": ["kanban"],
+                    "allowed_side_effects": ["owner_approved_external_write"],
+                }
+            },
+        },
+        "workflow": {
+            "id": "land-close-flow",
+            "goal_id": "close-land-deals",
+            "require_semantics": True,
+            "workstreams": [{"key": "seller-conversion", "stages": ["source", "negotiate", "close"]}],
+            "stages": [
+                {
+                    "key": "source",
+                    "actions": [{"key": "capture_lead"}],
+                    "triggers": [{"type": "timer", "key": "daily_source"}],
+                    "exit_criteria": [
+                        {"transition": "negotiate", "evidence_required": ["qualified_lead"]}
+                    ],
+                },
+                {
+                    "key": "negotiate",
+                    "actions": [
+                        {
+                            "key": "seller_follow_up",
+                            "required_capabilities": ["seller_outreach"],
+                            "side_effect_class": "owner_approved_external_write",
+                        }
+                    ],
+                    "exit_criteria": [
+                        {"transition": "close", "evidence_required": ["accepted_terms"]}
+                    ],
+                },
+                {
+                    "key": "close",
+                    "actions": [{"key": "archive_outcome"}],
+                    "exit_criteria": [],
+                },
+            ],
+        },
+        "entities": [
+            {
+                "key": "seller_lead",
+                "type": "lead",
+                "states": ["new", "qualified", "negotiating", "closed", "dead"],
+                "terminal_states": ["closed", "dead"],
+            }
+        ],
+        "event_loops": [
+            {"type": "inbound_sms", "entity": "seller_lead", "terminal_states": ["closed", "dead"]}
+        ],
+        "approval_gates": [
+            {"key": "owner_offer_approval", "required_before": ["seller_follow_up"]}
+        ],
+        "proof_requirements": ["qualified_lead", "accepted_terms", "seller_outcome"],
+        "side_effect_policy": {
+            "allowed": ["read_only", "owner_approved_external_write"],
+            "forbidden": ["unapproved_external_write"],
+            "approval_required": ["seller_outreach"],
+        },
+        "escalation_paths": [
+            {"condition": "offer or commitment exceeds owner-approved authority", "to": "owner"}
+        ],
+        "owner_summary": {
+            "summary": (
+                "The board sources seller leads, qualifies properties, follows up "
+                "through approved channels, negotiates within owner-approved limits, "
+                "and archives each deal outcome with proof."
+            )
+        },
+    }
+
+
+def _approve_launch_contract(slug, contract, *, evidence_source="test-owner-approval"):
+    kb.review_business_launch_contract(
+        slug,
+        contract=contract,
+        create_if_missing=not kb.board_exists(slug),
+    )
+    token = kb.issue_board_launch_approval_token(
+        slug,
+        contract=contract,
+        approved_by="owner",
+        approval_evidence={"source": evidence_source},
+        owner_authority_confirmed=True,
+    )["token"]
+    return kb.review_business_launch_contract(
+        slug,
+        contract=contract,
+        approve=True,
+        author="owner",
+        approval_token=token,
+    )
+
+
+def _issue_amendment_token(slug, amendment_id, *, evidence_source="amendment-approval"):
+    return kb.issue_board_launch_approval_token(
+        slug,
+        amendment_id=amendment_id,
+        approved_by="owner",
+        approval_evidence={"source": evidence_source},
+        owner_authority_confirmed=True,
+    )["token"]
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +349,16 @@ class TestBoardCRUD:
         slugs = [b["slug"] for b in kb.list_boards()]
         assert slugs == ["default", "bar"]
 
+    def test_create_does_not_mutate_existing_board_metadata(self, fresh_home):
+        kb.create_board("bar", name="Original", runtime="goal")
+        again = kb.create_board("bar", name="Replacement", runtime="company")
+
+        assert again["name"] == "Original"
+        assert again["runtime"]["mode"] == "goal"
+        meta = kb.read_board_metadata("bar")
+        assert meta["name"] == "Original"
+        assert meta["runtime"]["mode"] == "goal"
+
     def test_create_writes_metadata(self, fresh_home):
         meta = kb.create_board(
             "baz",
@@ -321,6 +455,1296 @@ class TestBoardCRUD:
         action = meta["workflow"]["stages"][0]["actions"][0]
         assert action["required_capabilities"] == ["mock_research"]
         assert action["required_proof"] == ["mock_report"]
+
+    def test_business_launch_review_keeps_rough_goal_in_universal_intake(self, fresh_home):
+        result = kb.review_business_launch_contract(
+            "land-draft",
+            rough_goal="Launch a land wholesaling business",
+            create_if_missing=True,
+        )
+
+        assert result["ok"] is False
+        assert result["status"] == "needs_clarification"
+        assert result["launch_phase"] == "contract_review"
+        assert result["questions"] == []
+        assert result["launch_intake"]["state"] == "clarifying"
+        assert result["launch_intake"]["workflow_type"] == "agentic_workflow"
+        assert result["launch_intake"]["question_generation"]["required"] is True
+        assert result["launch_intake"]["question_generation"]["mode"] == "model_generated"
+        assert "keyword routing" in result["launch_intake"]["question_generation"]["system_prompt"]
+        assert result["launch_intake"]["assumptions"]
+        meta = kb.read_board_metadata("land-draft")
+        assert meta["launch_phase"] == "contract_review"
+        assert meta["business_contract"]["objective"]["statement"] == (
+            "Launch a land wholesaling business"
+        )
+        assert "workflow" not in meta["business_contract"]
+        assert "land_wholesaling_v1" not in json.dumps(meta["business_contract"])
+        assert meta["contract_readiness"]["questions"] == []
+
+    def test_rough_launch_for_any_goal_uses_model_intake_prompt(self, fresh_home):
+        result = kb.review_business_launch_contract(
+            "research-draft",
+            rough_goal="I need agents to run a weekly research pipeline",
+            create_if_missing=True,
+        )
+
+        assert result["ok"] is False
+        assert result["status"] == "needs_clarification"
+        assert result["launch_phase"] == "contract_review"
+        assert result["launch_intake"]["workflow_type"] == "agentic_workflow"
+        assert result["questions"] == []
+        assert result["readiness"]["question_generation"]["required"] is True
+        assert kb.read_board_metadata("research-draft")["contract_readiness"]["questions"] == []
+        assert "workflow.stages" in result["readiness"]["missing"]
+
+    def test_rough_launch_uses_model_prompt_instead_of_domain_questions(self, fresh_home):
+        result = kb.review_business_launch_contract(
+            "life-insurance-recruiting",
+            rough_goal="I want to get more recruits for my life insurance business",
+            create_if_missing=True,
+        )
+
+        generation = result["launch_intake"]["question_generation"]
+        prompt_text = generation["system_prompt"].lower()
+        questions_text = " ".join(result["questions"]).lower()
+
+        assert result["status"] == "needs_clarification"
+        assert result["launch_phase"] == "contract_review"
+        assert result["launch_intake"]["workflow_type"] == "agentic_workflow"
+        assert result["questions"] == []
+        assert generation["required"] is True
+        assert generation["mode"] == "model_generated"
+        assert generation["input"]["rough_goal"] == (
+            "I want to get more recruits for my life insurance business"
+        )
+        assert "fixed" in prompt_text
+        assert "industry templates" in prompt_text
+        assert "prewritten question lists" in prompt_text
+        assert "recruit" not in prompt_text
+        for technical_term in (
+            "dispatcher",
+            "optimizer",
+            "worker profile",
+            "event loop",
+            "entities",
+            "provider policy",
+            "schema",
+            "contract",
+        ):
+            assert technical_term not in questions_text
+
+    def test_intake_answers_enter_recursive_assessment_before_contract_draft(self, fresh_home):
+        kb.review_business_launch_contract(
+            "weak-answer-intake",
+            rough_goal="I want to get more recruits for my life insurance business",
+            create_if_missing=True,
+        )
+
+        result = kb.review_business_launch_contract(
+            "weak-answer-intake",
+            intake_answers="I just want more people, do whatever.",
+        )
+
+        intake = result["launch_intake"]
+        assert result["status"] == "needs_clarification"
+        assert result["launch_phase"] == "contract_review"
+        assert result["questions"] == []
+        assert intake["state"] == "assessing_answers"
+        assert intake["clarification_round"] == 1
+        assert intake["answers"]["raw"] == "I just want more people, do whatever."
+        assert intake["answer_quality"]["status"] == "needs_assessment"
+        assert intake["answer_quality"]["sufficient"] is False
+        assert intake["answer_assessment"]["required"] is True
+        assert intake["answer_assessment"]["mode"] == "model_assessed"
+        assert result["readiness"]["answer_assessment"]["required"] is True
+        meta = kb.read_board_metadata("weak-answer-intake")
+        assert meta["business_contract"]["launch_intake"]["state"] == "assessing_answers"
+
+    def test_duplicate_intake_answers_do_not_advance_assessment_round(self, fresh_home):
+        kb.review_business_launch_contract(
+            "duplicate-answer-intake",
+            rough_goal="I want to get more recruits for my life insurance business",
+            create_if_missing=True,
+        )
+        kb.review_business_launch_contract(
+            "duplicate-answer-intake",
+            intake_answers="I want 10 qualified recruiting conversations per month.",
+        )
+
+        with pytest.raises(ValueError, match="intake_answers already submitted"):
+            kb.review_business_launch_contract(
+                "duplicate-answer-intake",
+                intake_answers="I want 10 qualified recruiting conversations per month.",
+            )
+
+        meta = kb.read_board_metadata("duplicate-answer-intake")
+        intake = meta["business_contract"]["launch_intake"]
+        assert intake["clarification_round"] == 1
+        assert len(intake["answer_history"]) == 1
+
+        changed = kb.review_business_launch_contract(
+            "duplicate-answer-intake",
+            intake_answers="I want 10 qualified recruiting conversations per month from licensed agents.",
+        )
+        assert changed["launch_intake"]["clarification_round"] == 2
+
+    def test_duplicate_intake_answers_normalize_generic_answer_keys(self, fresh_home):
+        kb.review_business_launch_contract(
+            "duplicate-generic-answer-intake",
+            rough_goal="I want to get more recruits for my life insurance business",
+            create_if_missing=True,
+        )
+        first = kb.review_business_launch_contract(
+            "duplicate-generic-answer-intake",
+            intake_answers={"owner_response": "I just want more partners, do whatever."},
+        )
+        assert first["launch_intake"]["answers"] == {
+            "raw": "I just want more partners, do whatever."
+        }
+
+        with pytest.raises(ValueError, match="intake_answers already submitted"):
+            kb.review_business_launch_contract(
+                "duplicate-generic-answer-intake",
+                intake_answers={"answers": "I just want more partners, do whatever."},
+            )
+
+        intake = kb.read_board_metadata("duplicate-generic-answer-intake")["business_contract"]["launch_intake"]
+        assert intake["clarification_round"] == 1
+        assert len(intake["answer_history"]) == 1
+
+    def test_structured_clear_intake_answers_draft_contract_for_owner_review(self, fresh_home):
+        kb.review_business_launch_contract(
+            "clear-answer-intake",
+            rough_goal="Launch an ongoing referral partner workflow",
+            create_if_missing=True,
+        )
+
+        result = kb.review_business_launch_contract(
+            "clear-answer-intake",
+            intake_answers={
+                "success_criteria": (
+                    "Success means producing 20 qualified referral partner prospects, "
+                    "drafting outreach for owner approval, and booking 5 qualified "
+                    "partner conversations per month."
+                ),
+                "good_partners": (
+                    "Good partners are CPAs, tax preparers, payroll firms, business "
+                    "attorneys, and local business coaches serving small businesses."
+                ),
+                "allowed_sources": (
+                    "Hermes may research LinkedIn, Google Maps, public websites, "
+                    "and existing notes if available."
+                ),
+                "prohibited_actions": (
+                    "Hermes may not send outreach, spend money, use personal accounts, "
+                    "make pricing promises, or represent itself as the owner without approval."
+                ),
+                "workflow": (
+                    "Find prospects, qualify fit, draft a personalized message, wait for "
+                    "owner approval, send only after approval if a sending channel is "
+                    "authorized, track replies, negotiate next steps, and stop when a "
+                    "partner signs, says no, is unqualified, or needs owner judgment."
+                ),
+                "proof_requirements": (
+                    "Proof should include the prospect list, why each is qualified, "
+                    "proposed message, approval status, sent/reply log, next action, "
+                    "and weekly summary."
+                ),
+                "owner_escalation_rules": (
+                    "Stop and ask for competitors, unclear fit, complaints, legal or "
+                    "financial claims, negative replies, or anything involving money."
+                ),
+            },
+        )
+
+        intake = result["launch_intake"]
+        assert result["ok"] is True
+        assert result["status"] == "ready_for_owner_review"
+        assert result["launch_phase"] == "contract_review"
+        assert intake["state"] == "ready_for_owner_review"
+        assert intake["answer_quality"]["sufficient"] is True
+        assert intake["answer_quality"]["answers_hash"]
+        assert intake["answer_quality"]["round"] == 1
+        # New path (Phase 1): sufficiency is backed by the deterministic
+        # structural coverage gate, not the old >=5-field / >=300-char heuristic.
+        assert intake["answer_quality"]["coverage_score"] >= 0.6
+        assert intake["answer_quality"]["coverage_dimensions"]
+        assert intake["coverage"]["passed"] is True
+        assert intake["coverage"]["score"] >= 0.6
+        assert result["contract"]["workflow"]["stages"]
+        assert result["contract"]["entities"]
+        assert result["contract"]["event_loops"]
+        assert result["contract"]["approval_gates"]
+        assert result["contract"]["proof_requirements"]
+        assert result["contract"]["side_effect_policy"]
+        assert result["contract"]["escalation_paths"]
+
+    def test_generic_but_long_answers_no_longer_auto_draft(self, fresh_home):
+        """Phase 1 regression: answers that passed the OLD honor-system gate
+        (>=5 fields, >=300 chars) but are generic filler must NOT auto-draft a
+        contract. The deterministic structural coverage gate blocks them."""
+        kb.review_business_launch_contract(
+            "generic-filler-intake",
+            rough_goal="Launch a partner workflow",
+            create_if_missing=True,
+        )
+        result = kb.review_business_launch_contract(
+            "generic-filler-intake",
+            intake_answers={
+                "a": "We want to do the thing well and make it good for everyone involved over time.",
+                "b": "It should be nice and helpful and work the way we hope it will work for us.",
+                "c": "Please just handle it however seems best and keep things moving along smoothly.",
+                "d": "Do whatever you think is right and try to make people happy with the results.",
+                "e": "Keep it simple and easy and do not overthink any of the small details here.",
+            },
+        )
+        # Coverage fails -> no synthesized workflow, not ready for owner review.
+        assert result["ok"] is False
+        assert result["status"] != "ready_for_owner_review"
+        assert result["launch_phase"] == "contract_review"
+        assert not result["contract"].get("workflow")
+
+    def test_intake_contract_draft_requires_quality_evidence(self, fresh_home):
+        kb.review_business_launch_contract(
+            "draft-evidence-intake",
+            rough_goal="Launch a partner referral workflow",
+            create_if_missing=True,
+        )
+        kb.review_business_launch_contract(
+            "draft-evidence-intake",
+            intake_answers={
+                "outcome": "Book 5 qualified partner conversations per month.",
+                "allowed_channels": "Research only; outreach drafts need owner approval.",
+                "stop_conditions": "Stop for complaints, money, or legal claims.",
+            },
+        )
+        contract = _launch_ready_contract()
+        contract["launch_intake"] = {
+            "question_generation": {"required": True, "mode": "model_generated"},
+            "answer_quality": {"status": "sufficient", "sufficient": True},
+        }
+
+        reviewed = kb.review_business_launch_contract(
+            "draft-evidence-intake",
+            contract=contract,
+        )
+
+        assert reviewed["ok"] is False
+        assert "launch_intake.answer_quality.evidence" in reviewed["readiness"]["missing"]
+        assert reviewed["launch_phase"] == "contract_review"
+
+    def test_intake_contract_draft_is_bound_to_latest_answers(self, fresh_home):
+        answers = {
+            "outcome": "Book 5 qualified partner conversations per month.",
+            "allowed_channels": "Research only; outreach drafts need owner approval.",
+            "stop_conditions": "Stop for complaints, money, or legal claims.",
+        }
+        kb.review_business_launch_contract(
+            "draft-bound-intake",
+            rough_goal="Launch a partner referral workflow",
+            create_if_missing=True,
+        )
+        kb.review_business_launch_contract(
+            "draft-bound-intake",
+            intake_answers=answers,
+        )
+        contract = _launch_ready_contract()
+        contract["launch_intake"] = {
+            "question_generation": {"required": True, "mode": "model_generated"},
+            "answer_quality": {
+                "status": "sufficient",
+                "sufficient": True,
+                "evidence": "Owner gave measurable outcome, allowed channels, and stop conditions.",
+            },
+        }
+
+        reviewed = kb.review_business_launch_contract(
+            "draft-bound-intake",
+            contract=contract,
+        )
+
+        expected_hash = kb._launch_intake_answers_hash(answers)
+        assert reviewed["ok"] is True
+        assert reviewed["launch_intake"]["answer_quality"]["answers_hash"] == expected_hash
+        assert reviewed["launch_intake"]["answer_quality"]["round"] == 1
+        assert reviewed["launch_intake"]["state"] == "ready_for_owner_review"
+
+        stale = _launch_ready_contract()
+        stale["launch_intake"] = {
+            "question_generation": {"required": True, "mode": "model_generated"},
+            "answer_quality": {
+                "status": "sufficient",
+                "sufficient": True,
+                "evidence": "Owner gave measurable outcome, allowed channels, and stop conditions.",
+                "answers_hash": "stale",
+            },
+        }
+        with pytest.raises(ValueError, match="answers_hash does not match"):
+            kb.review_business_launch_contract("draft-bound-intake", contract=stale)
+
+        token = kb.issue_board_launch_approval_token(
+            "draft-bound-intake",
+            contract=contract,
+            approved_by="owner",
+            approval_evidence={"source": "owner approved interpreted intake contract"},
+            owner_authority_confirmed=True,
+        )["token"]
+        activated = kb.review_business_launch_contract(
+            "draft-bound-intake",
+            contract=contract,
+            approve=True,
+            approval_token=token,
+        )
+        assert activated["launch_phase"] == "active"
+        assert activated["approval"]["approval_token_id"]
+
+    def test_partial_launch_answers_recompute_targeted_questions(self, fresh_home):
+        contract = {
+            "objective": {
+                "statement": "Run a support escalation workflow",
+                "success": ["urgent customer issues are resolved"],
+                "failure": ["agents keep working after a customer opts out"],
+                "constraints": ["do not issue refunds without approval"],
+            },
+            "launch_intake": {
+                "state": "clarifying",
+                "questions": [
+                    "What kind of business or recurring operation should this board run?"
+                ],
+            },
+        }
+
+        result = kb.review_business_launch_contract(
+            "partial-intake",
+            contract=contract,
+            create_if_missing=True,
+        )
+
+        assert result["status"] == "needs_clarification"
+        assert result["questions"]
+        assert len(result["questions"]) <= 6
+        assert "What kind of business or recurring operation should this board run?" not in result["questions"]
+        assert any("final call" in question.lower() for question in result["questions"])
+
+    def test_ready_contract_with_assumptions_waits_for_owner_review(self, fresh_home):
+        contract = _launch_ready_contract()
+        contract["assumptions"] = ["Owner approval confirms the initial operating plan."]
+
+        result = kb.review_business_launch_contract(
+            "owner-review",
+            contract=contract,
+            create_if_missing=True,
+        )
+
+        assert result["ok"] is True
+        assert result["status"] == "ready_for_owner_review"
+        assert result["launch_phase"] == "contract_review"
+        assert result["assumptions"] == ["Owner approval confirms the initial operating plan."]
+        status = kb.validate_board_launch_readiness("owner-review")
+        assert status["dispatch_enabled"] is False
+        assert status["readiness"]["status"] == "ready_for_owner_review"
+
+    def test_optimizer_or_approved_absence_required_for_non_company_runtime(self, fresh_home):
+        contract = json.loads(json.dumps(_launch_ready_contract()))
+        contract["runtime"]["mode"] = "goal"
+        del contract["runtime"]["profiles"]["optimizer"]
+
+        missing = kb.validate_business_runtime_contract(contract)
+
+        assert missing["ok"] is False
+        assert "runtime.profiles.optimizer" in missing["missing"]
+
+        contract["runtime"]["optimizer_policy"] = {
+            "disabled": True,
+            "approved_by": "owner",
+            "reason": "Owner approved direct dispatcher-to-worker operation for this board.",
+        }
+        ready = kb.validate_business_runtime_contract(contract)
+
+        assert ready["ok"] is True
+
+    def test_ready_contract_with_rough_goal_syncs_intake_state_and_activates_with_token(self, fresh_home):
+        contract = _launch_ready_contract()
+        rough_goal = "I need agents to run this workflow"
+        contract["launch_intake"] = {
+            "source": "rough_goal",
+            "rough_goal": rough_goal,
+            "question_generation": {"required": True, "mode": "model_generated"},
+            "assumptions": ["Owner answered launch-intake questions clearly."],
+            "answer_quality": {
+                "status": "sufficient",
+                "sufficient": True,
+                "evidence": "Owner answered launch-intake questions clearly.",
+            },
+        }
+        reviewed = kb.review_business_launch_contract(
+            "rough-ready",
+            contract=contract,
+            rough_goal=rough_goal,
+            create_if_missing=True,
+        )
+
+        assert reviewed["ok"] is True
+        assert reviewed["status"] == "ready_for_owner_review"
+        assert reviewed["launch_phase"] == "contract_review"
+        assert reviewed["launch_intake"]["state"] == "ready_for_owner_review"
+        assert reviewed["launch_intake"]["owner_review_required"] is True
+
+        token = kb.issue_board_launch_approval_token(
+            "rough-ready",
+            contract=contract,
+            rough_goal=rough_goal,
+            approved_by="owner",
+            approval_evidence={"source": "owner approved interpreted contract"},
+            owner_authority_confirmed=True,
+        )["token"]
+        activated = kb.review_business_launch_contract(
+            "rough-ready",
+            contract=contract,
+            rough_goal=rough_goal,
+            approve=True,
+            approval_token=token,
+        )
+
+        assert activated["launch_phase"] == "active"
+        assert activated["approval"]["approval_token_id"]
+
+    def test_launch_ready_contract_can_activate_board(self, fresh_home):
+        result = _approve_launch_contract(
+            "land-ready",
+            _launch_ready_contract(),
+        )
+
+        assert result["ok"] is True
+        assert result["launch_phase"] == "active"
+        assert result["launch_review_id"]
+        assert result["approval"]["status"] == "approved"
+        assert result["approval"]["approval_token_id"]
+        assert result["approval"]["contract_hash"]
+        meta = kb.read_board_metadata("land-ready")
+        assert meta["launch_phase"] == "active"
+        assert meta["launch_review_id"] == result["launch_review_id"]
+        assert meta["launch_approval"]["approved_by"] == "owner"
+        assert meta["contract_readiness"]["ok"] is True
+        assert meta["contract_version"] == 1
+        assert meta["launch_approval_tokens"] == []
+        with kb.connect(board="land-ready") as conn:
+            token_row = conn.execute(
+                "SELECT status, kind FROM board_launch_approval_tokens WHERE id = ?",
+                (result["approval"]["approval_token_id"],),
+            ).fetchone()
+            review_row = conn.execute(
+                "SELECT status, kind FROM board_launch_reviews WHERE id = ?",
+                (result["launch_review_id"],),
+            ).fetchone()
+        assert dict(token_row) == {"status": "consumed", "kind": "launch_review"}
+        assert dict(review_row) == {"status": "approved", "kind": "launch_review"}
+        assert kb.board_dispatch_gate("land-ready")["ok"] is True
+
+    def test_launch_approval_requires_token(self, fresh_home):
+        contract = _launch_ready_contract()
+        kb.review_business_launch_contract(
+            "missing-approval",
+            contract=contract,
+            create_if_missing=True,
+        )
+
+        with pytest.raises(ValueError, match="approval_token is required"):
+            kb.review_business_launch_contract(
+                "missing-approval",
+                contract=contract,
+                approve=True,
+            )
+
+        assert kb.read_board_metadata("missing-approval")["launch_phase"] == "contract_review"
+
+    def test_failed_launch_activation_write_leaves_token_pending(self, fresh_home, monkeypatch):
+        contract = _launch_ready_contract()
+        kb.review_business_launch_contract(
+            "write-fail-approval",
+            contract=contract,
+            create_if_missing=True,
+        )
+        issued = kb.issue_board_launch_approval_token(
+            "write-fail-approval",
+            contract=contract,
+            approved_by="owner",
+            approval_evidence={"source": "write-fail"},
+            owner_authority_confirmed=True,
+        )
+        original_write = kb.write_board_metadata
+
+        def fail_active_write(board, *args, **kwargs):
+            if kwargs.get("launch_phase") == "active":
+                raise RuntimeError("simulated metadata write failure")
+            return original_write(board, *args, **kwargs)
+
+        monkeypatch.setattr(kb, "write_board_metadata", fail_active_write)
+
+        with pytest.raises(RuntimeError, match="simulated metadata write failure"):
+            kb.review_business_launch_contract(
+                "write-fail-approval",
+                contract=contract,
+                approve=True,
+                approval_token=issued["token"],
+            )
+
+        with kb.connect(board="write-fail-approval") as conn:
+            token_row = conn.execute(
+                "SELECT status, consumed_at FROM board_launch_approval_tokens WHERE id = ?",
+                (issued["token_id"],),
+            ).fetchone()
+            review_row = conn.execute(
+                "SELECT COUNT(*) AS count FROM board_launch_reviews",
+            ).fetchone()
+        assert token_row["status"] == "pending"
+        assert token_row["consumed_at"] is None
+        assert review_row["count"] == 0
+
+    def test_launch_approval_token_expires(self, fresh_home):
+        contract = _launch_ready_contract()
+        kb.review_business_launch_contract(
+            "expired-approval",
+            contract=contract,
+            create_if_missing=True,
+        )
+        token = kb.issue_board_launch_approval_token(
+            "expired-approval",
+            contract=contract,
+            approved_by="owner",
+            approval_evidence={"source": "expired"},
+            ttl_seconds=1,
+            owner_authority_confirmed=True,
+        )
+        with kb.connect(board="expired-approval") as conn:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE board_launch_approval_tokens SET expires_at = 1 WHERE id = ?",
+                    (token["token_id"],),
+                )
+
+        with pytest.raises(ValueError, match="approval_token has expired"):
+            kb.review_business_launch_contract(
+                "expired-approval",
+                contract=contract,
+                approve=True,
+                approval_token=token["token"],
+            )
+
+        with kb.connect(board="expired-approval") as conn:
+            token_record = conn.execute(
+                "SELECT status FROM board_launch_approval_tokens WHERE id = ?",
+                (token["token_id"],),
+            ).fetchone()
+        assert token_record["status"] == "expired"
+
+    def test_launch_approval_token_is_one_time(self, fresh_home):
+        contract = _launch_ready_contract()
+        kb.review_business_launch_contract(
+            "one-time-approval",
+            contract=contract,
+            create_if_missing=True,
+        )
+        token = kb.issue_board_launch_approval_token(
+            "one-time-approval",
+            contract=contract,
+            approved_by="owner",
+            approval_evidence={"source": "one-time"},
+            owner_authority_confirmed=True,
+        )["token"]
+        kb.review_business_launch_contract(
+            "one-time-approval",
+            contract=contract,
+            approve=True,
+            approval_token=token,
+        )
+
+        with pytest.raises(ValueError, match="already been used"):
+            kb.review_business_launch_contract(
+                "one-time-approval",
+                contract=contract,
+                approve=True,
+                approval_token=token,
+            )
+
+    def test_launch_approval_token_concurrent_double_consume(self, fresh_home):
+        contract = _launch_ready_contract()
+        kb.review_business_launch_contract(
+            "concurrent-approval",
+            contract=contract,
+            create_if_missing=True,
+        )
+        token = kb.issue_board_launch_approval_token(
+            "concurrent-approval",
+            contract=contract,
+            approved_by="owner",
+            approval_evidence={"source": "concurrent"},
+            owner_authority_confirmed=True,
+        )["token"]
+        barrier = threading.Barrier(2)
+
+        def activate_once():
+            barrier.wait(timeout=5)
+            try:
+                result = kb.review_business_launch_contract(
+                    "concurrent-approval",
+                    contract=contract,
+                    approve=True,
+                    approval_token=token,
+                )
+            except Exception as exc:
+                return ("error", str(exc))
+            return ("ok", result["launch_phase"])
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: activate_once(), range(2)))
+
+        assert sorted(kind for kind, _ in results) == ["error", "ok"]
+        assert any("already been used" in message for kind, message in results if kind == "error")
+        meta = kb.read_board_metadata("concurrent-approval")
+        assert meta["launch_phase"] == "active"
+        assert meta["launch_approval"]["status"] == "approved"
+        with kb.connect(board="concurrent-approval") as conn:
+            token_rows = conn.execute(
+                "SELECT status, COUNT(*) AS count FROM board_launch_approval_tokens GROUP BY status"
+            ).fetchall()
+            review_rows = conn.execute(
+                "SELECT status, COUNT(*) AS count FROM board_launch_reviews GROUP BY status"
+            ).fetchall()
+        assert {row["status"]: row["count"] for row in token_rows} == {"consumed": 1}
+        assert {row["status"]: row["count"] for row in review_rows} == {"approved": 1}
+
+    def test_launch_approval_token_is_bound_to_contract_hash(self, fresh_home):
+        contract = _launch_ready_contract()
+        kb.review_business_launch_contract(
+            "hash-bound",
+            contract=contract,
+            create_if_missing=True,
+        )
+        token = kb.issue_board_launch_approval_token(
+            "hash-bound",
+            contract=contract,
+            approved_by="owner",
+            approval_evidence={"source": "hash-bound"},
+            owner_authority_confirmed=True,
+        )["token"]
+        changed = _launch_ready_contract()
+        changed["objective"]["success"] = ["changed success target"]
+
+        with pytest.raises(ValueError, match="different contract"):
+            kb.review_business_launch_contract(
+                "hash-bound",
+                contract=changed,
+                approve=True,
+                approval_token=token,
+            )
+
+        assert kb.read_board_metadata("hash-bound")["launch_phase"] == "contract_review"
+
+    def test_launch_approval_token_is_bound_to_board(self, fresh_home):
+        contract = _launch_ready_contract()
+        kb.review_business_launch_contract(
+            "board-a",
+            contract=contract,
+            create_if_missing=True,
+        )
+        kb.review_business_launch_contract(
+            "board-b",
+            contract=contract,
+            create_if_missing=True,
+        )
+        token = kb.issue_board_launch_approval_token(
+            "board-a",
+            contract=contract,
+            approved_by="owner",
+            approval_evidence={"source": "board-a-only"},
+            owner_authority_confirmed=True,
+        )["token"]
+
+        with pytest.raises(ValueError, match="approval_token is not valid for this board"):
+            kb.review_business_launch_contract(
+                "board-b",
+                contract=contract,
+                approve=True,
+                approval_token=token,
+            )
+
+    def test_launch_gate_rejects_synthetic_approval_without_consumed_token(self, fresh_home):
+        contract = _launch_ready_contract()
+        kb.create_board(
+            "synthetic-token",
+            contract=contract,
+            launch_phase="active",
+        )
+        kb.write_board_metadata(
+            "synthetic-token",
+            launch_review_id="lr_fake",
+            launch_approval={
+                "id": "lr_fake",
+                "type": "launch_review",
+                "status": "approved",
+                "approved_by": "owner",
+                "evidence": {"source": "synthetic"},
+                "approval_token_id": "lat_fake",
+                "contract_hash": kb._business_contract_hash(contract),
+                "contract_version": 1,
+            },
+            launch_approval_tokens=[
+                {
+                    "id": "lat_fake",
+                    "status": "consumed",
+                    "kind": "launch_review",
+                    "board": "synthetic-token",
+                    "contract_version": 1,
+                    "contract_hash": kb._business_contract_hash(contract),
+                    "approved_by": "owner",
+                    "evidence": {"source": "synthetic"},
+                    "created_at": 1,
+                    "expires_at": 9999999999,
+                    "token_hash": "fake",
+                    "consumed_at": 2,
+                }
+            ],
+        )
+
+        gate = kb.board_dispatch_gate("synthetic-token")
+
+        assert gate["ok"] is False
+        assert gate["launch_approved"] is False
+        assert "launch_review_missing" in {b["code"] for b in gate["blockers"]}
+
+    def test_launch_gate_rejects_synthetic_approval_without_evidence(self, fresh_home):
+        kb.create_board(
+            "synthetic-approval",
+            contract=_launch_ready_contract(),
+            launch_phase="active",
+        )
+        kb.write_board_metadata(
+            "synthetic-approval",
+            launch_review_id="lr_fake",
+            launch_approval={
+                "id": "lr_fake",
+                "type": "launch_review",
+                "status": "approved",
+                "approved_by": "owner",
+                "evidence": {"source": "synthetic"},
+                "contract_version": 1,
+            },
+        )
+
+        gate = kb.board_dispatch_gate("synthetic-approval")
+
+        assert gate["ok"] is False
+        assert gate["launch_approved"] is False
+        assert "launch_review_missing" in {b["code"] for b in gate["blockers"]}
+
+    def test_launch_review_accepts_exit_criteria_on_every_stage(self, fresh_home):
+        contract = _launch_ready_contract()
+        contract["workflow"]["stages"][2]["exit_criteria"] = [
+            {"transition": "close", "evidence_required": ["outcome_archived"]}
+        ]
+
+        readiness = kb.validate_business_runtime_contract(contract)
+
+        assert readiness["ok"] is True
+        assert "workflow.exit_criteria" not in readiness["missing"]
+
+    def test_launch_review_requires_nonterminal_stage_exit_criteria(self, fresh_home):
+        contract = _launch_ready_contract()
+        contract["workflow"]["stages"][1]["exit_criteria"] = []
+
+        readiness = kb.validate_business_runtime_contract(contract)
+
+        assert readiness["ok"] is False
+        assert "workflow.stages.negotiate.exit_criteria" in readiness["missing"]
+
+    def test_managed_active_board_requires_approved_launch_review(self, fresh_home):
+        kb.create_board(
+            "unreviewed-active",
+            contract=_launch_ready_contract(),
+            launch_phase="active",
+        )
+
+        gate = kb.board_dispatch_gate("unreviewed-active")
+
+        assert gate["ok"] is False
+        assert gate["launch_approved"] is False
+        assert "launch_review_missing" in {b["code"] for b in gate["blockers"]}
+
+        conn = kb.connect(board="unreviewed-active")
+        try:
+            with pytest.raises(ValueError, match="approved launch review"):
+                kb.create_task(
+                    conn,
+                    title="should not create executable work",
+                    assignee="worker",
+                    workstream_id="seller-conversion",
+                    stage_key="source",
+                    action_key="capture_lead",
+                )
+        finally:
+            conn.close()
+
+    def test_company_launch_requires_optimizer_or_approved_disable_policy(self, fresh_home):
+        missing_optimizer = _launch_ready_contract()
+        missing_optimizer["runtime"]["profiles"].pop("optimizer")
+
+        blocked = kb.review_business_launch_contract(
+            "no-optimizer",
+            contract=missing_optimizer,
+            create_if_missing=True,
+            approve=True,
+            author="owner",
+            approved_by="owner",
+            approval_evidence={"source": "optimizer-disable-test"},
+        )
+
+        assert blocked["ok"] is False
+        assert blocked["launch_phase"] == "contract_review"
+        assert "runtime.profiles.optimizer" in blocked["readiness"]["missing"]
+        assert blocked["launch_review_id"] is None
+
+        approved_disable = _launch_ready_contract()
+        approved_disable["runtime"]["profiles"].pop("optimizer")
+        approved_disable["runtime"]["optimizer_policy"] = {
+            "enabled": False,
+            "approved_by": "owner",
+            "reason": "manual review during launch",
+        }
+
+        activated = _approve_launch_contract(
+            "optimizer-disabled",
+            approved_disable,
+            evidence_source="optimizer-disable-approval",
+        )
+
+        assert activated["ok"] is True
+        assert activated["launch_phase"] == "active"
+        assert kb.board_dispatch_gate("optimizer-disabled")["ok"] is True
+
+    def test_company_dispatch_gate_requires_launch_readiness(self, fresh_home):
+        kb.create_board(
+            "company-not-ready",
+            runtime="company",
+            objective="Run a real business board",
+            success=["work completes"],
+            failure=["work launches without contract"],
+            dispatcher_profile="ceo",
+            optimizer_profile="optimizer",
+            worker_profile="worker",
+        )
+
+        gate = kb.board_dispatch_gate("company-not-ready")
+
+        assert gate["ok"] is False
+        assert gate["managed"] is True
+        assert "launch_readiness_failed" in {b["code"] for b in gate["blockers"]}
+
+    def test_dispatch_is_gated_until_board_launch_is_active(self, fresh_home):
+        kb.review_business_launch_contract(
+            "paused-launch",
+            rough_goal="Launch a vague business",
+            create_if_missing=True,
+        )
+        conn = kb.connect(board="paused-launch")
+        try:
+            with pytest.raises(ValueError, match="only blocked or triage tasks"):
+                kb.create_task(conn, title="should not dispatch", assignee="worker")
+            tid = kb.create_task(
+                conn,
+                title="triage can collect launch details",
+                assignee="worker",
+                triage=True,
+            )
+            blocked_tid = kb.create_task(
+                conn,
+                title="blocked launch backlog",
+                assignee="worker",
+                initial_status="blocked",
+            )
+            result = kb.dispatch_once(conn, dry_run=True, board="paused-launch")
+            with pytest.raises(ValueError, match="launch gate is closed"):
+                kb.specify_triage_task(conn, tid, body="details collected")
+            with pytest.raises(ValueError, match="launch gate is closed"):
+                kb.decompose_triage_task(
+                    conn,
+                    tid,
+                    root_assignee="worker",
+                    children=[{"title": "child work", "assignee": "worker"}],
+                )
+        finally:
+            conn.close()
+
+        assert result.spawned == []
+        assert result.launch_blocked[0]["launch_phase"] == "contract_review"
+        assert tid not in [row[0] for row in result.spawned]
+        assert blocked_tid not in [row[0] for row in result.spawned]
+
+    def test_closed_launch_gate_blocks_direct_executable_transitions(self, fresh_home):
+        kb.review_business_launch_contract(
+            "closed-direct",
+            rough_goal="Launch a vague business",
+            create_if_missing=True,
+        )
+        conn = kb.connect(board="closed-direct")
+        try:
+            parent = kb.create_task(
+                conn,
+                title="blocked parent",
+                assignee="worker",
+                initial_status="blocked",
+            )
+            child = kb.create_task(
+                conn,
+                title="blocked child",
+                assignee="worker",
+                initial_status="blocked",
+                parents=[parent],
+            )
+
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, parent).status == "blocked"
+
+            assert kb.unblock_task(conn, child) is True
+            assert kb.get_task(conn, child).status == "todo"
+            ok, reason = kb.promote_task(
+                conn,
+                child,
+                actor="tester",
+                force=True,
+                reason="direct bypass attempt",
+            )
+            assert ok is False
+            assert "launch gate is closed" in reason
+            assert kb.get_task(conn, child).status == "todo"
+
+            assert kb.unblock_task(conn, parent) is False
+            assert kb.get_task(conn, parent).status == "blocked"
+
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child,))
+            assert kb.claim_task(conn, child) is None
+            assert kb.get_task(conn, child).status == "ready"
+
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (child,))
+            assert kb.claim_review_task(conn, child) is None
+            assert kb.get_task(conn, child).status == "review"
+        finally:
+            conn.close()
+
+    def test_closed_launch_gate_reclaims_running_work_to_blocked(self, fresh_home):
+        _approve_launch_contract(
+            "closed-reclaim",
+            _launch_ready_contract(),
+            evidence_source="closed-reclaim-test",
+        )
+        conn = kb.connect(board="closed-reclaim")
+        try:
+            tid = kb.create_task(
+                conn,
+                title="running work",
+                assignee="worker",
+                workstream_id="seller-conversion",
+                stage_key="source",
+                action_key="capture_lead",
+            )
+            assert kb.claim_task(conn, tid) is not None
+            kb.write_board_metadata("closed-reclaim", launch_phase="contract_review")
+
+            assert kb.reclaim_task(conn, tid, reason="launch closed") is True
+            assert kb.get_task(conn, tid).status == "blocked"
+        finally:
+            conn.close()
+
+    def test_contract_amendment_applies_with_version_history(self, fresh_home):
+        _approve_launch_contract(
+            "amendable",
+            _launch_ready_contract(),
+            evidence_source="amendment-test",
+        )
+        amendment = kb.propose_board_contract_amendment(
+            "amendable",
+            patch={"objective": {"success": ["two signed contracts per month"]}},
+            reason="tighten measurable success",
+            author="tester",
+            risk="low",
+        )
+
+        assert amendment["status"] == "pending"
+        assert amendment["readiness"]["ok"] is True
+
+        token = _issue_amendment_token(
+            "amendable",
+            amendment["id"],
+            evidence_source="amendment-approval",
+        )
+        applied = kb.apply_board_contract_amendment(
+            "amendable",
+            amendment["id"],
+            approval_token=token,
+        )
+
+        meta = kb.read_board_metadata("amendable")
+        assert applied["contract_version"] == 2
+        assert meta["contract_version"] == 2
+        assert meta["objective"]["success"] == ["two signed contracts per month"]
+        assert meta["contract_history"][0]["version"] == 1
+        assert any(
+            row.get("id") == amendment["id"] and row.get("status") == "applied"
+            for row in meta["contract_amendments"]
+        )
+
+    def test_contract_amendment_apply_requires_approval_token(self, fresh_home):
+        _approve_launch_contract(
+            "amend-no-evidence",
+            _launch_ready_contract(),
+            evidence_source="initial-owner-approval",
+        )
+        amendment = kb.propose_board_contract_amendment(
+            "amend-no-evidence",
+            patch={"objective": {"success": ["two signed contracts per month"]}},
+            reason="tighten measurable success",
+            author="tester",
+            risk="low",
+        )
+
+        with pytest.raises(ValueError, match="approval_token is required"):
+            kb.apply_board_contract_amendment(
+                "amend-no-evidence",
+                amendment["id"],
+            )
+
+        with pytest.raises(ValueError, match="approval_token is required"):
+            kb.apply_board_contract_amendment(
+                "amend-no-evidence",
+                amendment["id"],
+                activate=False,
+            )
+
+    def test_contract_amendment_force_does_not_apply_non_ready_contract(self, fresh_home):
+        _approve_launch_contract(
+            "amend-no-force",
+            _launch_ready_contract(),
+            evidence_source="initial-owner-approval",
+        )
+        amendment = kb.propose_board_contract_amendment(
+            "amend-no-force",
+            patch={
+                "workflow": {
+                    "id": "not-ready",
+                    "require_semantics": False,
+                    "workstreams": [],
+                    "stages": [{"key": "only", "actions": [], "exit_criteria": []}],
+                }
+            },
+            reason="simulate incomplete launch amendment",
+            author="tester",
+            risk="medium",
+        )
+
+        with pytest.raises(ValueError, match="contract amendment is not launch-ready"):
+            kb.apply_board_contract_amendment(
+                "amend-no-force",
+                amendment["id"],
+                force=True,
+            )
+
+        meta = kb.read_board_metadata("amend-no-force")
+        assert meta["contract_version"] == 1
+        assert meta["launch_phase"] == "active"
+
+    def test_contract_amendment_token_is_bound_to_amendment_id(self, fresh_home):
+        _approve_launch_contract(
+            "amend-token-bound",
+            _launch_ready_contract(),
+            evidence_source="initial-owner-approval",
+        )
+        patch = {"objective": {"success": ["two signed contracts per month"]}}
+        first = kb.propose_board_contract_amendment(
+            "amend-token-bound",
+            patch=patch,
+            reason="first target",
+            author="tester",
+            risk="low",
+        )
+        second = kb.propose_board_contract_amendment(
+            "amend-token-bound",
+            patch=patch,
+            reason="second target",
+            author="tester",
+            risk="low",
+        )
+        token = _issue_amendment_token(
+            "amend-token-bound",
+            first["id"],
+            evidence_source="first-amendment-approval",
+        )
+
+        with pytest.raises(ValueError, match="different amendment"):
+            kb.apply_board_contract_amendment(
+                "amend-token-bound",
+                second["id"],
+                approval_token=token,
+            )
+
+        assert kb.read_board_metadata("amend-token-bound")["contract_version"] == 1
+
+    def test_launch_token_cannot_apply_amendment(self, fresh_home):
+        contract = _launch_ready_contract()
+        _approve_launch_contract(
+            "cross-kind-launch-token",
+            contract,
+            evidence_source="initial-owner-approval",
+        )
+        launch_token = kb.issue_board_launch_approval_token(
+            "cross-kind-launch-token",
+            contract=contract,
+            approved_by="owner",
+            approval_evidence={"source": "wrong-kind"},
+            owner_authority_confirmed=True,
+        )["token"]
+        amendment = kb.propose_board_contract_amendment(
+            "cross-kind-launch-token",
+            patch={"objective": {"success": ["two signed contracts per month"]}},
+            reason="tighten measurable success",
+            author="tester",
+            risk="low",
+        )
+
+        with pytest.raises(ValueError, match="different approval kind"):
+            kb.apply_board_contract_amendment(
+                "cross-kind-launch-token",
+                amendment["id"],
+                approval_token=launch_token,
+            )
+
+    def test_amendment_token_cannot_approve_launch_review(self, fresh_home):
+        contract = _launch_ready_contract()
+        _approve_launch_contract(
+            "cross-kind-amend-token",
+            contract,
+            evidence_source="initial-owner-approval",
+        )
+        amendment = kb.propose_board_contract_amendment(
+            "cross-kind-amend-token",
+            patch={"objective": {"success": ["two signed contracts per month"]}},
+            reason="tighten measurable success",
+            author="tester",
+            risk="low",
+        )
+        amendment_token = _issue_amendment_token(
+            "cross-kind-amend-token",
+            amendment["id"],
+            evidence_source="wrong-kind",
+        )
+
+        with pytest.raises(ValueError, match="different approval kind"):
+            kb.review_business_launch_contract(
+                "cross-kind-amend-token",
+                contract=contract,
+                approve=True,
+                approval_token=amendment_token,
+            )
+
+    def test_contract_amendment_token_is_one_time(self, fresh_home):
+        _approve_launch_contract(
+            "amend-token-reuse",
+            _launch_ready_contract(),
+            evidence_source="initial-owner-approval",
+        )
+        patch = {"objective": {"success": ["two signed contracts per month"]}}
+        first = kb.propose_board_contract_amendment(
+            "amend-token-reuse",
+            patch=patch,
+            reason="first target",
+            author="tester",
+            risk="low",
+        )
+        token = _issue_amendment_token(
+            "amend-token-reuse",
+            first["id"],
+            evidence_source="first-amendment-approval",
+        )
+        kb.apply_board_contract_amendment(
+            "amend-token-reuse",
+            first["id"],
+            approval_token=token,
+        )
+        second = kb.propose_board_contract_amendment(
+            "amend-token-reuse",
+            patch=patch,
+            reason="second target",
+            author="tester",
+            risk="low",
+        )
+
+        with pytest.raises(ValueError, match="already been used"):
+            kb.apply_board_contract_amendment(
+                "amend-token-reuse",
+                second["id"],
+                approval_token=token,
+            )
+
+    def test_stale_contract_amendments_are_rejected(self, fresh_home):
+        _approve_launch_contract(
+            "stale-amend",
+            _launch_ready_contract(),
+            evidence_source="initial-owner-approval",
+        )
+        first = kb.propose_board_contract_amendment(
+            "stale-amend",
+            patch={"objective": {"success": ["two signed contracts per month"]}},
+            reason="first target",
+            author="tester",
+            risk="low",
+        )
+        second = kb.propose_board_contract_amendment(
+            "stale-amend",
+            patch={"objective": {"success": ["three signed contracts per month"]}},
+            reason="second target",
+            author="tester",
+            risk="low",
+        )
+
+        token = _issue_amendment_token(
+            "stale-amend",
+            first["id"],
+            evidence_source="first-owner-approval",
+        )
+        kb.apply_board_contract_amendment(
+            "stale-amend",
+            first["id"],
+            approval_token=token,
+        )
+
+        with pytest.raises(ValueError, match="is stale"):
+            kb.apply_board_contract_amendment(
+                "stale-amend",
+                second["id"],
+            )
+
+        meta = kb.read_board_metadata("stale-amend")
+        assert meta["contract_version"] == 2
+        assert meta["objective"]["success"] == ["two signed contracts per month"]
+
+    def test_active_board_review_cannot_overwrite_contract(self, fresh_home):
+        original = _launch_ready_contract()
+        _approve_launch_contract(
+            "active-review",
+            original,
+            evidence_source="initial-owner-approval",
+        )
+        changed = _launch_ready_contract()
+        changed["objective"]["success"] = ["changed target"]
+
+        with pytest.raises(ValueError, match="contract amendments"):
+            kb.review_business_launch_contract("active-review", contract=changed)
+
+        meta = kb.read_board_metadata("active-review")
+        assert meta["objective"]["success"] == original["objective"]["success"]
+        assert meta["contract_version"] == 1
 
     def test_create_kernel_board_writes_plain_metadata(self, fresh_home):
         meta = kb.create_board("plain", runtime="kernel", name="Plain")
@@ -574,6 +1998,7 @@ def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.Completed
     """Run ``hermes kanban …`` with PYTHONPATH pinned to the worktree."""
     env = dict(os.environ)
     env["PYTHONPATH"] = str(_WORKTREE)
+    env["HERMES_TEST_OWNER_APPROVAL_AUTHORITY"] = "1"
     if env_extra:
         env.update(env_extra)
     return subprocess.run(
@@ -673,6 +2098,431 @@ class TestCLI:
         assert raw["runtime"]["mode"] == "company"
         assert raw["runtime"]["dispatcher"]["profile"] == "ceo"
         assert raw["runtime"]["worker_envelopes"]["worker"]["capabilities"] == ["mock_research"]
+
+    def test_boards_contract_launch_intake_via_cli(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path), "HERMES_PROFILE": "personal-assistant"}
+
+        rough = _cli(
+            [
+                "boards", "contract", "review", "cli-intake",
+                "--rough-goal", "I want to launch an ongoing workflow to recruit referral partners",
+                "--create",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert rough.returncode == 0, rough.stderr
+        rough_payload = json.loads(rough.stdout)
+        assert rough_payload["launch_phase"] == "contract_review"
+        assert rough_payload["board"]["contract_readiness"]["ok"] is False
+        assert rough_payload["launch_intake"]["state"] == "clarifying"
+        assert rough_payload["launch_intake"]["question_generation"]["mode"] == "model_generated"
+        assert rough_payload["readiness"]["questions"] == []
+        assert rough_payload["board"]["contract_readiness"]["questions"] == []
+
+        weak = _cli(
+            [
+                "boards", "contract", "review", "cli-intake",
+                "--intake-answers", json.dumps({"owner_response": "I just want more partners, do whatever."}),
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert weak.returncode == 0, weak.stderr
+        weak_payload = json.loads(weak.stdout)
+        assert weak_payload["ok"] is False
+        assert weak_payload["launch_intake"]["state"] == "assessing_answers"
+        assert weak_payload["launch_intake"]["clarification_round"] == 1
+
+        duplicate = _cli(
+            [
+                "boards", "contract", "review", "cli-intake",
+                "--intake-answers", json.dumps({"answers": "I just want more partners, do whatever."}),
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert duplicate.returncode == 2
+        assert "intake_answers already submitted" in duplicate.stderr
+
+        clear_answers = {
+            "success_criteria": "Create 20 qualified referral partner opportunities and book 5 qualified conversations per month.",
+            "good_fit": "Good partners are CPAs, payroll providers, tax preparers, business attorneys, and local advisors serving small businesses.",
+            "allowed_context": "Hermes may use public websites, public directories, owner-provided notes, and approved CRM exports.",
+            "approval_boundaries": "Hermes may not send messages, spend money, make promises, use personal accounts, or schedule meetings without owner approval.",
+            "workflow_path": "Collect possible partners, check fit, draft the next action, wait for owner approval, execute only approved steps, track outcomes, and close on signed partner, no, disqualified, or owner stop.",
+            "proof": "Show the source/context log, fit rationale, draft action, approval status, action log, next action, and weekly summary.",
+            "stop_conditions": "Stop for unclear fit, complaints, legal or financial claims, money, reputation risk, negative replies, or any new external side effect.",
+        }
+        answers_path = tmp_path / "clear-intake.json"
+        answers_path.write_text(json.dumps({"answers": clear_answers}), encoding="utf-8")
+
+        clear = _cli(
+            [
+                "boards", "contract", "review", "cli-intake",
+                "--intake-answers", f"@{answers_path}",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert clear.returncode == 0, clear.stderr
+        clear_payload = json.loads(clear.stdout)
+        assert clear_payload["ok"] is True
+        assert clear_payload["status"] == "ready_for_owner_review"
+        assert clear_payload["launch_phase"] == "contract_review"
+        assert clear_payload["launch_intake"]["state"] == "ready_for_owner_review"
+        assert clear_payload["launch_intake"]["answer_quality"]["sufficient"] is True
+        assert clear_payload["launch_intake"]["answers"]["success_criteria"].startswith("Create 20")
+        assert clear_payload["board"]["contract_readiness"]["ok"] is True
+
+        status = _cli(
+            ["boards", "contract", "status", "cli-intake", "--json"],
+            env_extra=env,
+        )
+        assert status.returncode == 0, status.stderr
+        status_payload = json.loads(status.stdout)
+        assert status_payload["dispatch_enabled"] is False
+        assert status_payload["launch_approved"] is False
+
+    def test_owner_profile_direct_contract_requires_intake_or_operator_override(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path), "HERMES_PROFILE": "personal-assistant"}
+        contract_path = tmp_path / "launch-contract.json"
+        contract_path.write_text(json.dumps(_launch_ready_contract()), encoding="utf-8")
+
+        blocked = _cli(
+            [
+                "boards", "contract", "review", "cli-direct-blocked",
+                "--contract", f"@{contract_path}",
+                "--create",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert blocked.returncode == 2
+        assert "launch_intake is required before direct contract review" in blocked.stderr
+
+        override = _cli(
+            [
+                "boards", "contract", "review", "cli-direct-blocked",
+                "--contract", f"@{contract_path}",
+                "--create",
+                "--operator-override",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert override.returncode == 0, override.stderr
+        assert json.loads(override.stdout)["ok"] is True
+
+    def test_approval_token_cli_requires_owner_authority(self, tmp_path):
+        env = {
+            "HERMES_HOME": str(tmp_path),
+            "HERMES_PROFILE": "test-orchestrator",
+            "HERMES_TEST_OWNER_APPROVAL_AUTHORITY": "0",
+        }
+        contract_path = tmp_path / "launch-contract.json"
+        contract_path.write_text(json.dumps(_launch_ready_contract()), encoding="utf-8")
+        reviewed = _cli(
+            [
+                "boards", "contract", "review", "cli-token-authority",
+                "--contract", f"@{contract_path}",
+                "--create",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert reviewed.returncode == 0, reviewed.stderr
+
+        token = _cli(
+            [
+                "boards", "contract", "approval-token", "cli-token-authority",
+                "--contract", f"@{contract_path}",
+                "--approved-by", "owner",
+                "--approval-evidence", "owner approved cli launch",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert token.returncode == 2
+        assert "interactive owner authority boundary" in token.stderr
+
+    def test_boards_contract_review_and_amend_via_cli(self, tmp_path):
+        env = {
+            "HERMES_HOME": str(tmp_path),
+            "HERMES_PROFILE": "test-orchestrator",
+            "HERMES_TEST_OWNER_APPROVAL_AUTHORITY": "1",
+        }
+        contract_path = tmp_path / "launch-contract.json"
+        contract_path.write_text(json.dumps(_launch_ready_contract()), encoding="utf-8")
+
+        reviewed = _cli(
+            [
+                "boards", "contract", "review", "cli-launch",
+                "--contract", f"@{contract_path}",
+                "--create",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert reviewed.returncode == 0, reviewed.stderr
+        review_payload = json.loads(reviewed.stdout)
+        assert review_payload["ok"] is True
+        assert review_payload["launch_phase"] == "contract_review"
+
+        approval = _cli(
+            [
+                "boards", "contract", "approval-token", "cli-launch",
+                "--contract", f"@{contract_path}",
+                "--approved-by", "owner",
+                "--approval-evidence", "owner approved cli launch",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert approval.returncode == 0, approval.stderr
+        approval_payload = json.loads(approval.stdout)
+        assert approval_payload["kind"] == "launch_review"
+
+        activated = _cli(
+            [
+                "boards", "contract", "review", "cli-launch",
+                "--contract", f"@{contract_path}",
+                "--approve",
+                "--approval-token", approval_payload["token"],
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert activated.returncode == 0, activated.stderr
+        activated_payload = json.loads(activated.stdout)
+        assert activated_payload["ok"] is True
+        assert activated_payload["launch_phase"] == "active"
+        assert activated_payload["approval"]["approval_token_id"] == approval_payload["token_id"]
+
+        status = _cli(
+            ["boards", "contract", "status", "cli-launch", "--json"],
+            env_extra=env,
+        )
+        assert status.returncode == 0, status.stderr
+        status_payload = json.loads(status.stdout)
+        assert status_payload["dispatch_enabled"] is True
+
+        patch_path = tmp_path / "amendment.json"
+        patch_path.write_text(
+            json.dumps({"objective": {"success": ["five seller calls per week"]}}),
+            encoding="utf-8",
+        )
+        proposed = _cli(
+            [
+                "boards", "contract", "propose", "cli-launch", f"@{patch_path}",
+                "--reason", "change target",
+                "--risk", "low",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert proposed.returncode == 0, proposed.stderr
+        amendment = json.loads(proposed.stdout)
+
+        amendment_approval = _cli(
+            [
+                "boards", "contract", "approval-token", "cli-launch",
+                "--amendment-id", amendment["id"],
+                "--approved-by", "owner",
+                "--approval-evidence", "owner approved amendment",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert amendment_approval.returncode == 0, amendment_approval.stderr
+        amendment_approval_payload = json.loads(amendment_approval.stdout)
+        assert amendment_approval_payload["kind"] == "contract_amendment"
+
+        applied = _cli(
+            [
+                "boards", "contract", "apply", "cli-launch", amendment["id"],
+                "--approval-token", amendment_approval_payload["token"],
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert applied.returncode == 0, applied.stderr
+        applied_payload = json.loads(applied.stdout)
+        assert applied_payload["contract_version"] == 2
+        assert applied_payload["dispatch_enabled"] is True
+        assert applied_payload["launch_blocked"] is False
+        assert applied_payload["launch_phase"] == "active"
+
+    def test_boards_contract_review_approve_requires_token_via_cli(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path), "HERMES_PROFILE": "test-orchestrator"}
+        contract_path = tmp_path / "launch-contract.json"
+        contract_path.write_text(json.dumps(_launch_ready_contract()), encoding="utf-8")
+        reviewed = _cli(
+            [
+                "boards", "contract", "review", "cli-review-no-token",
+                "--contract", f"@{contract_path}",
+                "--create",
+            ],
+            env_extra=env,
+        )
+        assert reviewed.returncode == 0, reviewed.stderr
+
+        activated = _cli(
+            [
+                "boards", "contract", "review", "cli-review-no-token",
+                "--contract", f"@{contract_path}",
+                "--approve",
+            ],
+            env_extra=env,
+        )
+
+        assert activated.returncode == 2
+        assert "approval_token is required" in activated.stderr
+
+    def test_boards_contract_apply_requires_token_via_cli(self, tmp_path):
+        env = {
+            "HERMES_HOME": str(tmp_path),
+            "HERMES_PROFILE": "test-orchestrator",
+            "HERMES_TEST_OWNER_APPROVAL_AUTHORITY": "1",
+        }
+        contract_path = tmp_path / "launch-contract.json"
+        contract_path.write_text(json.dumps(_launch_ready_contract()), encoding="utf-8")
+        reviewed = _cli(
+            [
+                "boards", "contract", "review", "cli-apply-no-token",
+                "--contract", f"@{contract_path}",
+                "--create",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert reviewed.returncode == 0, reviewed.stderr
+        approval = _cli(
+            [
+                "boards", "contract", "approval-token", "cli-apply-no-token",
+                "--contract", f"@{contract_path}",
+                "--approved-by", "owner",
+                "--approval-evidence", "owner approved cli launch",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert approval.returncode == 0, approval.stderr
+        activated = _cli(
+            [
+                "boards", "contract", "review", "cli-apply-no-token",
+                "--contract", f"@{contract_path}",
+                "--approve",
+                "--approval-token", json.loads(approval.stdout)["token"],
+            ],
+            env_extra=env,
+        )
+        assert activated.returncode == 0, activated.stderr
+
+        patch_path = tmp_path / "amendment.json"
+        patch_path.write_text(
+            json.dumps({"objective": {"success": ["five seller calls per week"]}}),
+            encoding="utf-8",
+        )
+        proposed = _cli(
+            [
+                "boards", "contract", "propose", "cli-apply-no-token", f"@{patch_path}",
+                "--reason", "change target",
+                "--risk", "low",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert proposed.returncode == 0, proposed.stderr
+        amendment = json.loads(proposed.stdout)
+
+        applied = _cli(
+            [
+                "boards", "contract", "apply", "cli-apply-no-token", amendment["id"],
+            ],
+            env_extra=env,
+        )
+
+        assert applied.returncode == 2
+        assert "approval_token is required" in applied.stderr
+
+    def test_boards_contract_apply_force_is_rejected(self, tmp_path):
+        env = {
+            "HERMES_HOME": str(tmp_path),
+            "HERMES_PROFILE": "test-orchestrator",
+            "HERMES_TEST_OWNER_APPROVAL_AUTHORITY": "1",
+        }
+        contract_path = tmp_path / "launch-contract.json"
+        contract_path.write_text(json.dumps(_launch_ready_contract()), encoding="utf-8")
+
+        reviewed = _cli(
+            [
+                "boards", "contract", "review", "cli-force-launch",
+                "--contract", f"@{contract_path}",
+                "--create",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert reviewed.returncode == 0, reviewed.stderr
+        approval = _cli(
+            [
+                "boards", "contract", "approval-token", "cli-force-launch",
+                "--contract", f"@{contract_path}",
+                "--approved-by", "owner",
+                "--approval-evidence", "owner approved force launch",
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert approval.returncode == 0, approval.stderr
+        approval_payload = json.loads(approval.stdout)
+        activated = _cli(
+            [
+                "boards", "contract", "review", "cli-force-launch",
+                "--contract", f"@{contract_path}",
+                "--approve",
+                "--approval-token", approval_payload["token"],
+                "--json",
+            ],
+            env_extra=env,
+        )
+        assert activated.returncode == 0, activated.stderr
+
+        patch_path = tmp_path / "not-ready-amendment.json"
+        patch_path.write_text(
+            json.dumps({
+                "workflow": {
+                    "id": "not-ready",
+                    "require_semantics": False,
+                    "workstreams": [],
+                    "stages": [
+                        {"key": "only", "actions": [], "exit_criteria": []}
+                    ],
+                }
+            }),
+            encoding="utf-8",
+        )
+        proposed = _cli(
+            [
+                "boards", "contract", "propose", "cli-force-launch", f"@{patch_path}",
+                "--reason", "simulate incomplete launch amendment",
+            ],
+            env_extra=env,
+        )
+        assert proposed.returncode == 0, proposed.stderr
+        amendment_id = proposed.stdout.split()[1]
+
+        applied = _cli(
+            [
+                "boards", "contract", "apply", "cli-force-launch", amendment_id,
+                "--approved-by", "owner",
+                "--force",
+            ],
+            env_extra=env,
+        )
+        assert applied.returncode == 2
+        assert "--force has been retired" in applied.stderr
 
     def test_per_board_task_isolation_via_cli(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}

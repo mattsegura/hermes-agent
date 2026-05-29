@@ -1,0 +1,565 @@
+{
+  "objective": {
+    "statement": "Run the live Florida vacant-land wholesaling pipeline (source -> qualify -> contact -> negotiate -> contract -> close) with owner-gated outbound, separated worker roles, and structured proof before any card is marked done.",
+    "success": [
+      "Lead sourcing, parcel qualification, seller contact, negotiation, contract, and close stages all run with auditable structured evidence.",
+      "All outbound (SMS, email, calls, spend, contracts/offers) stays owner-approval-gated until Matthew explicitly enables it.",
+      "Only the approved business channel (Infobip) is ever used for outbound; personal channels are never used.",
+      "CEO, operator, negotiator, and optimizer scopes stay separated and auditable via worker envelopes.",
+      "Every card that reaches done carries fresh structured proof rather than prose or stale metadata."
+    ],
+    "failure": [
+      "A worker contacts a seller or external person through a channel that is not owner-approved.",
+      "A worker uses personal iMessage/SMS or any forbidden personal channel.",
+      "A card becomes done from prose or stale metadata without structured proof.",
+      "A profile outside its worker envelope claims or completes contracted work.",
+      "Outbound messaging, dialer, or spend runs before explicit owner approval."
+    ],
+    "constraints": [
+      "Outbound is owner-approval-gated: no SMS, email, calls, contracts, offers, payments, or spend without explicit Matthew approval.",
+      "Business channel required for outbound (Infobip); personal-channel fallback is forbidden (imsg, iMessage, BlueBubbles, Apple Messages, personal SMS).",
+      "Inbound normalization may run, but live outbound webhooks/sends remain disabled until approved.",
+      "Live promotion of any new outbound capability requires a separate owner approval packet."
+    ]
+  },
+  "runtime": {
+    "mode": "company",
+    "dispatcher": {
+      "profile": "land-ceo"
+    },
+    "profiles": {
+      "ceo": "land-ceo",
+      "optimizer": "land-pipeline-optimizer",
+      "worker": "land-operator-1"
+    },
+    "channel_policy": {
+      "sms": {
+        "provider": "infobip",
+        "inbound_bridge": "/Users/matthewsegura/.hermes/scripts/land-infobip-reactive-bridge.py",
+        "inbound_trigger_type": "inbound_sms",
+        "outbound_enabled": false,
+        "outbound_requires_owner_approval": true,
+        "business_channel_required": true,
+        "personal_channels_forbidden": [
+          "imsg",
+          "imessage",
+          "apple_messages",
+          "bluebubbles",
+          "personal_sms"
+        ],
+        "status": "inbound_normalization_ready_no_live_webhook",
+        "updated_at": 1779967795
+      }
+    },
+    "reactive_entities": {
+      "conversation_threads": {
+        "entity_type": "conversation_thread",
+        "trigger_type": "inbound_sms",
+        "trigger_key_format": "infobip:+E164",
+        "default_assignee": "land-negotiator-1",
+        "unknown_policy": "triage",
+        "terminal_completion_requires_entity_resolution": true
+      }
+    },
+    "require_worker_envelopes": true,
+    "tool_policy": {
+      "outbound_sms": {
+        "allowed": false,
+        "requires_owner_approval": true
+      },
+      "outbound_email": {
+        "allowed": false,
+        "requires_owner_approval": true
+      },
+      "phone_call": {
+        "allowed": false,
+        "requires_owner_approval": true
+      },
+      "payment_or_spend": {
+        "allowed": false,
+        "requires_owner_approval": true
+      },
+      "contract_or_offer_commitment": {
+        "allowed": false,
+        "requires_owner_approval": true
+      },
+      "personal_channel": {
+        "allowed": false,
+        "blocked_tools": [
+          "imsg",
+          "imessage",
+          "bluebubbles",
+          "apple_messages",
+          "personal_sms"
+        ]
+      }
+    },
+    "worker_envelopes": {
+      "land-ceo": {
+        "capabilities": [
+          "board_strategy",
+          "approval_packet",
+          "metrics_review"
+        ],
+        "toolsets": [
+          "kanban"
+        ],
+        "allowed_side_effects": [
+          "read_only",
+          "owner_approved_external_write"
+        ],
+        "required_proof": [
+          "decision_record"
+        ]
+      },
+      "land-operator-1": {
+        "capabilities": [
+          "lead_sourcing",
+          "parcel_research",
+          "valuation",
+          "skip_trace",
+          "due_diligence"
+        ],
+        "toolsets": [
+          "kanban",
+          "web"
+        ],
+        "allowed_side_effects": [
+          "read_only",
+          "owner_approved_external_write"
+        ],
+        "required_proof": [
+          "structured_artifact"
+        ]
+      },
+      "land-negotiator-1": {
+        "capabilities": [
+          "seller_conversation",
+          "negotiation_strategy",
+          "offer_management"
+        ],
+        "toolsets": [
+          "kanban"
+        ],
+        "allowed_side_effects": [
+          "read_only",
+          "owner_approved_external_write"
+        ],
+        "required_proof": [
+          "conversation_record"
+        ]
+      },
+      "land-pipeline-optimizer": {
+        "capabilities": [
+          "optimizer_analysis"
+        ],
+        "toolsets": [
+          "kanban"
+        ],
+        "allowed_side_effects": [
+          "read_only"
+        ],
+        "required_proof": [
+          "optimizer_recommendations"
+        ]
+      }
+    }
+  },
+  "workflow": {
+    "id": "land-close-flow-v1",
+    "description": "Board-scoped semantic workflow for moving Florida vacant-land work from owner intent to closed wholesale deals. Lifecycle Kanban status remains separate from these funnel stages.",
+    "goal_id": "close-land-deals",
+    "require_semantics": true,
+    "workstreams": [
+      {
+        "key": "lead-acquisition",
+        "label": "Lead acquisition",
+        "stages": [
+          "source",
+          "qualify"
+        ]
+      },
+      {
+        "key": "seller-conversion",
+        "label": "Seller conversion",
+        "stages": [
+          "contact",
+          "negotiate",
+          "contract",
+          "close"
+        ]
+      },
+      {
+        "key": "pipeline-ops",
+        "label": "Pipeline operations",
+        "stages": [
+          "source",
+          "qualify",
+          "contact",
+          "negotiate",
+          "operate"
+        ]
+      },
+      {
+        "key": "operations",
+        "label": "Runtime operations",
+        "stages": [
+          "operate"
+        ]
+      }
+    ],
+    "stages": [
+      {
+        "key": "source",
+        "label": "Source leads",
+        "allowed_lifecycle_states": [
+          "todo",
+          "ready",
+          "running",
+          "blocked",
+          "review",
+          "done"
+        ],
+        "actions": [
+          {
+            "key": "lead_research",
+            "label": "Find candidate vacant-land sellers"
+          },
+          {
+            "key": "list_build",
+            "label": "Build lead batch artifact"
+          },
+          {
+            "key": "source_leads",
+            "label": "Source lead batches"
+          }
+        ],
+        "exit_criteria": [
+          {
+            "transition": "qualify",
+            "evidence_required": [
+              "lead_batch_artifact"
+            ]
+          }
+        ],
+        "substates": [],
+        "triggers": []
+      },
+      {
+        "key": "qualify",
+        "label": "Qualify parcels and owners",
+        "allowed_lifecycle_states": [
+          "todo",
+          "ready",
+          "running",
+          "blocked",
+          "review",
+          "done"
+        ],
+        "actions": [
+          {
+            "key": "skip_trace",
+            "label": "Find owner contact paths"
+          },
+          {
+            "key": "parcel_verify",
+            "label": "Verify parcel facts and constraints"
+          },
+          {
+            "key": "comp_search",
+            "label": "Estimate value and offer range"
+          },
+          {
+            "key": "find_contact_info",
+            "label": "Find contact info / skip trace"
+          },
+          {
+            "key": "research_and_score",
+            "label": "Research and score parcel opportunity"
+          },
+          {
+            "key": "enrich_due_diligence",
+            "label": "Enrich due-diligence facts"
+          },
+          {
+            "key": "resolve_skip_trace",
+            "label": "Resolve missing skip-trace data"
+          }
+        ],
+        "exit_criteria": [
+          {
+            "transition": "contact",
+            "evidence_required": [
+              "qualified_leads",
+              "contact_paths"
+            ]
+          }
+        ],
+        "substates": [],
+        "triggers": []
+      },
+      {
+        "key": "contact",
+        "label": "Initial seller contact",
+        "allowed_lifecycle_states": [
+          "todo",
+          "ready",
+          "running",
+          "watching",
+          "blocked",
+          "review",
+          "done"
+        ],
+        "actions": [
+          {
+            "key": "outreach_prep",
+            "label": "Prepare message and offer posture"
+          },
+          {
+            "key": "initial_outreach",
+            "label": "Send first business-channel touch"
+          },
+          {
+            "key": "channel_readiness",
+            "label": "Verify business-channel readiness"
+          }
+        ],
+        "triggers": [
+          {
+            "type": "outbound_sms",
+            "channel": "infobip"
+          },
+          {
+            "type": "inbound_sms",
+            "channel": "infobip"
+          }
+        ],
+        "exit_criteria": [
+          {
+            "transition": "negotiate",
+            "evidence_required": [
+              "outreach_sent"
+            ]
+          }
+        ],
+        "substates": []
+      },
+      {
+        "key": "negotiate",
+        "label": "Negotiate with sellers",
+        "allowed_lifecycle_states": [
+          "todo",
+          "ready",
+          "running",
+          "watching",
+          "blocked",
+          "review",
+          "done"
+        ],
+        "substates": [
+          {
+            "key": "waiting_for_reply",
+            "label": "Healthy wait for seller reply"
+          },
+          {
+            "key": "follow_up_due",
+            "label": "Follow-up timer ready"
+          },
+          {
+            "key": "hot_lead",
+            "label": "Seller engaged"
+          },
+          {
+            "key": "due_diligence_blocked",
+            "label": "Needs parcel/title proof"
+          },
+          {
+            "key": "dead",
+            "label": "No viable path"
+          }
+        ],
+        "actions": [
+          {
+            "key": "seller_reply",
+            "label": "Handle inbound seller reply"
+          },
+          {
+            "key": "follow_up_drip",
+            "label": "Continue approved follow-up sequence"
+          },
+          {
+            "key": "offer",
+            "label": "Make or revise offer"
+          }
+        ],
+        "triggers": [
+          {
+            "kind": "inbound",
+            "detail": "seller replies on the business line",
+            "type": "inbound_sms",
+            "channel": "infobip"
+          },
+          {
+            "kind": "timer",
+            "detail": "follow-up cadence elapsed with no reply",
+            "cadence_hours": 72,
+            "type": "timer",
+            "reason": "follow_up_due"
+          },
+          {
+            "kind": "manual",
+            "detail": "owner makes a judgment call on this lead",
+            "type": "manual",
+            "reason": "owner decision"
+          }
+        ],
+        "exit_criteria": [
+          {
+            "transition": "contract",
+            "evidence_required": [
+              "accepted_offer"
+            ]
+          },
+          {
+            "transition": "source",
+            "evidence_required": [
+              "lead_dead_or_recycled"
+            ]
+          }
+        ]
+      },
+      {
+        "key": "contract",
+        "label": "Contract and due diligence",
+        "allowed_lifecycle_states": [
+          "todo",
+          "ready",
+          "running",
+          "watching",
+          "blocked",
+          "review",
+          "done"
+        ],
+        "actions": [
+          {
+            "key": "contract_prep",
+            "label": "Prepare purchase agreement"
+          },
+          {
+            "key": "seller_signature",
+            "label": "Get seller signature"
+          },
+          {
+            "key": "title_due_diligence",
+            "label": "Verify closing constraints"
+          },
+          {
+            "key": "title_search",
+            "label": "Search title and ownership constraints"
+          }
+        ],
+        "exit_criteria": [
+          {
+            "transition": "close",
+            "evidence_required": [
+              "signed_contract",
+              "closing_path"
+            ]
+          }
+        ],
+        "substates": [],
+        "triggers": []
+      },
+      {
+        "key": "close",
+        "label": "Assign or close deal",
+        "allowed_lifecycle_states": [
+          "todo",
+          "ready",
+          "running",
+          "watching",
+          "blocked",
+          "review",
+          "done"
+        ],
+        "actions": [
+          {
+            "key": "buyer_assignment",
+            "label": "Find/assign buyer"
+          },
+          {
+            "key": "title_close",
+            "label": "Coordinate closing"
+          },
+          {
+            "key": "payout",
+            "label": "Record closed deal outcome"
+          }
+        ],
+        "exit_criteria": [],
+        "substates": [],
+        "triggers": []
+      },
+      {
+        "key": "operate",
+        "label": "Operate pipeline",
+        "allowed_lifecycle_states": [
+          "todo",
+          "ready",
+          "running",
+          "watching",
+          "blocked",
+          "review",
+          "done"
+        ],
+        "substates": [
+          {
+            "key": "capability_gap",
+            "label": "Capability or credential gap"
+          },
+          {
+            "key": "health_check",
+            "label": "Health/metrics verification"
+          },
+          {
+            "key": "recovery",
+            "label": "Runtime recovery"
+          },
+          {
+            "key": "healthy_wait",
+            "label": "Known dependency wait"
+          }
+        ],
+        "actions": [
+          {
+            "key": "metrics_refresh",
+            "label": "Refresh live board metrics and health"
+          },
+          {
+            "key": "repair_worker",
+            "label": "Repair worker/runtime capability"
+          },
+          {
+            "key": "dispatcher_clean_restart",
+            "label": "Cleanly restart dispatcher/runtime"
+          },
+          {
+            "key": "wait_for_dependency",
+            "label": "Wait/wake on dependency readiness"
+          }
+        ],
+        "triggers": [
+          {
+            "type": "system_event",
+            "reason": "health_or_recovery"
+          },
+          {
+            "type": "timer",
+            "reason": "dependency_check"
+          }
+        ],
+        "exit_criteria": []
+      }
+    ]
+  }
+}

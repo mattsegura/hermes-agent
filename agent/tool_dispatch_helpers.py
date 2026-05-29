@@ -333,6 +333,8 @@ def make_tool_result_message(name: str, content: Any, tool_call_id: str) -> dict
     (content lists with image_url parts) pass through unwrapped so the
     list structure stays valid for vision-capable adapters.
     """
+    if name in _ASSISTANT_NEXT_ACTION_TOOLS:
+        content = _maybe_append_assistant_next_action(content)
     wrapped = _maybe_wrap_untrusted(name, content)
     return {
         "role": "tool",
@@ -359,6 +361,13 @@ _UNTRUSTED_TOOL_PREFIXES = (
 )
 
 _UNTRUSTED_WRAP_MIN_CHARS = 32
+_ASSISTANT_NEXT_ACTION_MARKER = "<assistant_next_action>"
+_ASSISTANT_NEXT_ACTION_TOOLS = frozenset({
+    "kanban_board_launch_status",
+    "kanban_business_launch_review",
+    "kanban_contract_amendment_propose",
+    "kanban_contract_amendment_apply",
+})
 
 
 def _is_untrusted_tool(name: Optional[str]) -> bool:
@@ -397,6 +406,37 @@ def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
     )
 
 
+def _maybe_append_assistant_next_action(content: Any) -> Any:
+    """Append trusted tool instructions that should steer the next response."""
+    if not isinstance(content, str):
+        return content
+    if "assistant_next_action" not in content:
+        return content
+    if _ASSISTANT_NEXT_ACTION_MARKER in content:
+        return content
+    try:
+        parsed = json.loads(content)
+    except Exception:
+        return content
+    if not isinstance(parsed, dict):
+        return content
+    action = parsed.get("assistant_next_action")
+    if not isinstance(action, dict) or not action.get("required"):
+        return content
+    instruction = str(action.get("instruction") or "").strip()
+    if not instruction:
+        return content
+    response_style = str(action.get("response_style") or "").strip()
+    marker = (
+        "\n\n<assistant_next_action>\n"
+        f"{instruction}\n"
+    )
+    if response_style:
+        marker += f"{response_style}\n"
+    marker += "</assistant_next_action>"
+    return content + marker
+
+
 __all__ = [
     "_NEVER_PARALLEL_TOOLS",
     "_PARALLEL_SAFE_TOOLS",
@@ -413,5 +453,6 @@ __all__ = [
     "_extract_file_mutation_targets",
     "_extract_error_preview",
     "_trajectory_normalize_msg",
+    "_maybe_append_assistant_next_action",
     "make_tool_result_message",
 ]
