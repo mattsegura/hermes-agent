@@ -5239,6 +5239,26 @@ CREATE INDEX IF NOT EXISTS idx_board_knob_audit      ON board_knob_audit(board, 
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
+DEFAULT_BUSY_TIMEOUT_MS = 30000
+
+
+def _resolve_busy_timeout_ms() -> int:
+    raw = os.environ.get("HERMES_KANBAN_BUSY_TIMEOUT_MS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+    return DEFAULT_BUSY_TIMEOUT_MS
+
+
+def _sqlite_connect(path: Path) -> sqlite3.Connection:
+    busy_timeout_ms = _resolve_busy_timeout_ms()
+    conn = sqlite3.connect(str(path), isolation_level=None, timeout=busy_timeout_ms / 1000.0)
+    conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    return conn
 
 # ---------------------------------------------------------------------------
 # Cross-process file lock
@@ -5253,6 +5273,35 @@ _SQLITE_HEADER = b"SQLite format 3\x00"
 # serialized by _INIT_LOCK (threading.RLock) as before.
 
 _LOCK_FDS: dict[str, int] = {}  # path -> fd, so we don't double-lock in-process
+
+
+@contextlib.contextmanager
+def _cross_process_init_lock(path: Path):
+    """Serialize first-connect WAL/schema/integrity setup across processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".init.lock")
+    handle = lock_path.open("a+b")
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            if fcntl is None:
+                yield
+                return
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if _IS_WINDOWS:
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            elif fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def _acquire_db_lock(db_path: Path) -> int:
@@ -5349,10 +5398,17 @@ class _LockedConnection:
                     _release_db_lock(db_path)
 
     def __enter__(self):
+        conn = object.__getattribute__(self, '_conn')
+        conn.__enter__()
         return self
 
     def __exit__(self, *args):
-        self.close()
+        # Match sqlite3.Connection context-manager semantics: commit/rollback
+        # the transaction but do NOT close the file descriptor. The explicit
+        # connect_closing() helper below is the leak-safe context manager for
+        # gateway/dashboard call paths.
+        conn = object.__getattribute__(self, '_conn')
+        return conn.__exit__(*args)
 
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, '_conn'), name)
@@ -5432,47 +5488,34 @@ class KanbanDbCorruptError(RuntimeError):
 
 
 def _backup_corrupt_db(path: Path) -> Optional[Path]:
-    """Copy a corrupt DB (and its WAL/SHM sidecars) to a timestamped backup.
-
-    Returns the backup path of the main DB file, or ``None`` if the copy
-    itself failed (the caller still raises loudly in that case).
-
-    Writes are confined to the original DB's parent directory. The
-    backup basename is derived purely from ``path.name``, never from
-    caller-supplied directory segments — no traversal is possible.
-    """
-    # Resolve once and pin the parent so subsequent path operations cannot
-    # escape it. ``Path.resolve()`` collapses any ``..`` segments and
-    # symlinks, and we only ever write inside ``parent``.
+    """Copy a corrupt DB (and sidecars) to a content-addressed backup."""
     resolved = path.resolve()
     parent = resolved.parent
-    base_name = resolved.name  # basename only
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    candidate = parent / f"{base_name}.corrupt.{stamp}.bak"
-    # Defensive: candidate must still be inside parent after construction.
-    # f-string interpolation of ``base_name`` cannot escape ``parent``
-    # because ``base_name`` is itself a resolved basename, but assert it
-    # anyway so static analyzers can see the containment guarantee.
-    if candidate.parent != parent:
-        return None
-    counter = 0
-    while candidate.exists():
-        counter += 1
-        candidate = parent / f"{base_name}.corrupt.{stamp}.{counter}.bak"
-        if candidate.parent != parent:
-            return None
+    base_name = resolved.name
+    digest = hashlib.sha256()
     try:
-        shutil.copy2(resolved, candidate)
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
     except OSError:
         return None
+    token = digest.hexdigest()[:16]
+    candidate = parent / f"{base_name}.corrupt.{token}.bak"
+    if candidate.parent != parent:
+        return None
+    if not candidate.exists():
+        try:
+            shutil.copy2(resolved, candidate)
+        except OSError:
+            return None
     for suffix in ("-wal", "-shm"):
         sidecar = parent / (base_name + suffix)
         if sidecar.parent != parent or not sidecar.exists():
             continue
+        sidecar_backup = parent / (candidate.name + suffix)
+        if sidecar_backup.parent != parent or sidecar_backup.exists():
+            continue
         try:
-            sidecar_backup = parent / (candidate.name + suffix)
-            if sidecar_backup.parent != parent:
-                continue
             shutil.copy2(sidecar, sidecar_backup)
         except OSError:
             pass
@@ -5675,7 +5718,7 @@ def connect(
         # via _INITIALIZED_PATHS so it only runs once per process per path.
         _guard_existing_db_is_healthy(path)
         resolved = str(path.resolve())
-        conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
+        conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
@@ -5743,6 +5786,29 @@ def connect(
             _release_db_lock(path)
         raise
     return _LockedConnection(conn, path, board_slug, release_lock=not _IS_WINDOWS)  # type: ignore[return-value]
+
+
+@contextlib.contextmanager
+def connect_closing(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+):
+    """Open a kanban DB connection and guarantee it is closed on exit.
+
+    Use this instead of ``with kb.connect() as conn:`` in short-lived
+    request/CLI paths. ``sqlite3.Connection`` commits or rolls back on
+    context exit but does not close the file descriptor; this helper closes
+    explicitly so long-lived gateway/dashboard processes don't leak handles.
+    """
+    conn = connect(db_path=db_path, board=board)
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def init_db(
@@ -14184,6 +14250,8 @@ class DispatchResult:
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
+    auto_assigned_default: list[str] = field(default_factory=list)
+    """Task ids assigned from kanban.default_assignee during dispatch."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids skipped because their assignee names a control-plane
     lane (a Claude Code terminal like ``orion-cc``) rather than a Hermes
@@ -14191,6 +14259,8 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
+    """Tasks deferred because their assignee is already at per-profile cap."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -15259,6 +15329,8 @@ def dispatch_once(
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
+    default_assignee: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -15370,9 +15442,25 @@ def dispatch_once(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
-        if not row["assignee"]:
+        assignee = row["assignee"]
+        if not assignee and default_assignee:
+            assignee = str(default_assignee).strip() or None
+            if assignee and not dry_run:
+                with write_txn(conn):
+                    conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, row["id"]))
+            if assignee:
+                result.auto_assigned_default.append(row["id"])
+        if not assignee:
             result.skipped_unassigned.append(row["id"])
             continue
+        if max_in_progress_per_profile is not None:
+            current_for_profile = int(conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running' AND assignee = ?",
+                (assignee,),
+            ).fetchone()[0])
+            if current_for_profile >= max_in_progress_per_profile:
+                result.skipped_per_profile_capped.append((row["id"], assignee, current_for_profile))
+                continue
         eligibility = evaluate_dispatch_eligibility(conn, row["id"], board=board_slug)
         if not eligibility.get("ok"):
             codes = [
@@ -15398,7 +15486,7 @@ def dispatch_once(
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if profile_exists is not None and not profile_exists(assignee):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -15429,7 +15517,7 @@ def dispatch_once(
                     )
             continue
         if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
+            result.spawned.append((row["id"], assignee, ""))
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds, board=board_slug)
         if claimed is None:

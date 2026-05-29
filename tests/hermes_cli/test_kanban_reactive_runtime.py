@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -680,3 +681,159 @@ def test_typed_external_reversible_is_approval_gated_at_dispatch(fresh_home):
         )
         verdict2 = kb.evaluate_dispatch_eligibility(conn, tid, board="serious")
         assert verdict2["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# K. 3A (F5+F3): tick failures are visible + the doctor flags a stale board.
+# ---------------------------------------------------------------------------
+
+
+def test_failing_tick_increments_counter_and_records_event(fresh_home):
+    _approve("serious", _contract())
+    with kb.connect(board="serious") as conn:
+        # Two consecutive failures: counters climb, but no ERROR escalation yet.
+        r1 = kb.record_tick_health_failure(
+            conn, board="serious", kind="reactive", error=RuntimeError("boom-1")
+        )
+        assert r1 == {"streak": 1, "total": 1, "escalated": False}
+        r2 = kb.record_tick_health_failure(
+            conn, board="serious", kind="reactive", error=RuntimeError("boom-2")
+        )
+        assert r2["streak"] == 2 and r2["escalated"] is False
+
+        # The third consecutive failure crosses the escalation threshold.
+        r3 = kb.record_tick_health_failure(
+            conn, board="serious", kind="reactive", error=RuntimeError("boom-3")
+        )
+        assert r3["streak"] == 3 and r3["escalated"] is True
+
+        # Each failure wrote a reactive_tick_error task_event.
+        events = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events WHERE kind = 'reactive_tick_error'"
+        ).fetchone()
+        assert int(events["n"]) == 3
+
+        health = kb.get_tick_health(conn, "serious")
+        assert health["reactive_error_streak"] == 3
+        assert health["reactive_error_total"] == 3
+        assert health["last_error"] == "boom-3"
+
+        # A clean tick resets the consecutive streak (totals are preserved).
+        kb.record_tick_health_success(conn, board="serious")
+        health2 = kb.get_tick_health(conn, "serious")
+        assert health2["reactive_error_streak"] == 0
+        assert health2["reactive_error_total"] == 3
+        assert health2["last_successful_tick"] is not None
+
+
+def test_doctor_flags_stale_board_with_live_work(fresh_home):
+    # Launch compiles an active timer schedule -> the board has live work.
+    _approve("serious", _contract())
+    with kb.connect(board="serious") as conn:
+        # No tick has ever succeeded -> doctor must flag it loudly.
+        report = kb.board_tick_stale(conn, board="serious")
+        assert report["has_live_work"] is True
+        assert report["stale"] is True
+        assert any("never recorded a successful tick" in r for r in report["reasons"])
+
+        # A fresh successful tick clears it.
+        now = int(time.time())
+        kb.record_tick_health_success(conn, board="serious", now=now)
+        ok_report = kb.board_tick_stale(conn, board="serious", now=now)
+        assert ok_report["stale"] is False and ok_report["healthy"] is True
+
+        # But once the last successful tick ages past the staleness budget,
+        # the board is flagged again -- the gateway has gone quiet.
+        stale_report = kb.board_tick_stale(
+            conn, board="serious", now=now + 10_000, staleness_seconds=900
+        )
+        assert stale_report["stale"] is True
+        assert any("not ticking this board" in r for r in stale_report["reasons"])
+
+
+def test_doctor_ignores_board_with_no_live_work(fresh_home):
+    # The default contract carries no optimizer-managed knob (no tunables); once
+    # its timer schedules go inactive the board has nothing for the gateway to
+    # drive, so a missing tick is NOT an error.
+    _approve("quiet", _contract())
+    with kb.connect(board="quiet") as conn:
+        conn.execute(
+            "UPDATE reactive_timer_schedules SET active = 0 WHERE board = ?", ("quiet",)
+        )
+        conn.commit()
+        report = kb.board_tick_stale(conn, board="quiet")
+        assert report["has_live_work"] is False
+        assert report["stale"] is False
+        assert report["healthy"] is True
+
+
+# ---------------------------------------------------------------------------
+# L. 3B (F4): the standalone --force daemon runs the full per-board tick.
+# ---------------------------------------------------------------------------
+
+
+def test_run_daemon_runs_reactive_and_optimizer_and_dispatch(fresh_home, monkeypatch):
+    import threading
+
+    _approve("serious", _contract())
+    calls = {"reactive": 0, "optimizer": 0, "dispatch": 0}
+    orig_reactive = kb.reactive_tick
+    orig_optimizer = kb.optimizer_tick
+    orig_dispatch = kb.dispatch_once
+
+    def _reactive(conn, **kw):
+        calls["reactive"] += 1
+        return orig_reactive(conn, **kw)
+
+    def _optimizer(conn, **kw):
+        calls["optimizer"] += 1
+        return orig_optimizer(conn, **kw)
+
+    def _dispatch(conn, **kw):
+        calls["dispatch"] += 1
+        return orig_dispatch(conn, **kw)
+
+    monkeypatch.setattr(kb, "reactive_tick", _reactive)
+    monkeypatch.setattr(kb, "optimizer_tick", _optimizer)
+    monkeypatch.setattr(kb, "dispatch_once", _dispatch)
+
+    stop = threading.Event()
+
+    def _runner():
+        kb.run_daemon(interval=0.05, stop_event=stop)
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    time.sleep(0.3)
+    stop.set()
+    t.join(timeout=2.0)
+    assert not t.is_alive()
+    # F4: the standalone daemon now drives the FULL tick, not dispatch-only.
+    assert calls["reactive"] >= 1
+    assert calls["optimizer"] >= 1
+    assert calls["dispatch"] >= 1
+
+    # And it stamped tick health, so `doctor` sees a real ticking gateway.
+    with kb.connect(board="serious") as conn:
+        health = kb.get_tick_health(conn, "serious")
+        assert health is not None and health["last_successful_tick"] is not None
+
+
+def test_doctor_cli_exit_code_flags_stale_board(fresh_home):
+    from types import SimpleNamespace
+
+    from hermes_cli import kanban as kbc
+
+    _approve("serious", _contract())
+    args = SimpleNamespace(
+        json=False, all_boards=True, staleness_seconds=kb.TICK_STALENESS_SECONDS,
+    )
+    # Never ticked -> live work but no successful tick -> non-zero exit.
+    assert kbc._cmd_doctor(args) == 1
+
+    # Once every board with live work has a fresh successful tick, doctor is OK.
+    for slug in [b.get("slug") for b in kb.list_boards(include_archived=False)]:
+        with kb.connect(board=slug) as conn:
+            if kb.board_tick_stale(conn, board=slug)["has_live_work"]:
+                kb.record_tick_health_success(conn, board=slug)
+    assert kbc._cmd_doctor(args) == 0

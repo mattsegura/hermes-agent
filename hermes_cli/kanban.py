@@ -3861,6 +3861,60 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     return 0 if (ok_count > 0 or not ids) else 1
 
 
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """Tick-liveness doctor (F5+F3): fail loudly when a board has live work
+    the gateway should be driving but is not ticking it.
+
+    Exit codes: 0 = all checked boards healthy, 1 = at least one board is
+    stale/unhealthy (so it slots into CI / monitoring as a hard signal).
+    """
+    staleness = int(getattr(args, "staleness_seconds", kb.TICK_STALENESS_SECONDS))
+    as_json = bool(getattr(args, "json", False))
+
+    if getattr(args, "all_boards", False):
+        try:
+            slugs = [b.get("slug") or kb.DEFAULT_BOARD
+                     for b in kb.list_boards(include_archived=False)]
+        except Exception:
+            slugs = [kb.DEFAULT_BOARD]
+        slugs = slugs or [kb.DEFAULT_BOARD]
+    else:
+        slugs = [os.environ.get("HERMES_KANBAN_BOARD") or kb.DEFAULT_BOARD]
+
+    reports: list[dict] = []
+    for slug in slugs:
+        with kb.connect_closing(board=slug) as conn:
+            reports.append(kb.board_tick_stale(conn, board=slug, staleness_seconds=staleness))
+
+    stale = [r for r in reports if r.get("stale")]
+
+    if as_json:
+        print(json.dumps({"healthy": not stale, "boards": reports}, indent=2))
+        return 1 if stale else 0
+
+    for r in reports:
+        slug = r["board"]
+        if r.get("stale"):
+            print(f"UNHEALTHY  {slug}", file=sys.stderr)
+            for reason in r.get("reasons", []):
+                print(f"    - {reason}", file=sys.stderr)
+        elif not r.get("has_live_work"):
+            print(f"idle       {slug} (no live reactive/optimizer work)")
+        else:
+            age = r.get("age_seconds")
+            age_str = f"{age}s ago" if age is not None else "n/a"
+            print(f"OK         {slug} (last successful tick: {age_str})")
+
+    if stale:
+        print(
+            f"\nkanban doctor: {len(stale)} board(s) have live work but are not "
+            f"being ticked. Is `hermes gateway start` running?",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove scratch workspaces of archived tasks, prune old events, and
     delete old worker logs."""
