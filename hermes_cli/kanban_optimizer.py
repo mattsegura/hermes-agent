@@ -78,9 +78,21 @@ BINARY_REWARD_KINDS: frozenset[str] = frozenset({"conversion", "reply", "loop_cl
 #: flip the sign so the learner always maximizes a utility.
 CONTINUOUS_REWARD_KINDS: frozenset[str] = frozenset({"time_to_done", "cost"})
 
-#: The single bounded knob this minimal optimizer manages, by preference order.
-#: The first name present in a board's ``tunables`` is the one we tune. This is
-#: a list purely so a future P3 can extend it without restructuring the loop.
+#: The bounded knobs this optimizer manages, by preference order. Every present
+#: managed knob is tuned each tick (E3 multi-knob loop in
+#: :func:`hermes_cli.kanban_db.optimizer_tick`).
+#:
+#: E1 TODO (concurrency caps): the dispatch caps in
+#: :data:`CONCURRENCY_CAP_KNOBS` are NOT listed here yet. The E2 read-seam
+#: (:func:`managed_cap_default`, wired into ``dispatch_once``) now makes a write
+#: to a cap tunable take effect, so adding a cap name here would no longer be a
+#: silent no-op at the dispatch layer. It is still withheld because the Thompson
+#: learner has no outcome attribution for a *concurrency* knob (rewards are
+#: attributed via ``knob_snapshot`` on ``outcome`` signals, which today snapshot
+#: cadence-type knobs), and :func:`is_cadence_knob` would mis-classify a cap as a
+#: timer-cadence knob and try to re-arm reactive schedules on a cap change. Wiring
+#: a cap into the learner needs (a) a cap-aware reward signal + snapshot and
+#: (b) splitting the cadence re-arm from the generic apply path -- a follow-up.
 OPTIMIZER_MANAGED_KNOBS: tuple[str, ...] = ("follow_up_interval_hours", "cadence_hours")
 
 # ---------------------------------------------------------------------------
@@ -859,6 +871,91 @@ def is_cadence_knob(knob: Optional[str]) -> bool:
     return bool(knob) and knob in OPTIMIZER_MANAGED_KNOBS
 
 
+# ---------------------------------------------------------------------------
+# D1 owner-class: who is allowed to autonomously write a knob (safety-by-
+# construction). A knob spec MAY carry an ``owner_class`` declaring whether the
+# autonomous optimizer is permitted to move it in-bounds, or whether even an
+# in-bounds write must route to the owner approval gate. This makes "the machine
+# cannot raise its own ceiling" STRUCTURAL: a budget/lifetime cap knob declared
+# ``owner-tunable`` (or ``infra-fixed``) is never autonomously written, no matter
+# how tempting the posterior, because the optimizer is refused at the apply
+# boundary -- not merely discouraged by reward shaping.
+# ---------------------------------------------------------------------------
+
+#: Knob owner-classes (who may autonomously write the knob).
+OWNER_CLASS_INFRA_FIXED: str = "infra-fixed"          # never tuned by anyone at runtime
+OWNER_CLASS_OWNER_TUNABLE: str = "owner-tunable"      # only the owner may change it
+OWNER_CLASS_OPTIMIZER_TUNABLE: str = "optimizer-tunable"  # the optimizer may tune in-bounds
+
+OWNER_CLASSES: frozenset[str] = frozenset({
+    OWNER_CLASS_INFRA_FIXED,
+    OWNER_CLASS_OWNER_TUNABLE,
+    OWNER_CLASS_OPTIMIZER_TUNABLE,
+})
+
+#: Conservative default when a knob declares NO owner_class: treat it as
+#: owner-tunable (NOT autonomously writable). The exception is the historically
+#: optimizer-managed knobs (:data:`OPTIMIZER_MANAGED_KNOBS`), which are
+#: effectively optimizer-tunable so the existing closed loop keeps working
+#: without every board re-declaring owner_class.
+DEFAULT_OWNER_CLASS: str = OWNER_CLASS_OWNER_TUNABLE
+
+
+def normalize_owner_class(value: Any) -> Optional[str]:
+    """Return the canonical owner-class string, or None if not in the vocab.
+
+    Accepts a few friendly aliases (underscores, ``optimizer``/``owner``/
+    ``infra`` shorthands) so a contract author is not tripped up by spelling.
+    """
+    if not isinstance(value, str):
+        return None
+    canon = value.strip().lower().replace("_", "-")
+    if canon in OWNER_CLASSES:
+        return canon
+    aliases = {
+        "optimizer": OWNER_CLASS_OPTIMIZER_TUNABLE,
+        "optimizer-managed": OWNER_CLASS_OPTIMIZER_TUNABLE,
+        "auto": OWNER_CLASS_OPTIMIZER_TUNABLE,
+        "owner": OWNER_CLASS_OWNER_TUNABLE,
+        "human": OWNER_CLASS_OWNER_TUNABLE,
+        "infra": OWNER_CLASS_INFRA_FIXED,
+        "fixed": OWNER_CLASS_INFRA_FIXED,
+        "immutable": OWNER_CLASS_INFRA_FIXED,
+    }
+    return aliases.get(canon)
+
+
+def knob_owner_class(spec: Optional[dict], *, knob: Optional[str] = None) -> str:
+    """Resolve the effective owner-class of a knob.
+
+    Resolution order:
+
+    1. An explicit, recognised ``owner_class`` on the spec wins.
+    2. Otherwise a historically optimizer-managed knob
+       (:data:`OPTIMIZER_MANAGED_KNOBS`) is treated as ``optimizer-tunable`` so
+       the existing closed loop keeps working with no contract changes.
+    3. Otherwise the conservative :data:`DEFAULT_OWNER_CLASS`
+       (``owner-tunable`` -- NOT autonomously writable).
+    """
+    if isinstance(spec, dict):
+        declared = normalize_owner_class(spec.get("owner_class"))
+        if declared is not None:
+            return declared
+    if knob and knob in OPTIMIZER_MANAGED_KNOBS:
+        return OWNER_CLASS_OPTIMIZER_TUNABLE
+    return DEFAULT_OWNER_CLASS
+
+
+def is_optimizer_writable(spec: Optional[dict], *, knob: Optional[str] = None) -> bool:
+    """True iff the autonomous optimizer may write this knob in-bounds.
+
+    Only ``optimizer-tunable`` knobs (declared, or the legacy managed knobs)
+    may be moved autonomously; ``owner-tunable`` and ``infra-fixed`` knobs must
+    route even an in-bounds write to the owner approval gate.
+    """
+    return knob_owner_class(spec, knob=knob) == OWNER_CLASS_OPTIMIZER_TUNABLE
+
+
 def managed_cadence_default(
     contract: Optional[dict], *, knob: Optional[str] = None
 ) -> Optional[float]:
@@ -879,6 +976,53 @@ def managed_cadence_default(
         return None
     if isinstance(default, (int, float)) and default > 0:
         return float(default)
+    return None
+
+
+#: Concurrency-cap knob names the dispatcher resolves from the contract's
+#: ``runtime.tunables`` (E2 read-seam). These are the dispatch caps the gateway
+#: reads from ``config.yaml``; declaring one as a tunable lets the optimizer's
+#: write to ``tunables[knob].default`` flow through to the live cap (config is
+#: the FALLBACK). Mirrors how :func:`managed_cadence_default` feeds cadence.
+#:
+#: NOTE (E1): these are NOT yet in :data:`OPTIMIZER_MANAGED_KNOBS` -- the learner
+#: tunes cadence knobs only. Adding a cap name there is a future step now that
+#: the read-seam below makes such a write take effect (no longer a no-op).
+CONCURRENCY_CAP_KNOBS: tuple[str, ...] = (
+    "max_in_progress",
+    "max_in_progress_per_profile",
+    "max_spawn",
+)
+
+
+def managed_cap_default(
+    contract: Optional[dict], knob: str
+) -> Optional[int]:
+    """Return a dispatch concurrency-cap knob's default from the contract.
+
+    E2 read-seam. The gateway dispatcher resolves ``max_in_progress`` /
+    ``max_in_progress_per_profile`` / ``max_spawn`` from
+    ``contract.runtime.tunables[knob].default`` with the ``config.yaml`` value
+    as FALLBACK -- mirroring how :func:`managed_cadence_default` feeds cadence.
+    Without this seam an optimizer write to a cap tunable is a silent no-op
+    (caps were read only from config).
+
+    Returns the declared default coerced to a positive ``int`` when present and
+    valid, else ``None`` (then the caller's config value is used). Booleans are
+    rejected (a YAML ``true``/``false`` is not a cap), and values below ``1``
+    are rejected (a cap of zero/negative is "no cap", which the caller already
+    expresses with ``None`` -- so we defer to the config fallback rather than
+    silently disable the cap from a malformed tunable).
+    """
+    if not knob:
+        return None
+    default = knob_default(find_knob_spec(contract, knob))
+    if isinstance(default, bool):
+        return None
+    if isinstance(default, (int, float)):
+        coerced = int(default)
+        if coerced >= 1:
+            return coerced
     return None
 
 

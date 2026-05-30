@@ -1312,6 +1312,43 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    # --- sensors (Tier-1 sensor inspection + owner overrides) ---
+    p_sensors = sub.add_parser(
+        "sensors",
+        help="Inspect Tier-1 sensors and apply owner overrides (e.g. force-close "
+             "a tripped circuit breaker).",
+        description=(
+            "Tier-1 sensors (heartbeat, circuit breaker, budget) auto-recover on "
+            "their own. The `reset` subcommand is an OWNER override that "
+            "force-closes a tripped circuit breaker immediately (after the owner "
+            "has fixed the underlying fault) instead of waiting out the cooldown. "
+            "The machine's own recovery path is unchanged."
+        ),
+    )
+    sensors_sub = p_sensors.add_subparsers(dest="sensors_action")
+
+    s_list = sensors_sub.add_parser(
+        "list", aliases=["ls"],
+        help="List declared sensors and their current persisted state",
+    )
+    s_list.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    s_reset = sensors_sub.add_parser(
+        "reset",
+        help="OWNER override: force a tripped circuit breaker back to 'closed'",
+    )
+    s_reset.add_argument(
+        "--sensor", default="circuit_breaker", metavar="<kind|key>",
+        help="Sensor kind ('circuit_breaker') or a specific sensor key to reset. "
+             "Only circuit breakers are resettable; omit a key to reset every "
+             "circuit breaker on the board (default: circuit_breaker).",
+    )
+    s_reset.add_argument(
+        "--reason", default=None,
+        help="Optional audit reason recorded with the override.",
+    )
+    s_reset.add_argument("--json", action="store_true", help="Emit JSON output")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1519,6 +1556,7 @@ def _kanban_command_dispatch(args: argparse.Namespace, action: str) -> int:
         "decompose":  _cmd_decompose,
         "doctor":   _cmd_doctor,
         "gc":       _cmd_gc,
+        "sensors":  _cmd_sensors,
     }
     handler = handlers.get(action)
     if not handler:
@@ -4437,6 +4475,81 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     if not all_flag:
         return 0 if ok_count == 1 else 1
     return 0 if (ok_count > 0 or not ids) else 1
+
+
+def _cmd_sensors(args: argparse.Namespace) -> int:
+    """Inspect Tier-1 sensors and apply owner overrides.
+
+    Subcommands:
+
+    * ``list`` -- show declared sensors + their current persisted state.
+    * ``reset`` -- OWNER override: force a tripped circuit breaker back to
+      ``closed`` (D2 human re-enable). Auto-recovery is unchanged; this is the
+      escape hatch for when the owner has fixed the fault and wants dispatch
+      restored without waiting out the cooldown.
+    """
+    action = getattr(args, "sensors_action", None) or "list"
+    slug = os.environ.get("HERMES_KANBAN_BOARD") or kb.DEFAULT_BOARD
+    as_json = bool(getattr(args, "json", False))
+
+    if action in {"list", "ls"}:
+        with kb.connect_closing(board=slug) as conn:
+            model = kb.build_sensor_state_read_model(conn, board=slug)
+        if as_json:
+            print(json.dumps(model, indent=2))
+            return 0
+        declared = model.get("declared", [])
+        states = model.get("states", [])
+        if not declared and not states:
+            print(f"No Tier-1 sensors declared on board {slug!r}.")
+            return 0
+        print(f"Sensors on board {slug!r}:")
+        for d in declared:
+            print(f"  - {d.get('kind')}/{d.get('key')}"
+                  + (f"  gates={d.get('gates_side_effect_class')}"
+                     if d.get("gates_side_effect_class") else ""))
+        if states:
+            print("Current state:")
+            for s in states:
+                ent = s.get("entity_ref")
+                ent_s = f" entity={ent}" if ent else ""
+                print(f"  - {s.get('sensor_kind')}/{s.get('sensor_key')}: "
+                      f"{s.get('status')}{ent_s}")
+        return 0
+
+    if action == "reset":
+        sensor = str(getattr(args, "sensor", "circuit_breaker") or "circuit_breaker").strip()
+        reason = getattr(args, "reason", None)
+        actor = _profile_author()
+        # Only circuit breakers are resettable. Treat the value as a sensor KEY
+        # unless it is exactly the kind token 'circuit_breaker'/'circuit', in
+        # which case reset every circuit breaker on the board.
+        kind_tokens = {"circuit_breaker", "circuit", "circuit-breaker", "all"}
+        key_filter = None if sensor.lower() in kind_tokens else sensor
+        with kb.connect_closing(board=slug) as conn:
+            result = kb.force_close_circuit_breaker(
+                conn, board=slug, sensor_key=key_filter, actor=actor, reason=reason,
+            )
+        if as_json:
+            print(json.dumps(result, indent=2))
+            return 0
+        reset = result.get("reset", [])
+        if not reset:
+            target = f" {key_filter!r}" if key_filter else ""
+            print(f"kanban: no circuit breaker{target} found on board {slug!r}.",
+                  file=sys.stderr)
+            return 1
+        for r in reset:
+            if r.get("transitioned"):
+                print(f"Force-closed circuit breaker {r['sensor_key']!r}: "
+                      f"{r['previous_status']} -> {r['status']} (by {actor}).")
+            else:
+                print(f"Circuit breaker {r['sensor_key']!r} already "
+                      f"{r['status']} -- no change.")
+        return 0
+
+    print(f"kanban sensors: unknown action {action!r}", file=sys.stderr)
+    return 2
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:

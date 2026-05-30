@@ -124,10 +124,14 @@ SENSOR_REQUIRED_KNOBS: dict[str, tuple[str, ...]] = {
 }
 
 #: Logical knobs a sensor kind MAY additionally bind (also bounded if present).
+#: D3: ``lifetime_cap`` is an OPTIONAL budget knob -- a non-resetting cumulative
+#: ceiling. When bound, lifetime spend >= cap blocks the budget sensor
+#: (over_lifetime) independent of the per-window meter. When absent the budget
+#: sensor behaves exactly as before.
 SENSOR_OPTIONAL_KNOBS: dict[str, tuple[str, ...]] = {
     "heartbeat": ("max_missed_beats",),
     "circuit_breaker": (),
-    "budget": (),
+    "budget": ("lifetime_cap",),
 }
 
 

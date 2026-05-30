@@ -1,0 +1,239 @@
+# capability_catalog.yaml
+# =============================================================================
+# GENERIC, DOMAIN-FREE capability/integration catalog (refreshed-plan item B1).
+#
+# DESIGN PRINCIPLE (critical): this file is DATA, not code. Adding a new tool or
+# a new domain = adding entries here, NEVER editing the resolver. There is zero
+# domain branching anywhere. Entries are keyed by the integration `id` and are
+# matched purely by the abstract `capability_type` strings they `provides`.
+#
+# The goal -> needed_capability_types inference is the MODEL's job at runtime
+# (intake synthesis). This catalog only declares what each integration can
+# provide and what it costs/needs to connect. The resolver is a generic matcher.
+#
+# Entry schema (every integration):
+#   id:            stable string id (becomes provider_policy route `provider`)
+#   provides:      [capability_type ...]   abstract verbs, NOT domains
+#   access:
+#     kind:        oauth | api_key | account
+#     required_inputs:   [ {key,label,type,required} ]  -- type in
+#                        {secret,string,number}. These map 1:1 onto the engine's
+#                        amendment required_inputs schema
+#                        (hermes_cli/kanban_db.py _normalize_amendment_required_inputs).
+#     inject_path: dot-path under which a NON-secret connection hint is merged
+#                  into the contract (provider_policy.<cap>.<...>). Secret-typed
+#                  inputs are recorded as provisioning evidence, never written to
+#                  board.json -- the resolver only emits the path; the engine's
+#                  set_amendment_inputs decides secret-vs-inject at provision time.
+#   cost:
+#     model:       subscription | per_call | ad_spend | free
+#     notes:       free-text human note (nothing parses this)
+#   read_or_write: [read|write]
+#
+# capability_type vocabulary is OPEN. The seed set below uses verbs like:
+#   read:subscription_revenue, read:install_attribution, read:product_analytics,
+#   read:store_analytics, write:ad_spend, write:store_listing,
+#   write:lifecycle_message, write:push_message, read:support_inbox,
+#   write:support_reply
+# Domains never appear as keys; a new domain just introduces new verbs + entries.
+# =============================================================================
+
+integrations:
+
+  # --- App store / distribution ---------------------------------------------
+  - id: app_store_connect
+    provides:
+      - read:store_analytics
+      - read:subscription_revenue
+      - write:store_listing
+    access:
+      kind: api_key
+      required_inputs:
+        - {key: asc_issuer_id,  label: "App Store Connect API Issuer ID", type: string, required: true}
+        - {key: asc_key_id,     label: "App Store Connect API Key ID",    type: string, required: true}
+        - {key: asc_private_key, label: "App Store Connect API Private Key (.p8)", type: secret, required: true}
+      inject_path: "provider_policy.{capability_type}.provider"
+    cost:
+      model: free
+      notes: "Free API with an Apple Developer Program membership ($99/yr, billed separately)."
+    read_or_write: [read, write]
+
+  - id: google_play_console
+    provides:
+      - read:store_analytics
+      - read:subscription_revenue
+      - write:store_listing
+    access:
+      kind: oauth
+      required_inputs:
+        - {key: gp_service_account_json, label: "Google Play service account JSON", type: secret, required: true}
+        - {key: gp_package_name,         label: "Android package name", type: string, required: true}
+      inject_path: "provider_policy.{capability_type}.provider"
+    cost:
+      model: free
+      notes: "Free API; requires a Google Play Developer account (one-time $25)."
+    read_or_write: [read, write]
+
+  # --- Subscription / revenue infra -----------------------------------------
+  - id: revenuecat
+    provides:
+      - read:subscription_revenue
+      - read:product_analytics
+    access:
+      kind: api_key
+      required_inputs:
+        - {key: revenuecat_api_key, label: "RevenueCat secret API key", type: secret, required: true}
+        - {key: revenuecat_project_id, label: "RevenueCat project ID", type: string, required: false}
+      inject_path: "provider_policy.{capability_type}.provider"
+    cost:
+      model: subscription
+      notes: "Free under a monthly tracked-revenue threshold, then 1% of tracked revenue."
+    read_or_write: [read]
+
+  - id: stripe
+    provides:
+      - read:subscription_revenue
+    access:
+      kind: api_key
+      required_inputs:
+        - {key: stripe_secret_key, label: "Stripe secret key (sk_live_...)", type: secret, required: true}
+      inject_path: "provider_policy.{capability_type}.provider"
+    cost:
+      model: per_call
+      notes: "API itself is free; Stripe takes per-transaction processing fees on payments."
+    read_or_write: [read]
+
+  # --- Product / behavioural analytics --------------------------------------
+  - id: mixpanel
+    provides:
+      - read:product_analytics
+    access:
+      kind: api_key
+      required_inputs:
+        - {key: mixpanel_project_id,    label: "Mixpanel project ID", type: string, required: true}
+        - {key: mixpanel_service_secret, label: "Mixpanel service account secret", type: secret, required: true}
+      inject_path: "provider_policy.{capability_type}.provider"
+    cost:
+      model: subscription
+      notes: "Free up to a monthly event volume, then usage-based subscription."
+    read_or_write: [read]
+
+  - id: amplitude
+    provides:
+      - read:product_analytics
+    access:
+      kind: api_key
+      required_inputs:
+        - {key: amplitude_api_key,    label: "Amplitude API key", type: secret, required: true}
+        - {key: amplitude_secret_key, label: "Amplitude secret key", type: secret, required: true}
+      inject_path: "provider_policy.{capability_type}.provider"
+    cost:
+      model: subscription
+      notes: "Free Starter plan up to an MTU cap, then per-seat/usage subscription."
+    read_or_write: [read]
+
+  - id: posthog
+    provides:
+      - read:product_analytics
+    access:
+      kind: api_key
+      required_inputs:
+        - {key: posthog_project_api_key, label: "PostHog project API key", type: secret, required: true}
+        - {key: posthog_host,            label: "PostHog host (cloud or self-hosted URL)", type: string, required: false}
+      inject_path: "provider_policy.{capability_type}.base_url"
+    cost:
+      model: subscription
+      notes: "Generous free tier; usage-based pricing after free event allotment. Self-host = free."
+    read_or_write: [read]
+
+  # --- Attribution -----------------------------------------------------------
+  - id: apple_search_ads
+    provides:
+      - read:install_attribution
+      - write:ad_spend
+    access:
+      kind: oauth
+      required_inputs:
+        - {key: asa_org_id,       label: "Apple Search Ads org ID", type: string, required: true}
+        - {key: asa_client_secret, label: "Apple Search Ads API client secret", type: secret, required: true}
+      inject_path: "provider_policy.{capability_type}.provider"
+    cost:
+      model: ad_spend
+      notes: "API is free; spend is the advertiser's Apple Search Ads budget."
+    read_or_write: [read, write]
+
+  # --- Paid acquisition ------------------------------------------------------
+  - id: meta_ads
+    provides:
+      - write:ad_spend
+      - read:install_attribution
+    access:
+      kind: oauth
+      required_inputs:
+        - {key: meta_access_token, label: "Meta Marketing API access token", type: secret, required: true}
+        - {key: meta_ad_account_id, label: "Meta ad account ID (act_...)", type: string, required: true}
+      inject_path: "provider_policy.{capability_type}.provider"
+    cost:
+      model: ad_spend
+      notes: "API is free; spend is the advertiser's Meta Ads budget (requires a budget cap)."
+    read_or_write: [read, write]
+
+  - id: google_ads
+    provides:
+      - write:ad_spend
+      - read:install_attribution
+    access:
+      kind: oauth
+      required_inputs:
+        - {key: google_ads_developer_token, label: "Google Ads developer token", type: secret, required: true}
+        - {key: google_ads_customer_id,     label: "Google Ads customer ID", type: string, required: true}
+        - {key: google_ads_refresh_token,   label: "Google Ads OAuth refresh token", type: secret, required: true}
+      inject_path: "provider_policy.{capability_type}.provider"
+    cost:
+      model: ad_spend
+      notes: "API is free; spend is the advertiser's Google Ads budget (requires a budget cap)."
+    read_or_write: [read, write]
+
+  # --- Lifecycle / messaging -------------------------------------------------
+  - id: customerio
+    provides:
+      - write:lifecycle_message
+    access:
+      kind: api_key
+      required_inputs:
+        - {key: customerio_site_id,  label: "Customer.io site ID", type: string, required: true}
+        - {key: customerio_api_key,  label: "Customer.io Track/App API key", type: secret, required: true}
+      inject_path: "provider_policy.{capability_type}.provider"
+    cost:
+      model: subscription
+      notes: "Monthly subscription tiered by tracked profiles / message volume."
+    read_or_write: [write]
+
+  - id: onesignal
+    provides:
+      - write:push_message
+    access:
+      kind: api_key
+      required_inputs:
+        - {key: onesignal_app_id,   label: "OneSignal app ID", type: string, required: true}
+        - {key: onesignal_api_key,  label: "OneSignal REST API key", type: secret, required: true}
+      inject_path: "provider_policy.{capability_type}.provider"
+    cost:
+      model: subscription
+      notes: "Free push tier; paid plans for higher volume and advanced features."
+    read_or_write: [write]
+
+  # --- Support / two-way conversation ---------------------------------------
+  - id: intercom
+    provides:
+      - read:support_inbox
+      - write:support_reply
+    access:
+      kind: oauth
+      required_inputs:
+        - {key: intercom_access_token, label: "Intercom access token", type: secret, required: true}
+      inject_path: "provider_policy.{capability_type}.provider"
+    cost:
+      model: subscription
+      notes: "Seat + usage based monthly subscription."
+    read_or_write: [read, write]

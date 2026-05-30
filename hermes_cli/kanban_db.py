@@ -1923,6 +1923,20 @@ def validate_business_runtime_contract(contract: Optional[Any]) -> dict[str, Any
     )
     if errors:
         status = "invalid"
+    # Unified launch-completeness (report-mode): run the STRONG structural
+    # invariants + net-new rules through ONE checker so the dispatch gate (which
+    # consults this function) finally SEES what only the invariants enforced.
+    # Surfaced as warnings + a structured `completeness` block; non-blocking until
+    # per-dimension enforce after a soak. Defensive: never breaks validate.
+    try:
+        from hermes_cli.launch_completeness import assess_launch_completeness
+
+        _completeness = assess_launch_completeness(normalized, enforce=False)
+        for _finding in list(_completeness.get("errors", [])) + list(_completeness.get("warnings", [])):
+            if _finding not in warnings:
+                warnings.append(_finding)
+    except Exception as _exc:  # pragma: no cover - defensive
+        _completeness = {"ok": True, "errors": [], "warnings": [], "dimensions": {}, "unavailable": repr(_exc)}
     return {
         "ok": not errors and not missing,
         "status": status,
@@ -1933,6 +1947,7 @@ def validate_business_runtime_contract(contract: Optional[Any]) -> dict[str, Any
         "assumptions": assumptions,
         "requires_owner_review": not errors and not missing,
         "owner_summary": normalized.get("owner_summary"),
+        "completeness": _completeness,
     }
 
 
@@ -3057,6 +3072,174 @@ def _mark_launch_intake_provenance(
     return merged
 
 
+def _contract_needed_capability_types(contract: dict[str, Any]) -> list[str]:
+    """Extract the model-declared abstract capability verbs from a contract.
+
+    Reads ``needed_capability_types`` from wherever the synthesizer chose to emit
+    it -- a top-level field (preferred, per the synthesis prompt) or, as a
+    fallback, ``runtime.provider_policy.needed_capability_types`` /
+    ``workflow.needed_capability_types``. Returns a de-duplicated string list.
+
+    There is ZERO goal->capability hardcoding here: the verbs come entirely from
+    the model's synthesized contract. An absent field yields an empty list (the
+    enrichment is then a no-op).
+    """
+    candidates: list[Any] = []
+    candidates.extend(_contract_list(contract.get("needed_capability_types")))
+    runtime = _contract_object(contract.get("runtime"))
+    policy = _contract_object(runtime.get("provider_policy"))
+    candidates.extend(_contract_list(policy.get("needed_capability_types")))
+    candidates.extend(_contract_list(runtime.get("needed_capability_types")))
+    workflow = _contract_object(contract.get("workflow"))
+    candidates.extend(_contract_list(workflow.get("needed_capability_types")))
+    return _string_list(candidates)
+
+
+def _provider_route_ids(value: Any, acc: set[str]) -> None:
+    """Recursively collect ``provider``/``providers`` ids from a policy subtree."""
+    if isinstance(value, dict):
+        for key in ("provider", "providers"):
+            raw = value.get(key)
+            if isinstance(raw, str) and raw.strip():
+                acc.add(raw.strip())
+            elif isinstance(raw, (list, tuple, set)):
+                acc.update(str(p).strip() for p in raw if str(p).strip())
+        for sub in value.values():
+            if isinstance(sub, (dict, list, tuple, set)):
+                _provider_route_ids(sub, acc)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            _provider_route_ids(item, acc)
+
+
+def _contract_connected_provider_ids(contract: dict[str, Any]) -> set[str]:
+    """Collect integration ids already wired into runtime.provider_policy.
+
+    These become the resolver's ``have`` set: an integration already present as a
+    material ``provider`` route (anywhere under provider_policy, including the
+    ``systems`` sub-map) is reported ``connected`` and contributes no new
+    required_inputs or cost line, so re-running enrichment is idempotent and
+    never re-prompts for an already-provisioned system.
+    """
+    runtime = _contract_object(contract.get("runtime"))
+    policy = _contract_object(runtime.get("provider_policy"))
+    have: set[str] = set()
+    _provider_route_ids(policy, have)
+    return have
+
+
+def _enrich_contract_with_capabilities(contract: dict[str, Any]) -> dict[str, Any]:
+    """ADDITIVELY enrich a synthesized contract with capability-discovery output.
+
+    REPORT-MODE / NON-BREAKING: this never blocks launch and never removes or
+    rewrites an existing field. It only fills gaps:
+
+      * a provider_policy route keyed by the abstract capability verb gets a
+        ``provider`` = resolved integration_id ONLY when no material route is
+        already present for that verb;
+      * the resolver's required_inputs are appended (de-duplicated by key) onto a
+        new additive top-level ``launch_required_inputs`` list;
+      * a one-line cost summary is appended to owner_summary.
+
+    The whole body is wrapped by the caller in try/except so a resolver/catalog
+    failure can never break synthesis. Returns the (possibly) enriched contract;
+    on no declared capabilities it returns the input unchanged.
+    """
+    needed = _contract_needed_capability_types(contract)
+    if not needed:
+        return contract
+
+    from hermes_cli import capability_resolver as _cap
+
+    have = _contract_connected_provider_ids(contract)
+    result = _cap.resolve_capabilities(needed, have=have)
+    resolved = result.get("resolved") or []
+    if not resolved:
+        return contract
+
+    enriched = dict(contract)
+    runtime = dict(_contract_object(enriched.get("runtime")))
+    policy = dict(_contract_object(runtime.get("provider_policy")))
+    # Routes live under provider_policy.systems, keyed by the capability verb,
+    # carrying a material ``provider`` key (= the resolved integration_id). This
+    # matches the synthesized contract shape (provider_policy.systems.<...>) so
+    # the dispatch gate reads a real route, not free text.
+    systems = dict(_contract_object(policy.get("systems")))
+
+    # 1) Additively route each capability verb to its resolved integration. Only
+    #    fill verbs that lack a material route already -- never clobber an
+    #    owner/model-declared provider.
+    newly_routed: list[str] = []
+    for row in resolved:
+        cap = str(row.get("capability_type") or "").strip()
+        integration_id = str(row.get("integration_id") or "").strip()
+        if not cap or not integration_id:
+            continue
+        existing = systems.get(cap)
+        if _policy_has_material_route(existing):
+            continue
+        route = dict(_contract_object(existing))
+        route["provider"] = integration_id
+        route.setdefault("access_state", row.get("access_state"))
+        route.setdefault("capability_type", cap)
+        systems[cap] = route
+        newly_routed.append(cap)
+
+    policy["systems"] = systems
+    runtime["provider_policy"] = policy
+    enriched["runtime"] = runtime
+
+    # 2) Append resolver required_inputs onto an additive launch-level list,
+    #    de-duplicated by key against anything already declared. Wire-compatible
+    #    with the engine amendment required_inputs schema.
+    existing_inputs = _contract_list(enriched.get("launch_required_inputs"))
+    seen_keys = {
+        str(_contract_object(ri).get("key") or "").strip()
+        for ri in existing_inputs
+        if str(_contract_object(ri).get("key") or "").strip()
+    }
+    appended_inputs = list(existing_inputs)
+    for ri in result.get("required_inputs") or []:
+        key = str(_contract_object(ri).get("key") or "").strip()
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        appended_inputs.append(ri)
+    if appended_inputs:
+        enriched["launch_required_inputs"] = appended_inputs
+
+    # 3) Add a cost summary line to owner_summary (report-mode, human-readable).
+    cost_plan = result.get("cost_plan") or {}
+    cost_bits: list[str] = []
+    for bucket, label in (
+        ("external_subscriptions", "subscription"),
+        ("ad_spend", "ad spend"),
+        ("per_call", "per-call"),
+    ):
+        ids = [str(c.get("integration_id") or "").strip()
+               for c in (cost_plan.get(bucket) or [])
+               if str(c.get("integration_id") or "").strip()]
+        if ids:
+            cost_bits.append(f"{label}: {', '.join(ids)}")
+    gaps = [g for g in (result.get("gaps") or []) if str(g).strip()]
+    summary_obj = dict(_contract_object(enriched.get("owner_summary")))
+    if newly_routed or cost_bits or gaps:
+        parts = []
+        if newly_routed:
+            parts.append(
+                f"Capability discovery wired {len(newly_routed)} integration "
+                f"route(s): {', '.join(newly_routed)}."
+            )
+        if cost_bits:
+            parts.append("Estimated cost surfaces -- " + "; ".join(cost_bits) + ".")
+        if gaps:
+            parts.append("No integration found for: " + ", ".join(gaps) + ".")
+        summary_obj["capability_cost_summary"] = " ".join(parts)
+        enriched["owner_summary"] = summary_obj
+
+    return enriched
+
+
 def _apply_synthesized_launch_contract(
     draft: dict[str, Any],
     intake: dict[str, Any],
@@ -3067,6 +3250,15 @@ def _apply_synthesized_launch_contract(
 ) -> dict[str, Any]:
     """Fold an auxiliary-synthesized contract into the launch-intake draft."""
     merged = normalize_board_operating_contract(synthesized)
+    # Capability discovery (report-mode, additive). Derive needed capability
+    # verbs the model declared and enrich the contract with resolved integration
+    # routes + required_inputs + a cost line. A resolver/catalog failure must
+    # NEVER break synthesis, so the whole call is guarded.
+    try:
+        merged = _enrich_contract_with_capabilities(merged)
+    except Exception:  # pragma: no cover - defensive: enrichment never blocks
+        _log.warning("launch_intake: capability enrichment skipped (resolver error)",
+                     exc_info=True)
     answers = _normalize_launch_intake_answers(intake.get("answers"))
     round_number = _launch_intake_latest_answer_round(intake)
     new_intake = dict(intake)
@@ -3119,6 +3311,50 @@ def _record_launch_intake_invariant_failure(
         intake["invariants"] = report.as_dict()
     except Exception:  # pragma: no cover - defensive
         intake["invariants"] = {"ok": False}
+    merged["launch_intake"] = intake
+    return merged
+
+
+def _run_degraded_fallback_through_completeness(
+    contract: dict[str, Any]
+) -> dict[str, Any]:
+    """Run the degraded universal-drafter fallback through the SAME unified
+    completeness checker the dispatch gate consults (audit: the degraded path
+    bypassed both ``check_contract_invariants`` and ``assess_launch_completeness``
+    -- a degraded board could dispatch having passed only the presence checker).
+
+    REPORT-MODE / NON-BREAKING: this runs ``assess_launch_completeness`` in
+    report-mode (enforce=False), attaches the merged report to
+    ``launch_intake.completeness`` for telemetry, and logs a warning summary. It
+    NEVER blocks, mutates the contract shape, or raises -- a degraded fallback
+    that already shipped keeps shipping; we just stop the checks being silent.
+    """
+    if not isinstance(contract, dict):
+        return contract
+    try:
+        from hermes_cli.launch_completeness import assess_launch_completeness
+
+        report = assess_launch_completeness(contract, enforce=False)
+    except Exception as exc:  # pragma: no cover - defensive: never break the fallback
+        _log.warning(
+            "launch_intake: degraded fallback completeness check raised: %r", exc
+        )
+        return contract
+
+    findings = list(report.get("errors", [])) + list(report.get("warnings", []))
+    if findings:
+        _log.warning(
+            "launch_intake: degraded universal-drafter fallback has %d completeness "
+            "finding(s) (report-mode, non-blocking): %s",
+            len(findings),
+            "; ".join(findings[:5]),
+        )
+    intake = _contract_object(contract.get("launch_intake"))
+    if not intake:
+        return contract
+    merged = dict(contract)
+    intake = dict(intake)
+    intake["completeness"] = report
     merged["launch_intake"] = intake
     return merged
 
@@ -3209,6 +3445,11 @@ def _synthesize_launch_contract_from_intake(draft: dict[str, Any]) -> dict[str, 
 
     # Degraded fallback: deterministic universal drafter.
     fallback = _build_universal_contract_from_launch_intake(draft)
+    # The degraded path previously bypassed the structural + completeness checks
+    # the dispatch gate relies on (audit: kanban_db.py degraded fallback). Run it
+    # through the SAME unified checker (report-mode, non-blocking) so the gap is
+    # surfaced as telemetry instead of silently shipping unchecked.
+    fallback = _run_degraded_fallback_through_completeness(fallback)
     return _mark_launch_intake_provenance(
         fallback, source="model_generated", degraded=True
     )
@@ -11476,6 +11717,23 @@ def _json_text_or_none(value: Optional[Any]) -> Optional[str]:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _coerce_json(value: Optional[Any]) -> Any:
+    """Inverse of :func:`_json_text_or_none` for reading audit columns.
+
+    Audit ``old_value``/``new_value`` columns are stored as ``json.dumps`` text.
+    Parse them back to a Python value (number/bool/str). Non-JSON or NULL text
+    is returned unchanged, so this is safe on already-native values too.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, (str, bytes, bytearray)):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return value
+
+
 def _board_knob_snapshot(board: Optional[str]) -> dict[str, Any]:
     """Best-effort snapshot of the board's active tunable defaults.
 
@@ -15607,6 +15865,110 @@ def build_sensor_state_read_model(
     return {"declared": declared, "states": get_sensor_states(conn, board=board_slug)}
 
 
+# ---------------------------------------------------------------------------
+# D2 circuit-breaker human re-enable: an OWNER override that force-closes a
+# tripped Tier-1 circuit breaker. The machine still auto-recovers on its own
+# (open -> half_open -> closed once the cooldown elapses and the failure rate
+# falls); this is an ADDITIVE owner escape hatch for when the owner has fixed
+# the underlying fault and wants dispatch restored immediately rather than
+# waiting out the cooldown. It resets the persisted ``board_sensor_state`` row
+# to ``closed``, clears the failure/success counters and ``opened_at``, emits an
+# audited ``sensor_circuit`` recovery transition, and is owner-only at the CLI.
+# ---------------------------------------------------------------------------
+def force_close_circuit_breaker(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    sensor_key: Optional[str] = None,
+    actor: str = "owner",
+    reason: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Owner-force a tripped circuit breaker back to ``closed`` (audited).
+
+    Resets every matching ``circuit_breaker`` board-level sensor-state row to
+    ``closed`` with cleared counters, and emits a ``sensor_circuit`` transition
+    signal recording it as an owner override (``forced=True``). When
+    ``sensor_key`` is given only that breaker is reset; otherwise every declared
+    circuit breaker on the board is reset. Idempotent: a breaker already closed
+    is left as-is (no spurious transition) but still reported.
+
+    Returns ``{"board", "reset": [{sensor_key, previous_status, status}], ...}``.
+    This is the human re-enable companion to the automatic recovery path -- the
+    machine's own open->half_open->closed cycle is unchanged.
+    """
+    from hermes_cli import kanban_sensors as _sensors
+
+    board_slug = _connection_board(conn, board)
+    when = int(time.time()) if now is None else int(now)
+    key_filter = str(sensor_key).strip() if sensor_key else None
+    out: dict[str, Any] = {"board": board_slug, "reset": [], "actor": actor}
+
+    with write_txn(conn):
+        if key_filter:
+            rows = conn.execute(
+                "SELECT sensor_key, status, state FROM board_sensor_state "
+                "WHERE board = ? AND sensor_kind = 'circuit_breaker' "
+                "AND entity_ref = ? AND sensor_key = ?",
+                (board_slug, _SENSOR_BOARD_ENTITY, key_filter),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT sensor_key, status, state FROM board_sensor_state "
+                "WHERE board = ? AND sensor_kind = 'circuit_breaker' "
+                "AND entity_ref = ?",
+                (board_slug, _SENSOR_BOARD_ENTITY),
+            ).fetchall()
+        for row in rows:
+            key = row["sensor_key"]
+            prev_status = row["status"]
+            try:
+                prev_state = json.loads(row["state"]) if row["state"] else {}
+            except (TypeError, ValueError):
+                prev_state = {}
+            # Preserve the gating class (a property of the declared sensor, not
+            # of the tripped state) so dispatch gating stays correct after reset.
+            gates = prev_state.get("gates_side_effect_class")
+            new_state = {
+                "failures": 0,
+                "successes": 0,
+                "total": 0,
+                "failure_rate": 0.0,
+                "opened_at": None,
+                "gates_side_effect_class": gates,
+                "forced_closed_at": when,
+                "forced_by": actor,
+            }
+            _write_sensor_state(
+                conn, board=board_slug, kind="circuit_breaker", key=key,
+                entity_ref=_SENSOR_BOARD_ENTITY, status=_sensors.CIRCUIT_CLOSED,
+                state=new_state, now=when,
+            )
+            already_closed = prev_status == _sensors.CIRCUIT_CLOSED
+            if not already_closed:
+                payload = {
+                    "transition": f"{prev_status}->{_sensors.CIRCUIT_CLOSED}",
+                    "sensor_key": key,
+                    "gates_side_effect_class": gates,
+                    "forced": True,
+                    "actor": actor,
+                    "reason": reason or "owner_force_close",
+                }
+                _emit_sensor_signal(
+                    conn, board=board_slug, signal_kind="sensor_circuit",
+                    sensor_key=key, entity_ref=None, payload=payload, now=when,
+                )
+            out["reset"].append({
+                "sensor_key": key,
+                "previous_status": prev_status,
+                "status": _sensors.CIRCUIT_CLOSED,
+                "transitioned": not already_closed,
+            })
+    if key_filter and not out["reset"]:
+        out["not_found"] = True
+    return out
+
+
 def _emit_sensor_signal(
     conn: sqlite3.Connection,
     *,
@@ -15822,6 +16184,10 @@ def _sensors_tick_budget(
         rate_limit=knobs.get("rate_limit"),
         warn_fraction=knobs.get("warn_fraction"),
         window=knobs.get("window"),
+        # D3: tick re-evaluation carries the non-resetting lifetime accumulator
+        # forward unchanged (only record_budget_consumption increments it).
+        lifetime_spend=float(prev_state.get("lifetime_spend") or 0.0),
+        lifetime_cap=knobs.get("lifetime_cap"),
     )
     _write_sensor_state(
         conn, board=board, kind="budget", key=key, entity_ref=_SENSOR_BOARD_ENTITY,
@@ -15959,16 +16325,21 @@ def record_budget_consumption(
                 window_start = pstate.get("window_start")
                 spend = float(pstate.get("spend") or 0.0)
                 reqs = float(pstate.get("requests") or 0.0)
+                # D3: the lifetime accumulator is NON-resetting -- carry it
+                # forward across every window roll and add this spend to it.
+                lifetime_spend = float(pstate.get("lifetime_spend") or 0.0)
                 if window_start is None:
                     window_start = now
                 # Roll the window before adding so new consumption lands in the
-                # current window, not a stale one.
+                # current window, not a stale one. The lifetime accumulator is
+                # explicitly NOT reset here.
                 if window and window > 0 and now - int(window_start) >= int(window):
                     window_start = now
                     spend = 0.0
                     reqs = 0.0
                 spend += float(cost)
                 reqs += float(requests)
+                lifetime_spend += float(cost)
                 decision = _sensors.budget_decision(
                     prev_level=prev["status"] if prev else None,
                     now=now,
@@ -15979,6 +16350,8 @@ def record_budget_consumption(
                     rate_limit=knobs.get("rate_limit"),
                     warn_fraction=knobs.get("warn_fraction"),
                     window=window,
+                    lifetime_spend=lifetime_spend,
+                    lifetime_cap=knobs.get("lifetime_cap"),
                 )
                 _write_sensor_state(
                     conn, board=board_slug, kind="budget", key=key,
@@ -16059,7 +16432,31 @@ def _sensor_dispatch_blockers(
         elif row["sensor_kind"] == "budget":
             over_budget = bool(state.get("over_budget"))
             over_rate = bool(state.get("over_rate"))
-            if over_budget or over_rate:
+            over_lifetime = bool(state.get("over_lifetime"))
+            if over_lifetime:
+                # D3: a breached lifetime ceiling is NOT cleared by a window
+                # roll -- only the owner raising/removing lifetime_cap can. We
+                # surface it as a distinct, sticky blocker so the operator sees
+                # it is a hard cumulative ceiling, not a transient window trip.
+                blockers.append({
+                    "code": "budget_over_lifetime",
+                    "sensor_key": row["sensor_key"],
+                    "over_budget": over_budget,
+                    "over_rate": over_rate,
+                    "over_lifetime": True,
+                    "lifetime_spend": state.get("lifetime_spend"),
+                    "lifetime_cap": state.get("lifetime_cap"),
+                    "usage_fraction": state.get("usage_fraction"),
+                    "pacing": state.get("pacing"),
+                    "message": (
+                        f"budget sensor {row['sensor_key']!r} has hit its "
+                        f"LIFETIME ceiling (spend={state.get('lifetime_spend')} "
+                        f">= cap={state.get('lifetime_cap')}) -- dispatch is "
+                        f"blocked until the owner raises the lifetime_cap "
+                        f"(a window roll will NOT clear this)."
+                    ),
+                })
+            elif over_budget or over_rate:
                 blockers.append({
                     "code": "budget_exceeded",
                     "sensor_key": row["sensor_key"],
@@ -16099,6 +16496,35 @@ OPTIMIZER_MIN_NEW_OUTCOMES: int = 5
 #: Approval-gate key namespace for knob updates that exceed the declared
 #: bounds (or name an unknown knob). Distinct from side-effect gate keys.
 KNOB_UPDATE_GATE_PREFIX: str = "knob_update"
+
+# ---------------------------------------------------------------------------
+# E4 canary + auto-revert (default-off).
+#
+# When the optimizer applies an in-bounds knob change it is a CANARY: if the
+# board's reward trend does not improve over a hold window after the change, a
+# later tick auto-reverts the knob to the last-known-good ``old_value`` (already
+# stored on the ``applied`` ``board_knob_audit`` row) and records a ``reverted``
+# audit row. This is BEHIND A DEFAULT-OFF FLAG because it changes existing
+# behaviour (a change that used to stick can now be rolled back); enable it with
+# env ``HERMES_OPTIMIZER_AUTO_REVERT=1`` (or pass ``auto_revert=True`` to
+# ``optimizer_tick``). With the flag off the canary is a pure no-op.
+# ---------------------------------------------------------------------------
+
+#: Minimum seconds an applied change must "bake" before the canary may judge it.
+#: Gives outcomes time to land at the new value before we measure improvement.
+OPTIMIZER_CANARY_HOLD_SECONDS: int = 24 * 3600
+
+#: Minimum post-change outcomes (at the new value) required before the canary
+#: will judge -- too few and the comparison is noise, so we keep holding.
+OPTIMIZER_CANARY_MIN_OUTCOMES: int = 4
+
+#: Improvement epsilon (in utility units). The post-change mean utility must
+#: beat the pre-change baseline by MORE than this to be considered an
+#: improvement; otherwise the change is "did not improve" and is reverted.
+OPTIMIZER_CANARY_IMPROVE_EPSILON: float = 0.0
+
+#: Env flag that opts a board's optimizer ticks into E4 auto-revert. Default-off.
+OPTIMIZER_AUTO_REVERT_ENV: str = "HERMES_OPTIMIZER_AUTO_REVERT"
 
 # ---------------------------------------------------------------------------
 # Signal / audit retention (operational hygiene).
@@ -16618,11 +17044,28 @@ def apply_knob_update(
     known = spec is not None
     in_bounds = known and _opt.knob_value_in_bounds(spec, new_value)
 
-    # --- Refused: out-of-bounds or unknown knob -> human approval gate. -----
-    if not known or not in_bounds:
-        deny_reason = (
-            "unknown_knob" if not known else "out_of_bounds"
-        )
+    # --- D1 owner-class boundary (safety-by-construction). ------------------
+    # An AUTONOMOUS write (actor == "optimizer") may only move a knob the
+    # contract declares ``optimizer-tunable`` (or one of the legacy managed
+    # knobs, treated as optimizer-tunable). A KNOWN, in-bounds proposal against
+    # an ``owner-tunable`` / ``infra-fixed`` knob is REFUSED here and routed to
+    # the same owner approval gate as an out-of-bounds proposal -- the optimizer
+    # structurally cannot raise its own ceiling, even within the declared range.
+    # An owner/human/ceo actor is NOT subject to this (they ARE the gate).
+    autonomous = str(actor or "").strip().lower() == "optimizer"
+    owner_class_blocked = bool(
+        known and in_bounds and autonomous
+        and not _opt.is_optimizer_writable(spec, knob=knob)
+    )
+
+    # --- Refused: out-of-bounds, unknown knob, or owner-class -> approval. ---
+    if not known or not in_bounds or owner_class_blocked:
+        if not known:
+            deny_reason = "unknown_knob"
+        elif not in_bounds:
+            deny_reason = "out_of_bounds"
+        else:
+            deny_reason = "owner_class"
         with write_txn(conn):
             audit_id = _record_knob_audit(
                 conn, board=board_slug, knob=knob, old_value=old_value,
@@ -16658,9 +17101,12 @@ def apply_knob_update(
         # ``optimizer``) that widens the range to include ``new_value``, instead
         # of leaving a dead-end ``approval_required`` record. An UNKNOWN knob
         # (inventing a new tunable) is a larger structural change left as an
-        # explicit hook (no auto-draft). Best-effort: never break the knob path.
+        # explicit hook (no auto-draft). An OWNER-CLASS refusal is NOT a range
+        # problem (the value is in-bounds) -- it is a deliberate authority gate,
+        # so we do NOT auto-draft a range-widening amendment for it. Best-effort:
+        # never break the knob path.
         amendment_id: Optional[str] = None
-        if known:
+        if known and not owner_class_blocked:
             try:
                 amendment_id = _propose_knob_range_amendment(
                     conn, board=board_slug, contract=contract, knob=knob,
@@ -16684,6 +17130,8 @@ def apply_knob_update(
             "signal_id": signal_id,
             "contract_version": contract_version,
             "amendment_id": amendment_id,
+            "owner_class": _opt.knob_owner_class(spec, knob=knob) if known else None,
+            "owner_class_blocked": owner_class_blocked,
         }
 
     # --- No-op: proposal equals the current value. --------------------------
@@ -16836,6 +17284,199 @@ def _optimizer_should_reevaluate(
     return new_outcomes >= OPTIMIZER_MIN_NEW_OUTCOMES
 
 
+# ---------------------------------------------------------------------------
+# E4 canary + auto-revert helpers (default-off).
+# ---------------------------------------------------------------------------
+
+
+def _auto_revert_enabled(auto_revert: Optional[bool]) -> bool:
+    """Resolve the E4 auto-revert flag: explicit arg wins, else the env flag.
+
+    Default-off: returns ``False`` unless the caller explicitly passes
+    ``auto_revert=True`` or the ``HERMES_OPTIMIZER_AUTO_REVERT`` env var is set
+    to a truthy value (``1``/``true``/``yes``/``on``).
+    """
+    if auto_revert is not None:
+        return bool(auto_revert)
+    raw = os.environ.get(OPTIMIZER_AUTO_REVERT_ENV, "")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _last_applied_knob_change(
+    conn: sqlite3.Connection, board: str, knob: str
+) -> Optional[dict]:
+    """Most recent autonomously-``applied`` knob change as a compact dict.
+
+    The canary judges the LAST applied change. Returns ``None`` when the most
+    recent audit row for the knob is not an optimizer ``applied`` row (e.g. it
+    was already reverted, gated, or applied by a human) -- so we never re-judge
+    an already-handled change. ``old_value`` is the last-known-good to revert to.
+    """
+    row = conn.execute(
+        "SELECT id, ts, old_value, new_value, status, actor, contract_version "
+        "FROM board_knob_audit WHERE board = ? AND knob = ? "
+        "ORDER BY ts DESC, id DESC LIMIT 1",
+        (board, knob),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["status"] != "applied" or row["actor"] != "optimizer":
+        return None
+    return {
+        "id": int(row["id"]),
+        "ts": int(row["ts"]) if row["ts"] is not None else None,
+        "old_value": _coerce_json(row["old_value"]),
+        "new_value": _coerce_json(row["new_value"]),
+        "contract_version": row["contract_version"],
+    }
+
+
+def _board_reward_mean_in_window(
+    conn: sqlite3.Connection,
+    board: str,
+    *,
+    lo_ts: Optional[int],
+    hi_ts: Optional[int],
+) -> tuple[int, Optional[float]]:
+    """Mean reward *utility* (higher == better) over board outcomes in a window.
+
+    Window is ``lo_ts < ts <= hi_ts`` (either bound optional). Utilities are
+    normalized via the optimizer's maximize-direction mapping (binary 1/0,
+    continuous negated) so the canary compares apples to apples regardless of
+    reward kind. Returns ``(n, mean_or_None)``.
+    """
+    from hermes_cli import kanban_optimizer as _opt
+
+    clauses = [
+        "board = ?",
+        "primitive_kind = 'outcome'",
+        "reward_value IS NOT NULL",
+        "reward_kind IS NOT NULL",
+    ]
+    params: list[Any] = [board]
+    if lo_ts is not None:
+        clauses.append("ts > ?")
+        params.append(int(lo_ts))
+    if hi_ts is not None:
+        clauses.append("ts <= ?")
+        params.append(int(hi_ts))
+    rows = conn.execute(
+        "SELECT reward_kind, reward_value FROM board_signals WHERE "
+        + " AND ".join(clauses),
+        tuple(params),
+    ).fetchall()
+    total = 0.0
+    n = 0
+    for row in rows:
+        utility = _opt.reward_utility(row["reward_kind"], row["reward_value"])
+        if utility is None:
+            continue
+        total += utility
+        n += 1
+    return n, (total / n if n else None)
+
+
+def _optimizer_canary_revert(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    knob: str,
+    contract: dict,
+    now: int,
+) -> Optional[dict]:
+    """Judge the last applied knob change; auto-revert if it did not improve.
+
+    Canary rule (E4): after the hold window has elapsed since an applied change
+    AND enough post-change outcomes have landed, compare the post-change mean
+    reward utility against the pre-change baseline. If the post-change mean did
+    NOT beat the baseline by more than the improvement epsilon, the change is a
+    regression -> revert the knob to the last-known-good ``old_value`` (from the
+    ``applied`` audit row) and record a ``reverted`` audit row.
+
+    Returns the revert result dict when a revert happened, else ``None`` (still
+    holding, improved, or nothing to judge). Caller must have already checked
+    the default-off flag.
+    """
+    from hermes_cli import kanban_optimizer as _opt
+
+    last = _last_applied_knob_change(conn, board, knob)
+    if last is None or last["ts"] is None:
+        return None
+    change_ts = last["ts"]
+    # Still baking: give outcomes time to land at the new value.
+    if (now - change_ts) < OPTIMIZER_CANARY_HOLD_SECONDS:
+        return None
+    post_n, post_mean = _board_reward_mean_in_window(
+        conn, board, lo_ts=change_ts, hi_ts=now
+    )
+    # Not enough post-change evidence to judge -> keep holding.
+    if post_n < OPTIMIZER_CANARY_MIN_OUTCOMES:
+        return None
+    _pre_n, pre_mean = _board_reward_mean_in_window(
+        conn, board, lo_ts=None, hi_ts=change_ts
+    )
+    # No baseline to compare against -> cannot call it a regression; hold.
+    if pre_mean is None or post_mean is None:
+        return None
+    improved = post_mean > (pre_mean + OPTIMIZER_CANARY_IMPROVE_EPSILON)
+    if improved:
+        return None
+
+    # Regression: revert to the last-known-good old_value. Guard the value is
+    # still in-bounds for the (possibly amended) contract before writing.
+    revert_to = last["old_value"]
+    spec = _opt.find_knob_spec(contract, knob)
+    if spec is None or not _opt.knob_value_in_bounds(spec, revert_to):
+        _log.warning(
+            "kanban optimizer canary: board %s knob %s did not improve "
+            "(pre=%.4f post=%.4f) but last-known-good %r is no longer in "
+            "bounds; skipping auto-revert",
+            board, knob, pre_mean, post_mean, revert_to,
+        )
+        return None
+
+    result = apply_knob_update(
+        conn,
+        board=board,
+        knob=knob,
+        new_value=revert_to,
+        old_value=last["new_value"],
+        reason=(
+            f"optimizer:canary_revert:no_improvement"
+            f":pre={pre_mean:.4f}:post={post_mean:.4f}:n={post_n}"
+        ),
+        actor="optimizer",
+        now=now,
+    )
+    # ``apply_knob_update`` stamps an 'applied' row for the write; add a paired
+    # 'reverted' audit row so the canary decision is first-class in the audit
+    # log (the read-model / owner can see WHY the knob moved back).
+    if result.get("applied"):
+        with write_txn(conn):
+            revert_audit_id = _record_knob_audit(
+                conn, board=board, knob=knob,
+                old_value=last["new_value"], new_value=revert_to,
+                status="reverted",
+                reason=result.get("reason"),
+                actor="optimizer",
+                contract_version=result.get("contract_version"),
+                context_features=None, ts=now,
+            )
+        result["status"] = "reverted"
+        result["reverted"] = True
+        result["revert_audit_id"] = revert_audit_id
+        result["pre_mean_reward"] = pre_mean
+        result["post_mean_reward"] = post_mean
+        result["post_outcomes"] = post_n
+        _log.info(
+            "kanban optimizer canary: board %s knob %s reverted to %r "
+            "(pre=%.4f post=%.4f n=%d)",
+            board, knob, revert_to, pre_mean, post_mean, post_n,
+        )
+        return result
+    return None
+
+
 def optimizer_tick(
     conn: sqlite3.Connection,
     *,
@@ -16844,6 +17485,7 @@ def optimizer_tick(
     now: Optional[int] = None,
     rng: Optional[Any] = None,
     force: bool = False,
+    auto_revert: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Drive the P2 closed learning loop one step for a board.
 
@@ -16853,20 +17495,27 @@ def optimizer_tick(
     outcomes have landed. An in-bounds proposal is applied autonomously; an
     out-of-bounds one is routed to an approval gate (never written).
 
-    For P2 exactly ONE knob is managed (see
-    :data:`hermes_cli.kanban_optimizer.OPTIMIZER_MANAGED_KNOBS`); the loop is
-    written to scale to more knobs later.
+    E3: ALL present managed knobs are tuned each tick (not just the first
+    ``select_managed_knob`` result); the per-knob math is unchanged.
+
+    E4 (default-off): when auto-revert is enabled (``auto_revert=True`` or env
+    ``HERMES_OPTIMIZER_AUTO_REVERT``), a canary check runs FIRST per knob -- a
+    previously-applied change whose reward trend did not improve over the hold
+    window is rolled back to the last-known-good value (recorded ``reverted``).
+    With the flag off this is a pure no-op, so existing behaviour is unchanged.
     """
     from hermes_cli import kanban_optimizer as _opt
 
     board_slug = _connection_board(conn, board)
     when = int(time.time()) if now is None else int(now)
+    revert_on = _auto_revert_enabled(auto_revert)
     result: dict[str, Any] = {
         "board": board_slug,
         "evaluated": [],
         "applied": [],
         "skipped": [],
         "gated": [],
+        "reverted": [],
     }
     # Opportunistic retention prune (operational hygiene). Best-effort: a prune
     # failure must never break the learning tick. The rollup keeps the learner's
@@ -16890,44 +17539,77 @@ def optimizer_tick(
         result["skipped"].append({"knob": knob, "reason": "contract_read_failed"})
         result["error"] = str(exc)
         return result
-    target = knob or _opt.select_managed_knob(contract)
-    if not target or _opt.find_knob_spec(contract, target) is None:
+    # E3 multi-knob tick: tune EVERY present managed knob, not just the first
+    # ``select_managed_knob`` result. Mirrors the read-model loop in
+    # ``build_learned_state_read_model`` (filter ``OPTIMIZER_MANAGED_KNOBS`` by
+    # presence in the contract). When ``knob`` is pinned we tune only that one
+    # (backward-compatible with the single-knob callers/tests). Per-knob math is
+    # unchanged -- each knob is evaluated/throttled/applied exactly as before.
+    if knob is not None:
+        targets = [knob] if _opt.find_knob_spec(contract, knob) is not None else []
+    else:
+        targets = [
+            kn for kn in _opt.OPTIMIZER_MANAGED_KNOBS
+            if _opt.find_knob_spec(contract, kn) is not None
+        ]
+    if not targets:
         result["skipped"].append({"knob": knob, "reason": "no_managed_knob"})
         return result
 
-    if not force and not _optimizer_should_reevaluate(conn, board_slug, target, when):
-        result["skipped"].append({"knob": target, "reason": "throttled"})
-        return result
+    for target in targets:
+        # E4 canary (default-off): judge the last applied change FIRST. A
+        # regression is rolled back to the last-known-good value; when a revert
+        # fires we skip re-tuning this knob this tick (let the reverted value
+        # bake before proposing again). Best-effort -- a canary hiccup must never
+        # stop the rest of the tick.
+        if revert_on:
+            try:
+                reverted = _optimizer_canary_revert(
+                    conn, board=board_slug, knob=target, contract=contract, now=when,
+                )
+            except Exception:  # pragma: no cover - canary is best-effort
+                _log.warning(
+                    "kanban optimizer canary failed for board %s knob %s",
+                    board_slug, target, exc_info=True,
+                )
+                reverted = None
+            if reverted is not None:
+                result["reverted"].append(reverted)
+                continue
 
-    proposal = _opt.propose_knob_value(
-        conn, board=board_slug, knob=target, contract=contract, rng=rng
-    )
-    result["evaluated"].append({
-        "knob": target,
-        "proposed": proposal.proposed_value,
-        "current": proposal.current_value,
-        "changed": proposal.changed,
-        "reason": proposal.reason,
-        "total_outcomes": proposal.total_outcomes,
-    })
-    if not proposal.changed:
-        result["skipped"].append({"knob": target, "reason": proposal.reason})
-        return result
+        if not force and not _optimizer_should_reevaluate(conn, board_slug, target, when):
+            result["skipped"].append({"knob": target, "reason": "throttled"})
+            continue
 
-    update = apply_knob_update(
-        conn,
-        board=board_slug,
-        knob=target,
-        new_value=proposal.proposed_value,
-        old_value=proposal.current_value,
-        reason="optimizer:thompson",
-        actor="optimizer",
-        now=when,
-    )
-    if update.get("applied"):
-        result["applied"].append(update)
-    else:
-        result["gated"].append(update)
+        proposal = _opt.propose_knob_value(
+            conn, board=board_slug, knob=target, contract=contract, rng=rng
+        )
+        result["evaluated"].append({
+            "knob": target,
+            "proposed": proposal.proposed_value,
+            "current": proposal.current_value,
+            "changed": proposal.changed,
+            "reason": proposal.reason,
+            "total_outcomes": proposal.total_outcomes,
+        })
+        if not proposal.changed:
+            result["skipped"].append({"knob": target, "reason": proposal.reason})
+            continue
+
+        update = apply_knob_update(
+            conn,
+            board=board_slug,
+            knob=target,
+            new_value=proposal.proposed_value,
+            old_value=proposal.current_value,
+            reason="optimizer:thompson",
+            actor="optimizer",
+            now=when,
+        )
+        if update.get("applied"):
+            result["applied"].append(update)
+        else:
+            result["gated"].append(update)
     return result
 
 
@@ -19106,6 +19788,56 @@ def _coerce_per_profile_cap(value) -> Optional[int]:
     return cap if cap > 0 else None
 
 
+def _resolve_dispatch_caps(
+    board_slug: str,
+    *,
+    max_in_progress: Optional[int],
+    max_in_progress_per_profile: Optional[int],
+    max_spawn: Optional[int],
+) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """Resolve the dispatch concurrency caps from the board contract (E2).
+
+    For each cap knob the precedence is
+    ``contract.runtime.tunables[knob].default`` THEN the passed-in config value
+    (the FALLBACK). This is the read-seam that makes an optimizer write to a cap
+    tunable take effect on dispatch -- mirroring how ``managed_cadence_default``
+    feeds the reactive cadence. Reading the contract is best-effort: any failure
+    leaves all three caps at their config-supplied values, so dispatch behaviour
+    is unchanged when no cap tunable is declared (the common case).
+    """
+    config_caps = {
+        "max_in_progress": max_in_progress,
+        "max_in_progress_per_profile": max_in_progress_per_profile,
+        "max_spawn": max_spawn,
+    }
+    try:
+        from hermes_cli import kanban_optimizer as _opt
+
+        contract = _metadata_as_business_contract(read_board_metadata(board_slug))
+        resolved: dict[str, Optional[int]] = {}
+        for knob, config_value in config_caps.items():
+            override = _opt.managed_cap_default(contract, knob)
+            if override is not None and override != config_value:
+                _log.info(
+                    "kanban dispatcher: board %s cap %s resolved from contract "
+                    "tunable default=%d (config fallback=%r)",
+                    board_slug, knob, override, config_value,
+                )
+            resolved[knob] = override if override is not None else config_value
+        return (
+            resolved["max_in_progress"],
+            resolved["max_in_progress_per_profile"],
+            resolved["max_spawn"],
+        )
+    except Exception:  # pragma: no cover - defensive: never break dispatch
+        _log.debug(
+            "kanban dispatcher: contract cap read failed for board %s; "
+            "using config caps",
+            board_slug, exc_info=True,
+        )
+        return (max_in_progress, max_in_progress_per_profile, max_spawn)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -19150,6 +19882,25 @@ def dispatch_once(
     board. When omitted, the current-board resolution chain is used.
     """
     board_slug = _connection_board(conn, board)
+
+    # E2 read-seam: resolve the concurrency caps from the board contract's
+    # tunables (``contract.runtime.tunables[knob].default``) with the passed-in
+    # config.yaml value as FALLBACK. This mirrors how ``managed_cadence_default``
+    # feeds the reactive cadence: without this an optimizer write to a cap
+    # tunable was a silent no-op because the caps were read ONLY from config.
+    # Best-effort -- a contract-read hiccup must never break dispatch, it just
+    # falls back to the config-supplied caps.
+    (
+        max_in_progress,
+        max_in_progress_per_profile,
+        max_spawn,
+    ) = _resolve_dispatch_caps(
+        board_slug,
+        max_in_progress=max_in_progress,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+        max_spawn=max_spawn,
+    )
+
     dispatch_audit = audit_board_dispatcher_ownership(board_slug)
     if dispatch_audit.get("status") == "critical":
         _log.error(

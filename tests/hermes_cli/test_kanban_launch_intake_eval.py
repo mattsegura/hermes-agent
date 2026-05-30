@@ -156,3 +156,63 @@ def test_phase0_definition_of_done_scoreboard():
     )
     assert universal_score < UNIVERSAL_MAX
     assert gold_score >= GOLD_MIN
+
+
+def _degraded_fallback_contract(fixture: dict, monkeypatch) -> dict:
+    """Drive the full synthesis entrypoint with the aux model disabled so it
+    deterministically takes the DEGRADED universal-drafter fallback path -- the
+    path the audit found bypassed the structural + completeness checks."""
+    # Force the offline/degraded branch regardless of local aux configuration.
+    monkeypatch.setattr(kb, "_launch_intake_aux_enabled", lambda: False)
+    draft = kb.build_business_runtime_contract_draft(
+        None, rough_goal=fixture["rough_goal"]
+    )
+    draft = kb._merge_launch_intake_answers(draft, intake_answers=fixture["answers"])
+    return kb._synthesize_launch_contract_from_intake(draft)
+
+
+@pytest.mark.parametrize("fixture", FIXTURES, ids=FIXTURE_IDS)
+def test_degraded_fallback_runs_through_completeness(fixture, monkeypatch):
+    """The degraded universal-drafter fallback must now be run through the SAME
+    unified completeness checker the dispatch gate consults (report-mode), so the
+    audit's 'degraded board dispatches having passed only the presence checker'
+    hole is at least surfaced as telemetry instead of silently shipping."""
+    result = _degraded_fallback_contract(fixture, monkeypatch)
+    intake = result.get("launch_intake") or {}
+    # It really went degraded (aux disabled).
+    assert intake.get("degraded_mode") is True, (
+        f"{fixture['domain']} did not take the degraded fallback path"
+    )
+    completeness = intake.get("completeness")
+    assert isinstance(completeness, dict), (
+        f"{fixture['domain']} degraded fallback did not attach a completeness report"
+    )
+    # The unified report carries the strong invariants + every net-new dimension.
+    dims = completeness.get("dimensions") or {}
+    for required_dim in (
+        "invariants",
+        "win_signal_rail",
+        "evidence_namespace",
+        "stage_reachability",
+        "distinct_terminals",
+    ):
+        assert required_dim in dims, (
+            f"{fixture['domain']} completeness report missing dimension {required_dim}"
+        )
+    # Non-breaking: attaching the report must not damage the shipped contract.
+    assert isinstance(result.get("objective"), dict)
+    assert isinstance(result.get("workflow"), dict)
+
+
+def test_degraded_fallback_completeness_is_non_blocking(monkeypatch):
+    """Even when the degraded fallback's completeness report is NOT ok (it is not,
+    because the universal drafter uses non-canonical side_effect_class labels the
+    invariants flag), the synthesis path must still RETURN the contract -- the
+    check is report-mode and never blocks dispatch."""
+    land = next(fx for fx in FIXTURES if fx["domain"] == "land_wholesaling")
+    result = _degraded_fallback_contract(land, monkeypatch)
+    assert isinstance(result, dict) and result.get("workflow")
+    completeness = (result.get("launch_intake") or {}).get("completeness") or {}
+    # Findings are surfaced (non-empty) but the contract still shipped.
+    findings = list(completeness.get("errors", [])) + list(completeness.get("warnings", []))
+    assert findings, "expected the degraded fallback to surface completeness findings"

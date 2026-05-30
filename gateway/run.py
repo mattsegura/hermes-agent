@@ -4450,6 +4450,14 @@ class GatewayRunner:
         # simply don't use kanban; this loop becomes a no-op.
         asyncio.create_task(self._kanban_dispatcher_watcher())
 
+        # Start background action-gate card watcher — polls
+        # ~/.hermes/action_gate.db for new status='pending' escalations and
+        # pushes a rich inline-keyboard approval card to the owner Telegram
+        # DM (ag:approve:<id> / ag:deny:<id>). Non-breaking: the escalating
+        # worker is blocked in its own SQLite poll and the file-based
+        # proposal flow still works. Gated off by HERMES_ACTION_GATE_CARDS.
+        asyncio.create_task(self._action_gate_card_watcher())
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
@@ -6034,6 +6042,150 @@ class GatewayRunner:
             while slept < interval and self._running:
                 await asyncio.sleep(min(1.0, interval - slept))
                 slept += 1.0
+
+    def _action_gate_owner_dm(self) -> "Optional[str]":
+        """Resolve the Telegram owner DM chat id for action-gate cards.
+
+        Preference order:
+          1. ``TELEGRAM_ALLOWED_USERS`` first entry — the canonical owner
+             allowlist the action gate already uses for its text fallback
+             (``agent.action_gate._send_telegram_notification``).
+          2. First ``type='dm'`` entry for telegram in the channel
+             directory (``channel_directory.json``).
+
+        Returns None when no owner DM can be resolved (in which case the
+        watcher quietly skips delivery — the worker still falls back to the
+        file-based proposal flow and deny-on-timeout, so this is safe).
+        """
+        allowed = os.environ.get("TELEGRAM_ALLOWED_USERS", "").strip()
+        if allowed:
+            first = allowed.split(",")[0].strip()
+            if first and first != "*":
+                return first
+        try:
+            from gateway.channel_directory import load_directory
+            directory = load_directory()
+            entries = directory.get("platforms", {}).get("telegram", []) or []
+            for ch in entries:
+                if ch.get("type") == "dm" and ch.get("id"):
+                    return str(ch["id"])
+            if entries and entries[0].get("id"):
+                return str(entries[0]["id"])
+        except Exception:
+            logger.debug("action-gate watcher: owner DM lookup failed", exc_info=True)
+        return None
+
+    async def _action_gate_card_watcher(self, interval: float = 2.0) -> None:
+        """Poll ``~/.hermes/action_gate.db`` and push owner approval cards.
+
+        For each ``status='pending'`` row that has not yet been notified
+        (``notified=0``), renders a rich inline-keyboard card to the owner
+        Telegram DM via :meth:`TelegramAdapter.send_action_gate_card`, with
+        callback data ``ag:approve:<id>`` / ``ag:deny:<id>``. The row is
+        flagged ``notified=1`` only after a successful send, so a transient
+        failure simply retries on the next tick (no duplicate cards).
+
+        This is purely additive and non-breaking: the worker that escalated
+        is blocked in ``action_gate._escalate_to_human``'s own 2s SQLite
+        poll. When the ``ag:`` callback flips ``pending_actions.status`` via
+        ``approve_action`` / ``deny_action``, that existing poll observes it
+        and proceeds/denies. We never touch the blocking model, and the
+        deny-on-timeout default is unchanged. If Telegram isn't connected or
+        no owner DM resolves, the watcher idles and the file-based proposal
+        flow continues to work.
+
+        Gated off by ``HERMES_ACTION_GATE_CARDS`` env (false-y disables).
+        SQLite work runs in ``asyncio.to_thread`` so the event loop never
+        blocks on the WAL lock; per-tick failures don't stop later ticks.
+        """
+        from gateway.config import Platform as _Platform
+
+        env_override = os.environ.get("HERMES_ACTION_GATE_CARDS", "").strip().lower()
+        if env_override in {"0", "false", "no", "off"}:
+            logger.info(
+                "action-gate watcher: disabled via HERMES_ACTION_GATE_CARDS env"
+            )
+            return
+
+        try:
+            from agent import action_gate as _ag
+        except Exception:
+            logger.warning(
+                "action-gate watcher: agent.action_gate not importable; disabled"
+            )
+            return
+
+        interval = max(float(interval), 1.0)
+
+        # Initial delay so the gateway finishes wiring adapters — matches
+        # the other background watchers here.
+        await asyncio.sleep(5)
+
+        while self._running:
+            try:
+                adapter = self.adapters.get(_Platform.TELEGRAM)
+                if adapter is None:
+                    # Telegram not connected this tick — leave rows
+                    # unnotified so a later tick (or reconnect) delivers
+                    # them. The worker's file-based fallback still works.
+                    await self._action_gate_sleep(interval)
+                    continue
+
+                owner_dm = self._action_gate_owner_dm()
+                if not owner_dm:
+                    await self._action_gate_sleep(interval)
+                    continue
+
+                rows = await asyncio.to_thread(_ag.fetch_unnotified_pending)
+                for row in rows:
+                    if not self._running:
+                        return
+                    action_id = row.get("id")
+                    if action_id is None:
+                        continue
+                    try:
+                        result = await adapter.send_action_gate_card(
+                            chat_id=str(owner_dm),
+                            action_id=int(action_id),
+                            tool_name=str(row.get("tool_name") or ""),
+                            description=str(row.get("description") or ""),
+                            profile=str(row.get("profile") or ""),
+                            args_preview=str(row.get("tool_args") or ""),
+                            classification=str(row.get("classification") or ""),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "action-gate watcher: send card failed for id=%s: %s",
+                            action_id, exc,
+                        )
+                        continue
+                    if getattr(result, "success", False):
+                        await asyncio.to_thread(_ag.mark_notified, int(action_id))
+                        logger.info(
+                            "action-gate watcher: delivered approval card for "
+                            "pending_action %s to owner DM",
+                            action_id,
+                        )
+                    else:
+                        logger.debug(
+                            "action-gate watcher: card send unsuccessful for id=%s "
+                            "(%s); will retry next tick",
+                            action_id, getattr(result, "error", "unknown"),
+                        )
+            except asyncio.CancelledError:
+                logger.debug("action-gate watcher: cancelled")
+                raise
+            except Exception:
+                logger.exception("action-gate watcher: unexpected watcher error")
+
+            await self._action_gate_sleep(interval)
+
+    async def _action_gate_sleep(self, interval: float) -> None:
+        """Sleep in 1s slices so gateway shutdown stays snappy."""
+        slept = 0.0
+        while slept < interval and self._running:
+            await asyncio.sleep(min(1.0, interval - slept))
+            slept += 1.0
 
     async def _platform_reconnect_watcher(self) -> None:
         """Background task that periodically retries connecting failed platforms.

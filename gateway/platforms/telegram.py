@@ -2649,6 +2649,97 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_exec_approval failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_action_gate_card(
+        self,
+        chat_id: str,
+        action_id: int,
+        tool_name: str,
+        description: str,
+        *,
+        profile: str = "",
+        args_preview: str = "",
+        classification: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render an inline-keyboard approval card for an action-gate escalation.
+
+        Modeled on :meth:`send_exec_approval`, but the buttons carry the
+        SQLite ``pending_actions`` row id directly in their callback data
+        (``ag:approve:<id>`` / ``ag:deny:<id>``).  The ``ag:`` branch in
+        :meth:`_handle_callback_query` resolves the row via
+        ``agent.action_gate.approve_action`` / ``deny_action``; the agent
+        worker's existing 2s SQLite poll then observes the flipped status.
+
+        Returns a ``SendResult``; on transient failure the caller (the
+        gateway watcher) simply retries on its next tick because the row's
+        ``notified`` flag is only set after a successful send.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            desc_preview = description[:3800] + "..." if len(description) > 3800 else description
+            lines = [
+                "🚨 <b>Action Gate — Approval Required</b>",
+                "",
+            ]
+            if profile:
+                lines.append(f"Profile: {_html.escape(str(profile))}")
+            lines.append(f"Tool: {_html.escape(str(tool_name))}")
+            if classification:
+                lines.append(f"Class: {_html.escape(str(classification))}")
+            lines.append(f"Action: {_html.escape(desc_preview)}")
+            if args_preview:
+                arg_snip = args_preview[:600]
+                lines.append("")
+                lines.append(f"<pre>{_html.escape(arg_snip)}</pre>")
+            text = "\n".join(lines)
+
+            thread_id = self._metadata_thread_id(metadata)
+
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ Approve", callback_data=f"ag:approve:{action_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Deny", callback_data=f"ag:deny:{action_id}"
+                    ),
+                ],
+            ])
+
+            kwargs: Dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "text": text,
+                "parse_mode": ParseMode.HTML,
+                "reply_markup": keyboard,
+                **self._link_preview_kwargs(),
+            }
+            # Escalations are high-signal: always notify the owner even in
+            # "important" silent mode (same intent as exec approvals).
+            notify_metadata = dict(metadata or {})
+            notify_metadata.setdefault("notify", True)
+            kwargs.update(self._notification_kwargs(notify_metadata))
+            reply_to_id = self._reply_to_message_id_for_send(
+                None, metadata, reply_to_mode=self._reply_to_mode
+            )
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                )
+            )
+
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_action_gate_card failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
         confirm_id: str, metadata: Optional[Dict[str, Any]] = None,
@@ -3194,6 +3285,93 @@ class TelegramAdapter(BasePlatformAdapter):
                 # button click.
                 if count and query_chat_id is not None:
                     self.resume_typing_for_chat(str(query_chat_id))
+            return
+
+        # --- Action-gate callbacks (ag:approve:id | ag:deny:id) ---
+        if data.startswith("ag:"):
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                choice = parts[1]  # approve | deny
+                try:
+                    gate_action_id = int(parts[2])
+                except (ValueError, IndexError):
+                    await query.answer(text="Invalid action data.")
+                    return
+
+                # Owner-only: gate on the same authorization used by every
+                # other interactive button. Escalations are high-stakes
+                # (outbound messages, payments), so we fail closed.
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ You are not authorized to decide this action.")
+                    return
+
+                if choice not in ("approve", "deny"):
+                    await query.answer(text="Invalid choice.")
+                    return
+
+                # Resolve the pending_actions row. approve_action/deny_action
+                # only flip rows that are still 'pending' (WHERE status=
+                # 'pending'), so a double-click or an already-timed-out row
+                # returns False and we tell the owner it's already resolved.
+                # The blocked worker's existing 2s SQLite poll then observes
+                # the flipped status and proceeds/denies accordingly — we do
+                # NOT change that blocking model.
+                user_display = getattr(query.from_user, "first_name", "User")
+                try:
+                    from agent import action_gate as _ag
+                    if choice == "approve":
+                        resolved = await asyncio.to_thread(
+                            _ag.approve_action, gate_action_id, "owner"
+                        )
+                    else:
+                        resolved = await asyncio.to_thread(
+                            _ag.deny_action, gate_action_id, "owner", False
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "[%s] action-gate callback failed (id=%s, choice=%s): %s",
+                        self.name, gate_action_id, choice, exc,
+                    )
+                    await query.answer(text="Failed to record decision. Try again.")
+                    return
+
+                if not resolved:
+                    await query.answer(text="This action has already been resolved.")
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                    return
+
+                label = "✅ Approved" if choice == "approve" else "❌ Denied"
+                await query.answer(text=label)
+                try:
+                    base_text = getattr(query.message, "text", "") or ""
+                    await query.edit_message_text(
+                        text=(
+                            f"{_html.escape(base_text)}\n\n"
+                            f"<b>{label}</b> by {_html.escape(str(user_display))}"
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    # Non-fatal if edit fails (message too old, etc.) — the
+                    # decision is already persisted in SQLite.
+                    pass
+
+                logger.info(
+                    "Telegram action-gate button resolved pending_action %d "
+                    "(choice=%s, user=%s)",
+                    gate_action_id, choice, user_display,
+                )
             return
 
         # --- Slash-confirm callbacks (sc:choice:confirm_id) ---
