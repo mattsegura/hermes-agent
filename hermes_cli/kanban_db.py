@@ -1741,6 +1741,29 @@ def launch_clarity_questions(missing: Iterable[str]) -> list[str]:
     return questions
 
 
+_SCOREABLE_SUCCESS_RE = re.compile(
+    r"(\d|%|\$|>=|<=|>|<|\bat least\b|\bat most\b|\bper\b|\bwithin\b|\brate\b|"
+    r"\bratio\b|\bcount\b|\bnumber of\b|\bMRR\b|\bARR\b|\bMAU\b|\bDAU\b|\bLTV\b|\bCAC\b)",
+    re.IGNORECASE,
+)
+
+
+def _success_entry_is_scoreable(entry: Any) -> bool:
+    """Heuristic: does a success criterion carry a measurable target?
+
+    A scoreable criterion references a number, percentage, currency, comparator,
+    rate/ratio/count, or a named metric — something the scoreboard can grade a
+    realized outcome against. Prose-only criteria ("do a good job", "close
+    deals") return False. REPORT-MODE only today: unscoreable entries warn,
+    never block. (Enforce-mode + a typed {metric,comparator,target,source}
+    schema / LLM-judge is the follow-on.)
+    """
+    text = str(entry or "").strip()
+    if not text:
+        return False
+    return bool(_SCOREABLE_SUCCESS_RE.search(text))
+
+
 def validate_business_runtime_contract(contract: Optional[Any]) -> dict[str, Any]:
     """Validate whether a board contract is clear enough to launch agents.
 
@@ -1769,8 +1792,22 @@ def validate_business_runtime_contract(contract: Optional[Any]) -> dict[str, Any
 
     if not str(objective.get("statement") or "").strip():
         missing.append("objective.statement")
-    if not _string_list(objective.get("success")):
+    _success_entries = _string_list(objective.get("success"))
+    if not _success_entries:
         missing.append("objective.success")
+    else:
+        _unscoreable = [s for s in _success_entries if not _success_entry_is_scoreable(s)]
+        if _unscoreable:
+            warnings.append(
+                "objective.success: "
+                + str(len(_unscoreable))
+                + " of "
+                + str(len(_success_entries))
+                + " criteria carry no measurable target the scoreboard can grade "
+                + "(report-mode): "
+                + "; ".join(_unscoreable[:3])
+                + (" ..." if len(_unscoreable) > 3 else "")
+            )
     if not _string_list(objective.get("failure")):
         missing.append("objective.failure")
     if not _string_list(objective.get("constraints")) and not _string_list(normalized.get("forbidden_actions")):
