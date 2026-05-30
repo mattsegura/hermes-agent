@@ -7151,7 +7151,14 @@ CREATE INDEX IF NOT EXISTS idx_launch_reviews_token  ON board_launch_reviews(app
 CREATE INDEX IF NOT EXISTS idx_launch_reviews_contract ON board_launch_reviews(kind, contract_hash, contract_version);
 CREATE INDEX IF NOT EXISTS idx_board_signals_kind    ON board_signals(board, primitive_kind, ts);
 CREATE INDEX IF NOT EXISTS idx_board_signals_entity  ON board_signals(board, entity_ref, ts);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_board_signals_dedupe ON board_signals(board, dedupe_key) WHERE dedupe_key IS NOT NULL;
+-- NOTE: the partial UNIQUE index over board_signals(board, dedupe_key) is
+-- created in _migrate_add_optional_columns(), NOT here. ``dedupe_key`` is a
+-- migration-added column; a legacy board_signals table predating it lacks the
+-- column, so creating the index inside this SCHEMA_SQL executescript (which
+-- runs BEFORE the column migration in connect()) crashed opening older boards
+-- with "no such column: dedupe_key". Every other migration-added column
+-- (tenant, idempotency_key, session_id, ...) follows the same convention:
+-- the column AND its index are added together in the migration pass.
 CREATE INDEX IF NOT EXISTS idx_board_knob_audit      ON board_knob_audit(board, knob, ts);
 CREATE INDEX IF NOT EXISTS idx_board_sensor_state     ON board_sensor_state(board, sensor_kind, sensor_key);
 CREATE INDEX IF NOT EXISTS idx_contract_amendments     ON board_contract_amendments(board, status, created_at);
