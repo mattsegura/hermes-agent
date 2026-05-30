@@ -3072,6 +3072,174 @@ def _mark_launch_intake_provenance(
     return merged
 
 
+def _contract_needed_capability_types(contract: dict[str, Any]) -> list[str]:
+    """Extract the model-declared abstract capability verbs from a contract.
+
+    Reads ``needed_capability_types`` from wherever the synthesizer chose to emit
+    it -- a top-level field (preferred, per the synthesis prompt) or, as a
+    fallback, ``runtime.provider_policy.needed_capability_types`` /
+    ``workflow.needed_capability_types``. Returns a de-duplicated string list.
+
+    There is ZERO goal->capability hardcoding here: the verbs come entirely from
+    the model's synthesized contract. An absent field yields an empty list (the
+    enrichment is then a no-op).
+    """
+    candidates: list[Any] = []
+    candidates.extend(_contract_list(contract.get("needed_capability_types")))
+    runtime = _contract_object(contract.get("runtime"))
+    policy = _contract_object(runtime.get("provider_policy"))
+    candidates.extend(_contract_list(policy.get("needed_capability_types")))
+    candidates.extend(_contract_list(runtime.get("needed_capability_types")))
+    workflow = _contract_object(contract.get("workflow"))
+    candidates.extend(_contract_list(workflow.get("needed_capability_types")))
+    return _string_list(candidates)
+
+
+def _provider_route_ids(value: Any, acc: set[str]) -> None:
+    """Recursively collect ``provider``/``providers`` ids from a policy subtree."""
+    if isinstance(value, dict):
+        for key in ("provider", "providers"):
+            raw = value.get(key)
+            if isinstance(raw, str) and raw.strip():
+                acc.add(raw.strip())
+            elif isinstance(raw, (list, tuple, set)):
+                acc.update(str(p).strip() for p in raw if str(p).strip())
+        for sub in value.values():
+            if isinstance(sub, (dict, list, tuple, set)):
+                _provider_route_ids(sub, acc)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            _provider_route_ids(item, acc)
+
+
+def _contract_connected_provider_ids(contract: dict[str, Any]) -> set[str]:
+    """Collect integration ids already wired into runtime.provider_policy.
+
+    These become the resolver's ``have`` set: an integration already present as a
+    material ``provider`` route (anywhere under provider_policy, including the
+    ``systems`` sub-map) is reported ``connected`` and contributes no new
+    required_inputs or cost line, so re-running enrichment is idempotent and
+    never re-prompts for an already-provisioned system.
+    """
+    runtime = _contract_object(contract.get("runtime"))
+    policy = _contract_object(runtime.get("provider_policy"))
+    have: set[str] = set()
+    _provider_route_ids(policy, have)
+    return have
+
+
+def _enrich_contract_with_capabilities(contract: dict[str, Any]) -> dict[str, Any]:
+    """ADDITIVELY enrich a synthesized contract with capability-discovery output.
+
+    REPORT-MODE / NON-BREAKING: this never blocks launch and never removes or
+    rewrites an existing field. It only fills gaps:
+
+      * a provider_policy route keyed by the abstract capability verb gets a
+        ``provider`` = resolved integration_id ONLY when no material route is
+        already present for that verb;
+      * the resolver's required_inputs are appended (de-duplicated by key) onto a
+        new additive top-level ``launch_required_inputs`` list;
+      * a one-line cost summary is appended to owner_summary.
+
+    The whole body is wrapped by the caller in try/except so a resolver/catalog
+    failure can never break synthesis. Returns the (possibly) enriched contract;
+    on no declared capabilities it returns the input unchanged.
+    """
+    needed = _contract_needed_capability_types(contract)
+    if not needed:
+        return contract
+
+    from hermes_cli import capability_resolver as _cap
+
+    have = _contract_connected_provider_ids(contract)
+    result = _cap.resolve_capabilities(needed, have=have)
+    resolved = result.get("resolved") or []
+    if not resolved:
+        return contract
+
+    enriched = dict(contract)
+    runtime = dict(_contract_object(enriched.get("runtime")))
+    policy = dict(_contract_object(runtime.get("provider_policy")))
+    # Routes live under provider_policy.systems, keyed by the capability verb,
+    # carrying a material ``provider`` key (= the resolved integration_id). This
+    # matches the synthesized contract shape (provider_policy.systems.<...>) so
+    # the dispatch gate reads a real route, not free text.
+    systems = dict(_contract_object(policy.get("systems")))
+
+    # 1) Additively route each capability verb to its resolved integration. Only
+    #    fill verbs that lack a material route already -- never clobber an
+    #    owner/model-declared provider.
+    newly_routed: list[str] = []
+    for row in resolved:
+        cap = str(row.get("capability_type") or "").strip()
+        integration_id = str(row.get("integration_id") or "").strip()
+        if not cap or not integration_id:
+            continue
+        existing = systems.get(cap)
+        if _policy_has_material_route(existing):
+            continue
+        route = dict(_contract_object(existing))
+        route["provider"] = integration_id
+        route.setdefault("access_state", row.get("access_state"))
+        route.setdefault("capability_type", cap)
+        systems[cap] = route
+        newly_routed.append(cap)
+
+    policy["systems"] = systems
+    runtime["provider_policy"] = policy
+    enriched["runtime"] = runtime
+
+    # 2) Append resolver required_inputs onto an additive launch-level list,
+    #    de-duplicated by key against anything already declared. Wire-compatible
+    #    with the engine amendment required_inputs schema.
+    existing_inputs = _contract_list(enriched.get("launch_required_inputs"))
+    seen_keys = {
+        str(_contract_object(ri).get("key") or "").strip()
+        for ri in existing_inputs
+        if str(_contract_object(ri).get("key") or "").strip()
+    }
+    appended_inputs = list(existing_inputs)
+    for ri in result.get("required_inputs") or []:
+        key = str(_contract_object(ri).get("key") or "").strip()
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        appended_inputs.append(ri)
+    if appended_inputs:
+        enriched["launch_required_inputs"] = appended_inputs
+
+    # 3) Add a cost summary line to owner_summary (report-mode, human-readable).
+    cost_plan = result.get("cost_plan") or {}
+    cost_bits: list[str] = []
+    for bucket, label in (
+        ("external_subscriptions", "subscription"),
+        ("ad_spend", "ad spend"),
+        ("per_call", "per-call"),
+    ):
+        ids = [str(c.get("integration_id") or "").strip()
+               for c in (cost_plan.get(bucket) or [])
+               if str(c.get("integration_id") or "").strip()]
+        if ids:
+            cost_bits.append(f"{label}: {', '.join(ids)}")
+    gaps = [g for g in (result.get("gaps") or []) if str(g).strip()]
+    summary_obj = dict(_contract_object(enriched.get("owner_summary")))
+    if newly_routed or cost_bits or gaps:
+        parts = []
+        if newly_routed:
+            parts.append(
+                f"Capability discovery wired {len(newly_routed)} integration "
+                f"route(s): {', '.join(newly_routed)}."
+            )
+        if cost_bits:
+            parts.append("Estimated cost surfaces -- " + "; ".join(cost_bits) + ".")
+        if gaps:
+            parts.append("No integration found for: " + ", ".join(gaps) + ".")
+        summary_obj["capability_cost_summary"] = " ".join(parts)
+        enriched["owner_summary"] = summary_obj
+
+    return enriched
+
+
 def _apply_synthesized_launch_contract(
     draft: dict[str, Any],
     intake: dict[str, Any],
@@ -3082,6 +3250,15 @@ def _apply_synthesized_launch_contract(
 ) -> dict[str, Any]:
     """Fold an auxiliary-synthesized contract into the launch-intake draft."""
     merged = normalize_board_operating_contract(synthesized)
+    # Capability discovery (report-mode, additive). Derive needed capability
+    # verbs the model declared and enrich the contract with resolved integration
+    # routes + required_inputs + a cost line. A resolver/catalog failure must
+    # NEVER break synthesis, so the whole call is guarded.
+    try:
+        merged = _enrich_contract_with_capabilities(merged)
+    except Exception:  # pragma: no cover - defensive: enrichment never blocks
+        _log.warning("launch_intake: capability enrichment skipped (resolver error)",
+                     exc_info=True)
     answers = _normalize_launch_intake_answers(intake.get("answers"))
     round_number = _launch_intake_latest_answer_round(intake)
     new_intake = dict(intake)

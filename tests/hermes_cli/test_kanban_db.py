@@ -4911,3 +4911,128 @@ def test_bare_connect_closes_and_releases_on_context_exit(tmp_path):
     if kb.fcntl is not None:
         resolved = str((db_path.parent / ".kanban.lock").resolve())
         assert resolved not in kb._LOCK_FDS
+
+
+# ---------------------------------------------------------------------------
+# Capability-discovery enrichment (cluster B) -- report-mode, additive
+# ---------------------------------------------------------------------------
+
+_GROW_APP_CONTRACT_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "fixtures", "launch_intake",
+    "grow_app_one_week.contract.json",
+)
+
+
+def _synth_contract(needed, *, provider_policy=None):
+    """A real, normalizable synthesized contract (the grow-app golden) that
+    declares ``needed_capability_types``. Using the golden contract keeps the
+    fixture faithful to the synthesized shape the enrichment runs against."""
+    import json as _json
+    with open(_GROW_APP_CONTRACT_PATH) as fh:
+        contract = _json.load(fh)
+    contract["needed_capability_types"] = list(needed)
+    if provider_policy is not None:
+        contract["runtime"]["provider_policy"] = provider_policy
+    return contract
+
+
+def test_enrich_contract_with_capabilities_routes_and_inputs():
+    """A goal declaring needed_capability_types yields provider_policy.systems
+    routes (keyed by the verb, with provider=integration_id) + required_inputs."""
+    needed = ["read:subscription_revenue", "write:ad_spend", "read:support_inbox"]
+    # Start from a clean (no systems) provider_policy so the catalog default wins.
+    contract = kb.normalize_board_operating_contract(
+        _synth_contract(needed, provider_policy={})
+    )
+    enriched = kb._enrich_contract_with_capabilities(contract)
+
+    systems = enriched["runtime"]["provider_policy"]["systems"]
+    # Each declared verb is now routed to its catalog-resolved integration id.
+    assert systems["read:subscription_revenue"]["provider"] == "app_store_connect"
+    assert systems["write:ad_spend"]["provider"] == "apple_search_ads"
+    assert systems["read:support_inbox"]["provider"] == "intercom"
+    # Each new route is a material route as far as the dispatch gate is concerned.
+    for cap in needed:
+        assert kb._policy_has_material_route(systems[cap])
+
+    # required_inputs were appended additively, in the engine amendment schema.
+    inputs = enriched["launch_required_inputs"]
+    assert inputs, "expected resolver required_inputs to be appended"
+    expected_keys = {"key", "label", "type", "required", "inject_path"}
+    for ri in inputs:
+        assert set(ri.keys()) == expected_keys
+    keys = {ri["key"] for ri in inputs}
+    assert "asc_issuer_id" in keys  # app_store_connect
+    assert "asa_org_id" in keys  # apple_search_ads
+    assert "intercom_access_token" in keys  # intercom
+
+    # owner_summary carries a human-readable capability/cost line.
+    summary_line = enriched["owner_summary"]["capability_cost_summary"]
+    assert "apple_search_ads" in summary_line  # ad spend cost surfaced
+    assert "intercom" in summary_line  # subscription cost surfaced
+
+
+def test_enrich_no_capabilities_is_noop():
+    """No declared needed_capability_types -> contract returned unchanged."""
+    contract = kb.normalize_board_operating_contract(
+        _synth_contract([], provider_policy={})
+    )
+    enriched = kb._enrich_contract_with_capabilities(contract)
+    assert enriched is contract
+    assert enriched["runtime"]["provider_policy"] == {}
+    assert "launch_required_inputs" not in enriched
+    assert "capability_cost_summary" not in (enriched.get("owner_summary") or {})
+
+
+def test_enrich_does_not_clobber_existing_material_route():
+    """An already-declared material route for a verb is preserved (additive only),
+    and an already-connected provider contributes no new required_inputs."""
+    contract = kb.normalize_board_operating_contract(
+        _synth_contract(
+            ["read:subscription_revenue"],
+            provider_policy={"systems": {"read:subscription_revenue": {"provider": "stripe"}}},
+        )
+    )
+    enriched = kb._enrich_contract_with_capabilities(contract)
+    systems = enriched["runtime"]["provider_policy"]["systems"]
+    # Owner/model choice of stripe is NOT overwritten by the catalog default.
+    assert systems["read:subscription_revenue"]["provider"] == "stripe"
+    # stripe is already a connected provider -> no new required_inputs surfaced.
+    assert not enriched.get("launch_required_inputs")
+
+
+def test_enrich_failure_never_breaks_apply(monkeypatch):
+    """A resolver explosion is swallowed (report-mode) and synthesis proceeds."""
+    def _boom(*_a, **_k):
+        raise RuntimeError("catalog on fire")
+
+    monkeypatch.setattr(kb, "_enrich_contract_with_capabilities", _boom)
+    synth = _synth_contract(["read:subscription_revenue"])
+    intake = {"answers": {"raw": "grow the app"}, "state": "answers_received"}
+    coverage = kb._launch_intake_coverage_report(
+        {"raw": "grow the app"}, rough_goal="grow app"
+    )
+    # Must not raise despite the enrichment blowing up.
+    merged = kb._apply_synthesized_launch_contract(
+        {"launch_intake": intake}, intake, coverage, synth, "grow app"
+    )
+    assert merged.get("objective") and merged.get("workflow")
+
+
+def test_apply_synthesized_contract_enriches_provider_policy():
+    """End-to-end through the synthesis-apply path: declared capabilities surface
+    as provider_policy.systems routes + launch_required_inputs on the merged
+    contract."""
+    needed = ["read:subscription_revenue", "write:ad_spend"]
+    synth = _synth_contract(needed, provider_policy={})
+    intake = {"answers": {"raw": "grow the app"}, "state": "answers_received"}
+    coverage = kb._launch_intake_coverage_report(
+        {"raw": "grow the app"}, rough_goal="grow app"
+    )
+    merged = kb._apply_synthesized_launch_contract(
+        {"launch_intake": intake}, intake, coverage, synth, "grow app"
+    )
+    systems = merged["runtime"]["provider_policy"]["systems"]
+    assert systems["read:subscription_revenue"]["provider"] == "app_store_connect"
+    assert systems["write:ad_spend"]["provider"] == "apple_search_ads"
+    assert merged.get("launch_required_inputs")
