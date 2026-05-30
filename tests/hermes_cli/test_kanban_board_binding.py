@@ -332,3 +332,109 @@ def test_doctor_health_clean_when_all_configured(fresh_home):
     assert health["ok"] is True
     assert health["orphans"] == []
     assert health["bad_profile_bindings"] == []
+
+
+# ---------------------------------------------------------------------------
+# 7. Launch auto-binds the contract's role profiles to the ONE board
+# ---------------------------------------------------------------------------
+
+def _launch_ready_land_contract():
+    return {
+        "objective": {
+            "statement": "Launch a land wholesaling business",
+            "success": ["qualified seller leads reach signed purchase agreements"],
+            "failure": ["seller conversations continue without approval boundaries"],
+            "constraints": ["owner approves outbound offers"],
+        },
+        "runtime": {
+            "mode": "company",
+            "dispatcher": {"profile": "land-ceo"},
+            "profiles": {"ceo": "land-ceo", "optimizer": "land-opt", "worker": "land-operator"},
+            "require_worker_envelopes": True,
+            "require_provider_policy": True,
+            "provider_policy": {"seller_outreach": {"provider": "approved_sms_gateway"}},
+            "worker_envelopes": {
+                "land-operator": {
+                    "capabilities": ["seller_outreach"],
+                    "toolsets": ["kanban"],
+                    "allowed_side_effects": ["owner_approved_external_write"],
+                }
+            },
+        },
+        "workflow": {
+            "id": "land-close-flow",
+            "goal_id": "close-land-deals",
+            "require_semantics": True,
+            "workstreams": [{"key": "seller-conversion", "stages": ["source", "negotiate", "close"]}],
+            "stages": [
+                {
+                    "key": "source",
+                    "actions": [{"key": "capture_lead"}],
+                    "triggers": [{"type": "timer", "key": "daily_source"}],
+                    "exit_criteria": [
+                        {"transition": "negotiate", "evidence_required": ["qualified_lead"]}
+                    ],
+                },
+                {
+                    "key": "negotiate",
+                    "actions": [
+                        {
+                            "key": "seller_follow_up",
+                            "required_capabilities": ["seller_outreach"],
+                            "side_effect_class": "owner_approved_external_write",
+                        }
+                    ],
+                    "exit_criteria": [
+                        {"transition": "close", "evidence_required": ["accepted_terms"]}
+                    ],
+                },
+                {"key": "close", "actions": [{"key": "archive_outcome"}], "exit_criteria": []},
+            ],
+        },
+        "entities": [
+            {
+                "key": "seller_lead",
+                "type": "lead",
+                "states": ["new", "qualified", "negotiating", "closed", "dead"],
+                "terminal_states": ["closed", "dead"],
+            }
+        ],
+        "event_loops": [
+            {"type": "inbound_sms", "entity": "seller_lead", "terminal_states": ["closed", "dead"]}
+        ],
+        "approval_gates": [
+            {"key": "owner_offer_approval", "required_before": ["seller_follow_up"]}
+        ],
+        "proof_requirements": ["qualified_lead", "accepted_terms", "seller_outcome"],
+        "side_effect_policy": {
+            "allowed": ["read_only", "owner_approved_external_write"],
+            "forbidden": ["unapproved_external_write"],
+            "approval_required": ["seller_outreach"],
+        },
+        "escalation_paths": [
+            {"condition": "offer exceeds owner-approved authority", "to": "owner"}
+        ],
+        "owner_summary": {"summary": "Sources, qualifies, negotiates within owner limits, archives."},
+    }
+
+
+def _approve_launch(slug, contract):
+    kb.review_business_launch_contract(slug, contract=contract, create_if_missing=True)
+    token = kb.issue_board_launch_approval_token(
+        slug, contract=contract, approved_by="owner",
+        approval_evidence={"source": "test-owner-approval"},
+        owner_authority_confirmed=True,
+    )["token"]
+    return kb.review_business_launch_contract(
+        slug, contract=contract, approve=True, author="owner", approval_token=token,
+    )
+
+
+def test_launch_binds_contract_role_profiles_to_the_board(fresh_home):
+    """Activating a board binds ceo/optimizer/worker/dispatcher to THAT board."""
+    res = _approve_launch("land-wholesaling", _launch_ready_land_contract())
+    assert res["launch_phase"] == "active"
+    # Every profile the contract names now resolves to the single shared board.
+    for prof in ("land-ceo", "land-opt", "land-operator"):
+        assert kb.profile_board_binding(prof) == "land-wholesaling"
+        assert kb.resolve_daemon_board(prof) == "land-wholesaling"

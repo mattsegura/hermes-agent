@@ -4441,6 +4441,18 @@ def _review_business_launch_contract_unlocked(
         # block activation of an otherwise-ready board.
         if phase == "active" and launch_review_id:
             _safe_compile_contract_reactive_runtime(normed, draft)
+            # HARD RAIL #4: launch binds every profile the contract names as a
+            # role (ceo/optimizer/worker/dispatcher) to THIS one board, writing
+            # `kanban_board: <slug>` into each profile's config.yaml. This makes
+            # "one business = one board + a known set of agent profiles" the
+            # only shape an activated board can produce — a gateway for any of
+            # those profiles then resolves to this board, never 'default'.
+            # Best-effort: a profile-config write must never block activation
+            # of an otherwise-ready board.
+            try:
+                bind_contract_roles_to_board(normed)
+            except Exception:
+                pass
     return {
         "ok": bool(readiness.get("ok")),
         "status": readiness.get("status"),
