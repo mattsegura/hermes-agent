@@ -434,3 +434,278 @@ def test_optimizer_tick_sparse_data_leaves_knob_unchanged(fresh_home):
         assert res["applied"] == []
         contract = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
         assert contract["tunables"][KNOB]["default"] == 72
+
+
+# ---------------------------------------------------------------------------
+# 8. E3 multi-knob tick: tune ALL present managed knobs, not just the first.
+# ---------------------------------------------------------------------------
+
+
+KNOB2 = "cadence_hours"
+
+
+def _contract_with_two_knobs(spec1: dict, spec2: dict) -> dict:
+    c = _contract_with_knob(spec1)
+    c["tunables"][KNOB2] = spec2
+    return c
+
+
+def test_optimizer_tick_tunes_all_present_managed_knobs(fresh_home):
+    slug = "opt-multi"
+    kb.create_board(slug)
+    kb.write_board_metadata(
+        slug,
+        business_contract=_contract_with_two_knobs(
+            {"default": 72, "allowed": [48, 72]},
+            {"default": 12, "allowed": [6, 12]},
+        ),
+    )
+    base = 5_000_000
+    with kb.connect(board=slug) as conn:
+        # Knob 1: value 48 clearly beats 72.
+        for i in range(30):
+            _emit_outcome(
+                conn, board=slug, knob=KNOB, value=48,
+                reward_kind="conversion", reward_value=1.0, ts=base + i,
+            )
+            _emit_outcome(
+                conn, board=slug, knob=KNOB, value=72,
+                reward_kind="conversion", reward_value=0.0, ts=base + i,
+            )
+        # Knob 2: value 6 clearly beats 12.
+        for i in range(30):
+            _emit_outcome(
+                conn, board=slug, knob=KNOB2, value=6,
+                reward_kind="conversion", reward_value=1.0, ts=base + i,
+            )
+            _emit_outcome(
+                conn, board=slug, knob=KNOB2, value=12,
+                reward_kind="conversion", reward_value=0.0, ts=base + i,
+            )
+        res = kb.optimizer_tick(conn, board=slug, now=base + 100, rng=random.Random(0))
+        # BOTH managed knobs were evaluated and applied in a single tick (the
+        # pre-E3 behaviour only touched the first select_managed_knob result).
+        evaluated = {e["knob"] for e in res["evaluated"]}
+        assert evaluated == {KNOB, KNOB2}, res
+        applied = {a["knob"]: a["new_value"] for a in res["applied"]}
+        assert applied == {KNOB: 48, KNOB2: 6}, res
+        contract = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        assert contract["tunables"][KNOB]["default"] == 48
+        assert contract["tunables"][KNOB2]["default"] == 6
+
+
+def test_optimizer_tick_pinned_knob_tunes_only_that_one(fresh_home):
+    slug = "opt-multi-pinned"
+    kb.create_board(slug)
+    kb.write_board_metadata(
+        slug,
+        business_contract=_contract_with_two_knobs(
+            {"default": 72, "allowed": [48, 72]},
+            {"default": 12, "allowed": [6, 12]},
+        ),
+    )
+    base = 6_000_000
+    with kb.connect(board=slug) as conn:
+        for i in range(30):
+            _emit_outcome(
+                conn, board=slug, knob=KNOB2, value=6,
+                reward_kind="conversion", reward_value=1.0, ts=base + i,
+            )
+            _emit_outcome(
+                conn, board=slug, knob=KNOB2, value=12,
+                reward_kind="conversion", reward_value=0.0, ts=base + i,
+            )
+        # Pin to KNOB2 only -> KNOB is never touched (backward-compatible path).
+        res = kb.optimizer_tick(
+            conn, board=slug, knob=KNOB2, now=base + 100, rng=random.Random(0)
+        )
+        assert {e["knob"] for e in res["evaluated"]} == {KNOB2}, res
+        contract = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        assert contract["tunables"][KNOB]["default"] == 72  # untouched
+        assert contract["tunables"][KNOB2]["default"] == 6   # tuned
+
+
+# ---------------------------------------------------------------------------
+# 9. E4 canary + auto-revert (default-off).
+# ---------------------------------------------------------------------------
+
+
+def _seed_applied_change(conn, slug, *, knob, old_value, new_value, ts):
+    """Apply an in-bounds change so an 'applied' audit row exists to canary."""
+    return kb.apply_knob_update(
+        conn, board=slug, knob=knob, new_value=new_value,
+        old_value=old_value, reason="seed", actor="optimizer", now=ts,
+    )
+
+
+def _setup_regression(conn, slug, base):
+    """Strong pre-change baseline, an applied change to 48, then a collapse."""
+    for i in range(6):
+        _emit_outcome(
+            conn, board=slug, knob=KNOB, value=72,
+            reward_kind="conversion", reward_value=1.0, ts=base + i,
+        )
+    _seed_applied_change(conn, slug, knob=KNOB, old_value=72, new_value=48, ts=base + 10)
+    for i in range(6):
+        _emit_outcome(
+            conn, board=slug, knob=KNOB, value=48,
+            reward_kind="conversion", reward_value=0.0, ts=base + 20 + i,
+        )
+
+
+def test_canary_reverts_regression_when_enabled(fresh_home):
+    """Flag on: a post-change reward collapse is rolled back to last-known-good.
+
+    Tested at the canary boundary (``_optimizer_canary_revert``) so the result
+    is independent of the separate Thompson re-tune loop.
+    """
+    slug = "canary-revert"
+    _make_board(slug, {"default": 72, "allowed": [48, 72]})
+    base = 8_000_000
+    hold = kb.OPTIMIZER_CANARY_HOLD_SECONDS
+    with kb.connect(board=slug) as conn:
+        _setup_regression(conn, slug, base)
+        contract = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        rev = kb._optimizer_canary_revert(
+            conn, board=slug, knob=KNOB, contract=contract, now=base + hold + 100,
+        )
+        assert rev is not None
+        assert rev["status"] == "reverted"
+        assert rev["new_value"] == 72  # back to last-known-good old_value
+        assert rev["pre_mean_reward"] == 1.0
+        assert rev["post_mean_reward"] == 0.0
+        # The contract default was rolled back.
+        contract2 = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        assert contract2["tunables"][KNOB]["default"] == 72
+        # A 'reverted' audit row exists.
+        statuses = [
+            r[0] for r in conn.execute(
+                "SELECT status FROM board_knob_audit WHERE board = ? AND knob = ? "
+                "ORDER BY ts, id", (slug, KNOB),
+            ).fetchall()
+        ]
+        assert "reverted" in statuses
+
+
+def test_canary_no_op_when_flag_off(fresh_home):
+    """Default-off: optimizer_tick does NOT run the canary (no revert path)."""
+    slug = "canary-off"
+    _make_board(slug, {"default": 72, "allowed": [48, 72]})
+    base = 7_000_000
+    hold = kb.OPTIMIZER_CANARY_HOLD_SECONDS
+    with kb.connect(board=slug) as conn:
+        _setup_regression(conn, slug, base)
+        # Flag off (default) -> the tick never enters the canary branch.
+        res = kb.optimizer_tick(
+            conn, board=slug, now=base + hold + 100, rng=random.Random(0),
+        )
+        assert res.get("reverted") == []
+
+
+def test_canary_keeps_change_that_improved(fresh_home):
+    """Flag on: an applied change that DID improve is kept (canary returns None)."""
+    slug = "canary-keep"
+    _make_board(slug, {"default": 72, "allowed": [48, 72]})
+    base = 9_000_000
+    hold = kb.OPTIMIZER_CANARY_HOLD_SECONDS
+    with kb.connect(board=slug) as conn:
+        # Weak baseline before the change.
+        for i in range(6):
+            _emit_outcome(
+                conn, board=slug, knob=KNOB, value=72,
+                reward_kind="conversion", reward_value=0.0, ts=base + i,
+            )
+        _seed_applied_change(conn, slug, knob=KNOB, old_value=72, new_value=48, ts=base + 10)
+        # Post-change reward improved.
+        for i in range(6):
+            _emit_outcome(
+                conn, board=slug, knob=KNOB, value=48,
+                reward_kind="conversion", reward_value=1.0, ts=base + 20 + i,
+            )
+        contract = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        rev = kb._optimizer_canary_revert(
+            conn, board=slug, knob=KNOB, contract=contract, now=base + hold + 100,
+        )
+        assert rev is None
+        contract2 = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        assert contract2["tunables"][KNOB]["default"] == 48
+
+
+def test_canary_holds_within_window(fresh_home):
+    """The hold window has NOT elapsed -> the canary holds (returns None)."""
+    slug = "canary-hold"
+    _make_board(slug, {"default": 72, "allowed": [48, 72]})
+    base = 10_000_000
+    with kb.connect(board=slug) as conn:
+        _setup_regression(conn, slug, base)
+        contract = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        # now is only a little after the change -> still baking.
+        rev = kb._optimizer_canary_revert(
+            conn, board=slug, knob=KNOB, contract=contract, now=base + 30,
+        )
+        assert rev is None
+        contract2 = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        assert contract2["tunables"][KNOB]["default"] == 48
+
+
+def test_canary_holds_when_too_few_post_outcomes(fresh_home):
+    """Past the hold window but too few post-change outcomes -> keep holding."""
+    slug = "canary-thin"
+    _make_board(slug, {"default": 72, "allowed": [48, 72]})
+    base = 12_000_000
+    hold = kb.OPTIMIZER_CANARY_HOLD_SECONDS
+    with kb.connect(board=slug) as conn:
+        for i in range(6):
+            _emit_outcome(
+                conn, board=slug, knob=KNOB, value=72,
+                reward_kind="conversion", reward_value=1.0, ts=base + i,
+            )
+        _seed_applied_change(conn, slug, knob=KNOB, old_value=72, new_value=48, ts=base + 10)
+        # Only 2 post-change outcomes -- below OPTIMIZER_CANARY_MIN_OUTCOMES.
+        for i in range(2):
+            _emit_outcome(
+                conn, board=slug, knob=KNOB, value=48,
+                reward_kind="conversion", reward_value=0.0, ts=base + 20 + i,
+            )
+        contract = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        rev = kb._optimizer_canary_revert(
+            conn, board=slug, knob=KNOB, contract=contract, now=base + hold + 100,
+        )
+        assert rev is None
+
+
+def test_canary_integrated_revert_appears_in_tick_result(fresh_home):
+    """End-to-end: with the flag on, optimizer_tick surfaces the revert."""
+    slug = "canary-tick"
+    _make_board(slug, {"default": 72, "allowed": [48, 72]})
+    base = 13_000_000
+    hold = kb.OPTIMIZER_CANARY_HOLD_SECONDS
+    with kb.connect(board=slug) as conn:
+        _setup_regression(conn, slug, base)
+        res = kb.optimizer_tick(
+            conn, board=slug, now=base + hold + 100, rng=random.Random(0),
+            auto_revert=True,
+        )
+        assert len(res["reverted"]) == 1, res
+        assert res["reverted"][0]["new_value"] == 72
+        # A reverted change short-circuits the re-tune for this knob this tick.
+        assert all(e["knob"] != KNOB for e in res["evaluated"])
+        contract = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        assert contract["tunables"][KNOB]["default"] == 72
+
+
+def test_canary_env_flag_enables_revert(fresh_home, monkeypatch):
+    """The HERMES_OPTIMIZER_AUTO_REVERT env var enables the canary."""
+    monkeypatch.setenv(kb.OPTIMIZER_AUTO_REVERT_ENV, "1")
+    slug = "canary-env"
+    _make_board(slug, {"default": 72, "allowed": [48, 72]})
+    base = 11_000_000
+    hold = kb.OPTIMIZER_CANARY_HOLD_SECONDS
+    with kb.connect(board=slug) as conn:
+        _setup_regression(conn, slug, base)
+        res = kb.optimizer_tick(
+            conn, board=slug, now=base + hold + 100, rng=random.Random(0),
+        )
+        assert len(res["reverted"]) == 1, res
+        contract = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        assert contract["tunables"][KNOB]["default"] == 72

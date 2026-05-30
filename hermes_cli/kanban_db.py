@@ -11476,6 +11476,23 @@ def _json_text_or_none(value: Optional[Any]) -> Optional[str]:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _coerce_json(value: Optional[Any]) -> Any:
+    """Inverse of :func:`_json_text_or_none` for reading audit columns.
+
+    Audit ``old_value``/``new_value`` columns are stored as ``json.dumps`` text.
+    Parse them back to a Python value (number/bool/str). Non-JSON or NULL text
+    is returned unchanged, so this is safe on already-native values too.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, (str, bytes, bytearray)):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return value
+
+
 def _board_knob_snapshot(board: Optional[str]) -> dict[str, Any]:
     """Best-effort snapshot of the board's active tunable defaults.
 
@@ -16101,6 +16118,35 @@ OPTIMIZER_MIN_NEW_OUTCOMES: int = 5
 KNOB_UPDATE_GATE_PREFIX: str = "knob_update"
 
 # ---------------------------------------------------------------------------
+# E4 canary + auto-revert (default-off).
+#
+# When the optimizer applies an in-bounds knob change it is a CANARY: if the
+# board's reward trend does not improve over a hold window after the change, a
+# later tick auto-reverts the knob to the last-known-good ``old_value`` (already
+# stored on the ``applied`` ``board_knob_audit`` row) and records a ``reverted``
+# audit row. This is BEHIND A DEFAULT-OFF FLAG because it changes existing
+# behaviour (a change that used to stick can now be rolled back); enable it with
+# env ``HERMES_OPTIMIZER_AUTO_REVERT=1`` (or pass ``auto_revert=True`` to
+# ``optimizer_tick``). With the flag off the canary is a pure no-op.
+# ---------------------------------------------------------------------------
+
+#: Minimum seconds an applied change must "bake" before the canary may judge it.
+#: Gives outcomes time to land at the new value before we measure improvement.
+OPTIMIZER_CANARY_HOLD_SECONDS: int = 24 * 3600
+
+#: Minimum post-change outcomes (at the new value) required before the canary
+#: will judge -- too few and the comparison is noise, so we keep holding.
+OPTIMIZER_CANARY_MIN_OUTCOMES: int = 4
+
+#: Improvement epsilon (in utility units). The post-change mean utility must
+#: beat the pre-change baseline by MORE than this to be considered an
+#: improvement; otherwise the change is "did not improve" and is reverted.
+OPTIMIZER_CANARY_IMPROVE_EPSILON: float = 0.0
+
+#: Env flag that opts a board's optimizer ticks into E4 auto-revert. Default-off.
+OPTIMIZER_AUTO_REVERT_ENV: str = "HERMES_OPTIMIZER_AUTO_REVERT"
+
+# ---------------------------------------------------------------------------
 # Signal / audit retention (operational hygiene).
 #
 # board_signals and board_knob_audit are append-only and otherwise unbounded.
@@ -16836,6 +16882,199 @@ def _optimizer_should_reevaluate(
     return new_outcomes >= OPTIMIZER_MIN_NEW_OUTCOMES
 
 
+# ---------------------------------------------------------------------------
+# E4 canary + auto-revert helpers (default-off).
+# ---------------------------------------------------------------------------
+
+
+def _auto_revert_enabled(auto_revert: Optional[bool]) -> bool:
+    """Resolve the E4 auto-revert flag: explicit arg wins, else the env flag.
+
+    Default-off: returns ``False`` unless the caller explicitly passes
+    ``auto_revert=True`` or the ``HERMES_OPTIMIZER_AUTO_REVERT`` env var is set
+    to a truthy value (``1``/``true``/``yes``/``on``).
+    """
+    if auto_revert is not None:
+        return bool(auto_revert)
+    raw = os.environ.get(OPTIMIZER_AUTO_REVERT_ENV, "")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _last_applied_knob_change(
+    conn: sqlite3.Connection, board: str, knob: str
+) -> Optional[dict]:
+    """Most recent autonomously-``applied`` knob change as a compact dict.
+
+    The canary judges the LAST applied change. Returns ``None`` when the most
+    recent audit row for the knob is not an optimizer ``applied`` row (e.g. it
+    was already reverted, gated, or applied by a human) -- so we never re-judge
+    an already-handled change. ``old_value`` is the last-known-good to revert to.
+    """
+    row = conn.execute(
+        "SELECT id, ts, old_value, new_value, status, actor, contract_version "
+        "FROM board_knob_audit WHERE board = ? AND knob = ? "
+        "ORDER BY ts DESC, id DESC LIMIT 1",
+        (board, knob),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["status"] != "applied" or row["actor"] != "optimizer":
+        return None
+    return {
+        "id": int(row["id"]),
+        "ts": int(row["ts"]) if row["ts"] is not None else None,
+        "old_value": _coerce_json(row["old_value"]),
+        "new_value": _coerce_json(row["new_value"]),
+        "contract_version": row["contract_version"],
+    }
+
+
+def _board_reward_mean_in_window(
+    conn: sqlite3.Connection,
+    board: str,
+    *,
+    lo_ts: Optional[int],
+    hi_ts: Optional[int],
+) -> tuple[int, Optional[float]]:
+    """Mean reward *utility* (higher == better) over board outcomes in a window.
+
+    Window is ``lo_ts < ts <= hi_ts`` (either bound optional). Utilities are
+    normalized via the optimizer's maximize-direction mapping (binary 1/0,
+    continuous negated) so the canary compares apples to apples regardless of
+    reward kind. Returns ``(n, mean_or_None)``.
+    """
+    from hermes_cli import kanban_optimizer as _opt
+
+    clauses = [
+        "board = ?",
+        "primitive_kind = 'outcome'",
+        "reward_value IS NOT NULL",
+        "reward_kind IS NOT NULL",
+    ]
+    params: list[Any] = [board]
+    if lo_ts is not None:
+        clauses.append("ts > ?")
+        params.append(int(lo_ts))
+    if hi_ts is not None:
+        clauses.append("ts <= ?")
+        params.append(int(hi_ts))
+    rows = conn.execute(
+        "SELECT reward_kind, reward_value FROM board_signals WHERE "
+        + " AND ".join(clauses),
+        tuple(params),
+    ).fetchall()
+    total = 0.0
+    n = 0
+    for row in rows:
+        utility = _opt.reward_utility(row["reward_kind"], row["reward_value"])
+        if utility is None:
+            continue
+        total += utility
+        n += 1
+    return n, (total / n if n else None)
+
+
+def _optimizer_canary_revert(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    knob: str,
+    contract: dict,
+    now: int,
+) -> Optional[dict]:
+    """Judge the last applied knob change; auto-revert if it did not improve.
+
+    Canary rule (E4): after the hold window has elapsed since an applied change
+    AND enough post-change outcomes have landed, compare the post-change mean
+    reward utility against the pre-change baseline. If the post-change mean did
+    NOT beat the baseline by more than the improvement epsilon, the change is a
+    regression -> revert the knob to the last-known-good ``old_value`` (from the
+    ``applied`` audit row) and record a ``reverted`` audit row.
+
+    Returns the revert result dict when a revert happened, else ``None`` (still
+    holding, improved, or nothing to judge). Caller must have already checked
+    the default-off flag.
+    """
+    from hermes_cli import kanban_optimizer as _opt
+
+    last = _last_applied_knob_change(conn, board, knob)
+    if last is None or last["ts"] is None:
+        return None
+    change_ts = last["ts"]
+    # Still baking: give outcomes time to land at the new value.
+    if (now - change_ts) < OPTIMIZER_CANARY_HOLD_SECONDS:
+        return None
+    post_n, post_mean = _board_reward_mean_in_window(
+        conn, board, lo_ts=change_ts, hi_ts=now
+    )
+    # Not enough post-change evidence to judge -> keep holding.
+    if post_n < OPTIMIZER_CANARY_MIN_OUTCOMES:
+        return None
+    _pre_n, pre_mean = _board_reward_mean_in_window(
+        conn, board, lo_ts=None, hi_ts=change_ts
+    )
+    # No baseline to compare against -> cannot call it a regression; hold.
+    if pre_mean is None or post_mean is None:
+        return None
+    improved = post_mean > (pre_mean + OPTIMIZER_CANARY_IMPROVE_EPSILON)
+    if improved:
+        return None
+
+    # Regression: revert to the last-known-good old_value. Guard the value is
+    # still in-bounds for the (possibly amended) contract before writing.
+    revert_to = last["old_value"]
+    spec = _opt.find_knob_spec(contract, knob)
+    if spec is None or not _opt.knob_value_in_bounds(spec, revert_to):
+        _log.warning(
+            "kanban optimizer canary: board %s knob %s did not improve "
+            "(pre=%.4f post=%.4f) but last-known-good %r is no longer in "
+            "bounds; skipping auto-revert",
+            board, knob, pre_mean, post_mean, revert_to,
+        )
+        return None
+
+    result = apply_knob_update(
+        conn,
+        board=board,
+        knob=knob,
+        new_value=revert_to,
+        old_value=last["new_value"],
+        reason=(
+            f"optimizer:canary_revert:no_improvement"
+            f":pre={pre_mean:.4f}:post={post_mean:.4f}:n={post_n}"
+        ),
+        actor="optimizer",
+        now=now,
+    )
+    # ``apply_knob_update`` stamps an 'applied' row for the write; add a paired
+    # 'reverted' audit row so the canary decision is first-class in the audit
+    # log (the read-model / owner can see WHY the knob moved back).
+    if result.get("applied"):
+        with write_txn(conn):
+            revert_audit_id = _record_knob_audit(
+                conn, board=board, knob=knob,
+                old_value=last["new_value"], new_value=revert_to,
+                status="reverted",
+                reason=result.get("reason"),
+                actor="optimizer",
+                contract_version=result.get("contract_version"),
+                context_features=None, ts=now,
+            )
+        result["status"] = "reverted"
+        result["reverted"] = True
+        result["revert_audit_id"] = revert_audit_id
+        result["pre_mean_reward"] = pre_mean
+        result["post_mean_reward"] = post_mean
+        result["post_outcomes"] = post_n
+        _log.info(
+            "kanban optimizer canary: board %s knob %s reverted to %r "
+            "(pre=%.4f post=%.4f n=%d)",
+            board, knob, revert_to, pre_mean, post_mean, post_n,
+        )
+        return result
+    return None
+
+
 def optimizer_tick(
     conn: sqlite3.Connection,
     *,
@@ -16844,6 +17083,7 @@ def optimizer_tick(
     now: Optional[int] = None,
     rng: Optional[Any] = None,
     force: bool = False,
+    auto_revert: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Drive the P2 closed learning loop one step for a board.
 
@@ -16853,20 +17093,27 @@ def optimizer_tick(
     outcomes have landed. An in-bounds proposal is applied autonomously; an
     out-of-bounds one is routed to an approval gate (never written).
 
-    For P2 exactly ONE knob is managed (see
-    :data:`hermes_cli.kanban_optimizer.OPTIMIZER_MANAGED_KNOBS`); the loop is
-    written to scale to more knobs later.
+    E3: ALL present managed knobs are tuned each tick (not just the first
+    ``select_managed_knob`` result); the per-knob math is unchanged.
+
+    E4 (default-off): when auto-revert is enabled (``auto_revert=True`` or env
+    ``HERMES_OPTIMIZER_AUTO_REVERT``), a canary check runs FIRST per knob -- a
+    previously-applied change whose reward trend did not improve over the hold
+    window is rolled back to the last-known-good value (recorded ``reverted``).
+    With the flag off this is a pure no-op, so existing behaviour is unchanged.
     """
     from hermes_cli import kanban_optimizer as _opt
 
     board_slug = _connection_board(conn, board)
     when = int(time.time()) if now is None else int(now)
+    revert_on = _auto_revert_enabled(auto_revert)
     result: dict[str, Any] = {
         "board": board_slug,
         "evaluated": [],
         "applied": [],
         "skipped": [],
         "gated": [],
+        "reverted": [],
     }
     # Opportunistic retention prune (operational hygiene). Best-effort: a prune
     # failure must never break the learning tick. The rollup keeps the learner's
@@ -16890,44 +17137,77 @@ def optimizer_tick(
         result["skipped"].append({"knob": knob, "reason": "contract_read_failed"})
         result["error"] = str(exc)
         return result
-    target = knob or _opt.select_managed_knob(contract)
-    if not target or _opt.find_knob_spec(contract, target) is None:
+    # E3 multi-knob tick: tune EVERY present managed knob, not just the first
+    # ``select_managed_knob`` result. Mirrors the read-model loop in
+    # ``build_learned_state_read_model`` (filter ``OPTIMIZER_MANAGED_KNOBS`` by
+    # presence in the contract). When ``knob`` is pinned we tune only that one
+    # (backward-compatible with the single-knob callers/tests). Per-knob math is
+    # unchanged -- each knob is evaluated/throttled/applied exactly as before.
+    if knob is not None:
+        targets = [knob] if _opt.find_knob_spec(contract, knob) is not None else []
+    else:
+        targets = [
+            kn for kn in _opt.OPTIMIZER_MANAGED_KNOBS
+            if _opt.find_knob_spec(contract, kn) is not None
+        ]
+    if not targets:
         result["skipped"].append({"knob": knob, "reason": "no_managed_knob"})
         return result
 
-    if not force and not _optimizer_should_reevaluate(conn, board_slug, target, when):
-        result["skipped"].append({"knob": target, "reason": "throttled"})
-        return result
+    for target in targets:
+        # E4 canary (default-off): judge the last applied change FIRST. A
+        # regression is rolled back to the last-known-good value; when a revert
+        # fires we skip re-tuning this knob this tick (let the reverted value
+        # bake before proposing again). Best-effort -- a canary hiccup must never
+        # stop the rest of the tick.
+        if revert_on:
+            try:
+                reverted = _optimizer_canary_revert(
+                    conn, board=board_slug, knob=target, contract=contract, now=when,
+                )
+            except Exception:  # pragma: no cover - canary is best-effort
+                _log.warning(
+                    "kanban optimizer canary failed for board %s knob %s",
+                    board_slug, target, exc_info=True,
+                )
+                reverted = None
+            if reverted is not None:
+                result["reverted"].append(reverted)
+                continue
 
-    proposal = _opt.propose_knob_value(
-        conn, board=board_slug, knob=target, contract=contract, rng=rng
-    )
-    result["evaluated"].append({
-        "knob": target,
-        "proposed": proposal.proposed_value,
-        "current": proposal.current_value,
-        "changed": proposal.changed,
-        "reason": proposal.reason,
-        "total_outcomes": proposal.total_outcomes,
-    })
-    if not proposal.changed:
-        result["skipped"].append({"knob": target, "reason": proposal.reason})
-        return result
+        if not force and not _optimizer_should_reevaluate(conn, board_slug, target, when):
+            result["skipped"].append({"knob": target, "reason": "throttled"})
+            continue
 
-    update = apply_knob_update(
-        conn,
-        board=board_slug,
-        knob=target,
-        new_value=proposal.proposed_value,
-        old_value=proposal.current_value,
-        reason="optimizer:thompson",
-        actor="optimizer",
-        now=when,
-    )
-    if update.get("applied"):
-        result["applied"].append(update)
-    else:
-        result["gated"].append(update)
+        proposal = _opt.propose_knob_value(
+            conn, board=board_slug, knob=target, contract=contract, rng=rng
+        )
+        result["evaluated"].append({
+            "knob": target,
+            "proposed": proposal.proposed_value,
+            "current": proposal.current_value,
+            "changed": proposal.changed,
+            "reason": proposal.reason,
+            "total_outcomes": proposal.total_outcomes,
+        })
+        if not proposal.changed:
+            result["skipped"].append({"knob": target, "reason": proposal.reason})
+            continue
+
+        update = apply_knob_update(
+            conn,
+            board=board_slug,
+            knob=target,
+            new_value=proposal.proposed_value,
+            old_value=proposal.current_value,
+            reason="optimizer:thompson",
+            actor="optimizer",
+            now=when,
+        )
+        if update.get("applied"):
+            result["applied"].append(update)
+        else:
+            result["gated"].append(update)
     return result
 
 
@@ -19106,6 +19386,56 @@ def _coerce_per_profile_cap(value) -> Optional[int]:
     return cap if cap > 0 else None
 
 
+def _resolve_dispatch_caps(
+    board_slug: str,
+    *,
+    max_in_progress: Optional[int],
+    max_in_progress_per_profile: Optional[int],
+    max_spawn: Optional[int],
+) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """Resolve the dispatch concurrency caps from the board contract (E2).
+
+    For each cap knob the precedence is
+    ``contract.runtime.tunables[knob].default`` THEN the passed-in config value
+    (the FALLBACK). This is the read-seam that makes an optimizer write to a cap
+    tunable take effect on dispatch -- mirroring how ``managed_cadence_default``
+    feeds the reactive cadence. Reading the contract is best-effort: any failure
+    leaves all three caps at their config-supplied values, so dispatch behaviour
+    is unchanged when no cap tunable is declared (the common case).
+    """
+    config_caps = {
+        "max_in_progress": max_in_progress,
+        "max_in_progress_per_profile": max_in_progress_per_profile,
+        "max_spawn": max_spawn,
+    }
+    try:
+        from hermes_cli import kanban_optimizer as _opt
+
+        contract = _metadata_as_business_contract(read_board_metadata(board_slug))
+        resolved: dict[str, Optional[int]] = {}
+        for knob, config_value in config_caps.items():
+            override = _opt.managed_cap_default(contract, knob)
+            if override is not None and override != config_value:
+                _log.info(
+                    "kanban dispatcher: board %s cap %s resolved from contract "
+                    "tunable default=%d (config fallback=%r)",
+                    board_slug, knob, override, config_value,
+                )
+            resolved[knob] = override if override is not None else config_value
+        return (
+            resolved["max_in_progress"],
+            resolved["max_in_progress_per_profile"],
+            resolved["max_spawn"],
+        )
+    except Exception:  # pragma: no cover - defensive: never break dispatch
+        _log.debug(
+            "kanban dispatcher: contract cap read failed for board %s; "
+            "using config caps",
+            board_slug, exc_info=True,
+        )
+        return (max_in_progress, max_in_progress_per_profile, max_spawn)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -19150,6 +19480,25 @@ def dispatch_once(
     board. When omitted, the current-board resolution chain is used.
     """
     board_slug = _connection_board(conn, board)
+
+    # E2 read-seam: resolve the concurrency caps from the board contract's
+    # tunables (``contract.runtime.tunables[knob].default``) with the passed-in
+    # config.yaml value as FALLBACK. This mirrors how ``managed_cadence_default``
+    # feeds the reactive cadence: without this an optimizer write to a cap
+    # tunable was a silent no-op because the caps were read ONLY from config.
+    # Best-effort -- a contract-read hiccup must never break dispatch, it just
+    # falls back to the config-supplied caps.
+    (
+        max_in_progress,
+        max_in_progress_per_profile,
+        max_spawn,
+    ) = _resolve_dispatch_caps(
+        board_slug,
+        max_in_progress=max_in_progress,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+        max_spawn=max_spawn,
+    )
+
     dispatch_audit = audit_board_dispatcher_ownership(board_slug)
     if dispatch_audit.get("status") == "critical":
         _log.error(
