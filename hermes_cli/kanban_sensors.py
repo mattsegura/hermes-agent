@@ -263,6 +263,12 @@ def circuit_decision(
 # ---------------------------------------------------------------------------
 # Sensor 3 -- Budget / rate meter + pacing (pure decision).
 # ---------------------------------------------------------------------------
+# Budget over-lifetime level: a cumulative (non-resetting) ceiling was hit. It
+# is distinct from per-window ``tripped`` because a window roll can never clear
+# it -- only an owner raising/removing the lifetime_cap can.
+BUDGET_OVER_LIFETIME = "over_lifetime"
+
+
 def budget_decision(
     *,
     prev_level: Optional[str],
@@ -274,6 +280,8 @@ def budget_decision(
     rate_limit: Optional[float],
     warn_fraction: Optional[float],
     window: Optional[float],
+    lifetime_spend: Optional[float] = None,
+    lifetime_cap: Optional[float] = None,
 ) -> SensorDecision:
     """Meter spend + request-rate against the per-window cap and emit warn/trip.
 
@@ -286,6 +294,14 @@ def budget_decision(
     gate must throttle new spawns); the returned ``state`` carries a
     ``pacing`` hint (allow + a suggested delay to the next window) the
     dispatcher can honour.
+
+    D3 cumulative ceiling: ``lifetime_spend`` is a NON-resetting accumulator the
+    DB layer maintains across every window roll; ``lifetime_cap`` is an optional
+    bounded knob. When lifetime spend >= lifetime_cap the meter blocks at level
+    ``over_lifetime`` INDEPENDENT of the window -- a window roll cannot clear it
+    (only the owner raising the cap can). Purely additive: when no
+    ``lifetime_cap`` is declared the lifetime check is skipped and the meter
+    behaves exactly as before.
     """
     win = int(window) if window and window > 0 else 0
     start = int(window_start) if window_start is not None else int(now)
@@ -315,12 +331,25 @@ def budget_decision(
 
     over_budget = bool(cap and cur_spend >= cap)
     over_rate = bool(rl and cur_requests >= rl)
-    blocking = over_budget or over_rate
 
-    # Pacing: when blocked, advise delaying until the window rolls. Otherwise
-    # allow immediately.
+    # D3 cumulative lifetime ceiling (additive; only active when a cap is set).
+    lcap = lifetime_cap if lifetime_cap and lifetime_cap > 0 else None
+    life_spend = float(lifetime_spend) if lifetime_spend is not None else 0.0
+    over_lifetime = bool(lcap and life_spend >= lcap)
+    lifetime_frac = (life_spend / lcap) if lcap else 0.0
+    if over_lifetime:
+        # over_lifetime supersedes the per-window level -- a window roll must not
+        # mask a breached lifetime ceiling. usage reflects the worse of the two.
+        level = BUDGET_OVER_LIFETIME
+        usage = max(usage, lifetime_frac)
+
+    blocking = over_budget or over_rate or over_lifetime
+
+    # Pacing: when blocked, advise delaying until the window rolls. A lifetime
+    # breach can NEVER be cleared by waiting (no window rolls it), so advise no
+    # delay (allow stays False -- the gate still blocks; the owner must act).
     delay = 0
-    if blocking and win > 0:
+    if blocking and not over_lifetime and win > 0:
         delay = max(0, (start + win) - int(now))
     pacing = {"allow": not blocking, "delay_seconds": delay}
 
@@ -338,7 +367,12 @@ def budget_decision(
         "over_rate": over_rate,
         "pacing": pacing,
         "window_reset": reset,
+        "lifetime_spend": round(life_spend, 6),
+        "over_lifetime": over_lifetime,
     }
+    if lcap is not None:
+        state["lifetime_cap"] = lcap
+        state["lifetime_fraction"] = round(lifetime_frac, 4)
     return SensorDecision(
         status=level,
         state=state,
@@ -352,6 +386,9 @@ def budget_decision(
             "rate_limit": rl,
             "over_budget": over_budget,
             "over_rate": over_rate,
+            "lifetime_spend": round(life_spend, 6),
+            "lifetime_cap": lcap,
+            "over_lifetime": over_lifetime,
         },
         blocking=blocking,
     )

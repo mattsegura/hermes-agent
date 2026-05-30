@@ -380,6 +380,135 @@ def test_unknown_knob_routes_to_approval_gate(fresh_home):
 
 
 # ---------------------------------------------------------------------------
+# 6b. D1 owner-class: the machine cannot raise its own ceiling.
+#
+# An autonomous (actor=optimizer) IN-BOUNDS write is refused unless the knob is
+# declared optimizer-tunable (or is a legacy managed knob). The refusal routes
+# to the SAME owner approval gate as an out-of-bounds proposal -- structural,
+# not incidental.
+# ---------------------------------------------------------------------------
+
+
+# A general-purpose extra knob NOT in OPTIMIZER_MANAGED_KNOBS, so it gets the
+# conservative default owner_class unless one is declared.
+GUARDED_KNOB = "lifetime_cap_units"
+
+
+def _contract_with_named_knob(name: str, spec: dict) -> dict:
+    c = _contract_with_knob({"default": 72, "allowed": [24, 48, 72]})
+    c["tunables"][name] = spec
+    return c
+
+
+def _make_board_named(slug: str, name: str, spec: dict) -> None:
+    kb.create_board(slug)
+    kb.write_board_metadata(slug, business_contract=_contract_with_named_knob(name, spec))
+
+
+def test_owner_class_helpers_resolution():
+    # Explicit owner_class wins.
+    assert opt.knob_owner_class({"owner_class": "optimizer-tunable"}) == "optimizer-tunable"
+    assert opt.knob_owner_class({"owner_class": "owner-tunable"}) == "owner-tunable"
+    assert opt.knob_owner_class({"owner_class": "infra-fixed"}) == "infra-fixed"
+    # Aliases normalize.
+    assert opt.knob_owner_class({"owner_class": "optimizer"}) == "optimizer-tunable"
+    assert opt.knob_owner_class({"owner_class": "infra"}) == "infra-fixed"
+    # Unset on a legacy managed knob -> optimizer-tunable (back-compat).
+    assert opt.knob_owner_class({}, knob=KNOB) == "optimizer-tunable"
+    # Unset on any other knob -> conservative owner-tunable (NOT writable).
+    assert opt.knob_owner_class({}, knob="anything_else") == "owner-tunable"
+    assert opt.is_optimizer_writable({"owner_class": "optimizer-tunable"}) is True
+    assert opt.is_optimizer_writable({"owner_class": "owner-tunable"}) is False
+    assert opt.is_optimizer_writable({}, knob=KNOB) is True
+
+
+def test_autonomous_in_bounds_write_to_owner_knob_is_refused(fresh_home):
+    # An IN-BOUNDS optimizer write to an owner-tunable knob is refused and
+    # routed to the approval gate (the value is fine; the AUTHORITY is not).
+    slug = "oc-owner"
+    _make_board_named(slug, GUARDED_KNOB,
+                      {"default": 100, "range": [1, 1000], "owner_class": "owner-tunable"})
+    with kb.connect(board=slug) as conn:
+        result = kb.apply_knob_update(
+            conn, board=slug, knob=GUARDED_KNOB, new_value=500, actor="optimizer",
+        )
+        assert result["applied"] is False
+        assert result["status"] == "approval_required"
+        assert result["reason"] == "owner_class"
+        assert result["owner_class_blocked"] is True
+        assert result["owner_class"] == "owner-tunable"
+        # The value was IN bounds, so this is NOT a range-widening amendment.
+        assert result["amendment_id"] is None
+        # Contract default was NOT moved.
+        contract = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        assert contract["tunables"][GUARDED_KNOB]["default"] == 100
+        # An approval_required audit row + a knob_action request (not an
+        # 'approval' grant) was recorded.
+        audit = conn.execute(
+            "SELECT status FROM board_knob_audit WHERE board = ? AND knob = ?",
+            (slug, GUARDED_KNOB),
+        ).fetchall()
+        assert [r[0] for r in audit] == ["approval_required"]
+
+
+def test_autonomous_write_to_infra_fixed_knob_is_refused(fresh_home):
+    slug = "oc-infra"
+    _make_board_named(slug, GUARDED_KNOB,
+                      {"default": 100, "range": [1, 1000], "owner_class": "infra-fixed"})
+    with kb.connect(board=slug) as conn:
+        result = kb.apply_knob_update(
+            conn, board=slug, knob=GUARDED_KNOB, new_value=200, actor="optimizer",
+        )
+        assert result["applied"] is False
+        assert result["status"] == "approval_required"
+        assert result["owner_class"] == "infra-fixed"
+
+
+def test_autonomous_in_bounds_write_to_optimizer_knob_applies(fresh_home):
+    # An explicitly optimizer-tunable knob IS autonomously writable in-bounds.
+    slug = "oc-opt"
+    _make_board_named(slug, GUARDED_KNOB,
+                      {"default": 100, "range": [1, 1000], "owner_class": "optimizer-tunable"})
+    with kb.connect(board=slug) as conn:
+        result = kb.apply_knob_update(
+            conn, board=slug, knob=GUARDED_KNOB, new_value=200, actor="optimizer",
+        )
+        assert result["applied"] is True
+        assert result["status"] == "applied"
+        contract = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        assert contract["tunables"][GUARDED_KNOB]["default"] == 200
+
+
+def test_owner_actor_may_write_owner_tunable_knob(fresh_home):
+    # The owner-class boundary ONLY constrains the autonomous optimizer; an
+    # owner/human actor is the gate and may write an owner-tunable knob directly.
+    slug = "oc-owner-actor"
+    _make_board_named(slug, GUARDED_KNOB,
+                      {"default": 100, "range": [1, 1000], "owner_class": "owner-tunable"})
+    with kb.connect(board=slug) as conn:
+        result = kb.apply_knob_update(
+            conn, board=slug, knob=GUARDED_KNOB, new_value=300, actor="owner",
+        )
+        assert result["applied"] is True
+        assert result["status"] == "applied"
+        contract = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        assert contract["tunables"][GUARDED_KNOB]["default"] == 300
+
+
+def test_legacy_managed_knob_without_owner_class_still_autonomous(fresh_home):
+    # Back-compat: a managed knob with NO owner_class declared stays
+    # autonomously writable (the existing closed loop must keep working).
+    slug = "oc-legacy"
+    _make_board(slug, {"default": 72, "allowed": [24, 48, 72]})
+    with kb.connect(board=slug) as conn:
+        result = kb.apply_knob_update(
+            conn, board=slug, knob=KNOB, new_value=48, actor="optimizer",
+        )
+        assert result["applied"] is True
+        assert result["status"] == "applied"
+
+
+# ---------------------------------------------------------------------------
 # 7. Scheduled optimizer_tick: end-to-end + throttle
 # ---------------------------------------------------------------------------
 
