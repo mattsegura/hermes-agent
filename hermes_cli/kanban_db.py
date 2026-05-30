@@ -1923,6 +1923,20 @@ def validate_business_runtime_contract(contract: Optional[Any]) -> dict[str, Any
     )
     if errors:
         status = "invalid"
+    # Unified launch-completeness (report-mode): run the STRONG structural
+    # invariants + net-new rules through ONE checker so the dispatch gate (which
+    # consults this function) finally SEES what only the invariants enforced.
+    # Surfaced as warnings + a structured `completeness` block; non-blocking until
+    # per-dimension enforce after a soak. Defensive: never breaks validate.
+    try:
+        from hermes_cli.launch_completeness import assess_launch_completeness
+
+        _completeness = assess_launch_completeness(normalized, enforce=False)
+        for _finding in list(_completeness.get("errors", [])) + list(_completeness.get("warnings", [])):
+            if _finding not in warnings:
+                warnings.append(_finding)
+    except Exception as _exc:  # pragma: no cover - defensive
+        _completeness = {"ok": True, "errors": [], "warnings": [], "dimensions": {}, "unavailable": repr(_exc)}
     return {
         "ok": not errors and not missing,
         "status": status,
@@ -1933,6 +1947,7 @@ def validate_business_runtime_contract(contract: Optional[Any]) -> dict[str, Any
         "assumptions": assumptions,
         "requires_owner_review": not errors and not missing,
         "owner_summary": normalized.get("owner_summary"),
+        "completeness": _completeness,
     }
 
 
