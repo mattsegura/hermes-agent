@@ -20,8 +20,17 @@ def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
 
     # Force a fresh catalog module state for each test.
+    #
+    # Use ``import_module`` rather than ``from hermes_cli import model_catalog``:
+    # a sibling test (or the shared conftest module-graph restorer) can delete
+    # ``sys.modules['hermes_cli.model_catalog']`` while the ``hermes_cli``
+    # package object still carries a stale ``.model_catalog`` attribute. In that
+    # split-brain state ``from hermes_cli import model_catalog`` returns the
+    # stale attribute WITHOUT repopulating ``sys.modules``, so the subsequent
+    # ``importlib.reload`` raises ``ImportError: module ... not in sys.modules``.
+    # ``import_module`` always guarantees the entry is present before reload.
     import importlib
-    from hermes_cli import model_catalog
+    model_catalog = importlib.import_module("hermes_cli.model_catalog")
     importlib.reload(model_catalog)
     yield home
     model_catalog.reset_cache()
