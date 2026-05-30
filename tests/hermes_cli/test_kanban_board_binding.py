@@ -239,6 +239,52 @@ def test_bind_contract_roles_binds_many_profiles_to_one_board(fresh_home):
     assert res["conflicts"] == []
 
 
+def test_board_role_profiles_harvests_agents_list(fresh_home):
+    """Extra named agents (negotiator/operator) declared under runtime.agents
+    must be harvested so every contract-named profile binds to the one board."""
+    c = {
+        "objective": {"statement": "wholesale land"},
+        "runtime": {
+            "mode": "goal",
+            "dispatcher": {"profile": "land-ceo"},
+            "profiles": {"optimizer": "land-optimizer", "worker": "land-worker"},
+            "agents": [
+                {"role": "negotiator", "profile": "land-negotiator"},
+                {"role": "operator", "profile": "land-operator"},
+            ],
+        },
+    }
+    kb.create_board("lw", contract=c)
+    roles = kb.board_role_profiles("lw")
+    assert roles.get("negotiator") == "land-negotiator"
+    assert roles.get("operator") == "land-operator"
+    res = kb.bind_contract_roles_to_board("lw")
+    # Every named non-default profile resolves to the one board.
+    for prof in ("land-ceo", "land-optimizer", "land-worker",
+                 "land-negotiator", "land-operator"):
+        assert res["bound"].get(prof) == "lw", (prof, res["bound"])
+        assert kb.resolve_daemon_board(profile=prof) == "lw"
+
+
+def test_bind_contract_roles_never_pins_default_profile(fresh_home):
+    """A contract naming 'default' must not pollute the global root config."""
+    c = {
+        "objective": {"statement": "x"},
+        "runtime": {"mode": "goal",
+                    "dispatcher": {"profile": "default"},
+                    "profiles": {"worker": "default", "ceo": "real-ceo"}},
+    }
+    kb.create_board("b1", contract=c)
+    res = kb.bind_contract_roles_to_board("b1")
+    # default is skipped; the real profile is bound.
+    assert "default" in res["skipped"]
+    assert "default" not in res["bound"]
+    assert res["bound"].get("real-ceo") == "b1"
+    # Root config.yaml was NOT pinned.
+    root_cfg = kb._profile_config_path("default")
+    assert (not root_cfg.exists()) or ("kanban_board" not in root_cfg.read_text())
+
+
 def test_bind_contract_roles_reports_conflicts(fresh_home):
     kb.create_board("land-wholesaling", contract=_land_contract())
     # Pre-bind one role profile to a different board.

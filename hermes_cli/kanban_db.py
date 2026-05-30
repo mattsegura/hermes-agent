@@ -6544,6 +6544,31 @@ def board_role_profiles(board: Optional[str] = None) -> dict[str, str]:
             prof_s = str(prof or "").strip()
             if prof_s:
                 roles[str(role)] = prof_s
+    # `runtime.profiles` is normalized to a fixed {ceo,optimizer,worker} shape,
+    # so contracts declare any *additional* named agents (negotiator, operator,
+    # …) under `runtime.agents` (a list of {role, profile}) — that's the
+    # documented extension point that survives normalization. Harvest those
+    # too: every profile the contract names must bind to this one board, or it
+    # would launch a gateway that fails the binding rail.
+    agents = runtime.get("agents")
+    if isinstance(agents, list):
+        for idx, entry in enumerate(agents):
+            if not isinstance(entry, dict):
+                continue
+            prof_s = str(entry.get("profile") or "").strip()
+            if not prof_s:
+                continue
+            role = str(entry.get("role") or f"agent{idx}").strip() or f"agent{idx}"
+            roles.setdefault(role, prof_s)
+    # worker_envelopes may also pin a profile per role.
+    envelopes = runtime.get("worker_envelopes")
+    if isinstance(envelopes, dict):
+        for role, env in envelopes.items():
+            if not isinstance(env, dict):
+                continue
+            prof_s = str(env.get("profile") or "").strip()
+            if prof_s:
+                roles.setdefault(str(role), prof_s)
     return roles
 
 
@@ -6565,13 +6590,29 @@ def bind_contract_roles_to_board(board: Optional[str] = None) -> dict:
     roles = board_role_profiles(slug)
     bound: dict[str, str] = {}
     conflicts: list[dict] = []
+    skipped: list[str] = []
     for _role, profile in roles.items():
+        # NEVER auto-pin the default/root profile to a single board: it is the
+        # catch-all whose config.yaml is the global root config. Writing a
+        # kanban_board into it would bind the root gateway to one business —
+        # the exact cross-board pollution this whole change prevents. (An
+        # operator who really wants this can still set_profile_board_binding
+        # explicitly.)
+        try:
+            from hermes_cli.profiles import normalize_profile_name
+            canon = normalize_profile_name(profile)
+        except Exception:
+            canon = profile
+        if canon == "default":
+            if profile not in skipped:
+                skipped.append(profile)
+            continue
         prior = profile_board_binding(profile)
         if prior and prior != slug:
             conflicts.append({"profile": profile, "was": prior, "now": slug})
         set_profile_board_binding(profile, slug)
         bound[profile] = slug
-    return {"board": slug, "bound": bound, "conflicts": conflicts}
+    return {"board": slug, "bound": bound, "conflicts": conflicts, "skipped": skipped}
 
 
 def resolve_daemon_board(profile: Optional[str] = None) -> str:

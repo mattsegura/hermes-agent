@@ -1635,6 +1635,9 @@ def _cmd_boards_bind_roles(args: argparse.Namespace) -> int:
     for c in res.get("conflicts", []):
         print(f"  note: {c['profile']} was bound to {c['was']!r}, re-bound to "
               f"{c['now']!r}", file=sys.stderr)
+    for prof in res.get("skipped", []):
+        print(f"  skipped {prof!r}: the default/root profile is never auto-pinned "
+              f"to a single board", file=sys.stderr)
     return 0
 
 
