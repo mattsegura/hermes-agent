@@ -15607,6 +15607,110 @@ def build_sensor_state_read_model(
     return {"declared": declared, "states": get_sensor_states(conn, board=board_slug)}
 
 
+# ---------------------------------------------------------------------------
+# D2 circuit-breaker human re-enable: an OWNER override that force-closes a
+# tripped Tier-1 circuit breaker. The machine still auto-recovers on its own
+# (open -> half_open -> closed once the cooldown elapses and the failure rate
+# falls); this is an ADDITIVE owner escape hatch for when the owner has fixed
+# the underlying fault and wants dispatch restored immediately rather than
+# waiting out the cooldown. It resets the persisted ``board_sensor_state`` row
+# to ``closed``, clears the failure/success counters and ``opened_at``, emits an
+# audited ``sensor_circuit`` recovery transition, and is owner-only at the CLI.
+# ---------------------------------------------------------------------------
+def force_close_circuit_breaker(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    sensor_key: Optional[str] = None,
+    actor: str = "owner",
+    reason: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Owner-force a tripped circuit breaker back to ``closed`` (audited).
+
+    Resets every matching ``circuit_breaker`` board-level sensor-state row to
+    ``closed`` with cleared counters, and emits a ``sensor_circuit`` transition
+    signal recording it as an owner override (``forced=True``). When
+    ``sensor_key`` is given only that breaker is reset; otherwise every declared
+    circuit breaker on the board is reset. Idempotent: a breaker already closed
+    is left as-is (no spurious transition) but still reported.
+
+    Returns ``{"board", "reset": [{sensor_key, previous_status, status}], ...}``.
+    This is the human re-enable companion to the automatic recovery path -- the
+    machine's own open->half_open->closed cycle is unchanged.
+    """
+    from hermes_cli import kanban_sensors as _sensors
+
+    board_slug = _connection_board(conn, board)
+    when = int(time.time()) if now is None else int(now)
+    key_filter = str(sensor_key).strip() if sensor_key else None
+    out: dict[str, Any] = {"board": board_slug, "reset": [], "actor": actor}
+
+    with write_txn(conn):
+        if key_filter:
+            rows = conn.execute(
+                "SELECT sensor_key, status, state FROM board_sensor_state "
+                "WHERE board = ? AND sensor_kind = 'circuit_breaker' "
+                "AND entity_ref = ? AND sensor_key = ?",
+                (board_slug, _SENSOR_BOARD_ENTITY, key_filter),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT sensor_key, status, state FROM board_sensor_state "
+                "WHERE board = ? AND sensor_kind = 'circuit_breaker' "
+                "AND entity_ref = ?",
+                (board_slug, _SENSOR_BOARD_ENTITY),
+            ).fetchall()
+        for row in rows:
+            key = row["sensor_key"]
+            prev_status = row["status"]
+            try:
+                prev_state = json.loads(row["state"]) if row["state"] else {}
+            except (TypeError, ValueError):
+                prev_state = {}
+            # Preserve the gating class (a property of the declared sensor, not
+            # of the tripped state) so dispatch gating stays correct after reset.
+            gates = prev_state.get("gates_side_effect_class")
+            new_state = {
+                "failures": 0,
+                "successes": 0,
+                "total": 0,
+                "failure_rate": 0.0,
+                "opened_at": None,
+                "gates_side_effect_class": gates,
+                "forced_closed_at": when,
+                "forced_by": actor,
+            }
+            _write_sensor_state(
+                conn, board=board_slug, kind="circuit_breaker", key=key,
+                entity_ref=_SENSOR_BOARD_ENTITY, status=_sensors.CIRCUIT_CLOSED,
+                state=new_state, now=when,
+            )
+            already_closed = prev_status == _sensors.CIRCUIT_CLOSED
+            if not already_closed:
+                payload = {
+                    "transition": f"{prev_status}->{_sensors.CIRCUIT_CLOSED}",
+                    "sensor_key": key,
+                    "gates_side_effect_class": gates,
+                    "forced": True,
+                    "actor": actor,
+                    "reason": reason or "owner_force_close",
+                }
+                _emit_sensor_signal(
+                    conn, board=board_slug, signal_kind="sensor_circuit",
+                    sensor_key=key, entity_ref=None, payload=payload, now=when,
+                )
+            out["reset"].append({
+                "sensor_key": key,
+                "previous_status": prev_status,
+                "status": _sensors.CIRCUIT_CLOSED,
+                "transitioned": not already_closed,
+            })
+    if key_filter and not out["reset"]:
+        out["not_found"] = True
+    return out
+
+
 def _emit_sensor_signal(
     conn: sqlite3.Connection,
     *,
@@ -15822,6 +15926,10 @@ def _sensors_tick_budget(
         rate_limit=knobs.get("rate_limit"),
         warn_fraction=knobs.get("warn_fraction"),
         window=knobs.get("window"),
+        # D3: tick re-evaluation carries the non-resetting lifetime accumulator
+        # forward unchanged (only record_budget_consumption increments it).
+        lifetime_spend=float(prev_state.get("lifetime_spend") or 0.0),
+        lifetime_cap=knobs.get("lifetime_cap"),
     )
     _write_sensor_state(
         conn, board=board, kind="budget", key=key, entity_ref=_SENSOR_BOARD_ENTITY,
@@ -15959,16 +16067,21 @@ def record_budget_consumption(
                 window_start = pstate.get("window_start")
                 spend = float(pstate.get("spend") or 0.0)
                 reqs = float(pstate.get("requests") or 0.0)
+                # D3: the lifetime accumulator is NON-resetting -- carry it
+                # forward across every window roll and add this spend to it.
+                lifetime_spend = float(pstate.get("lifetime_spend") or 0.0)
                 if window_start is None:
                     window_start = now
                 # Roll the window before adding so new consumption lands in the
-                # current window, not a stale one.
+                # current window, not a stale one. The lifetime accumulator is
+                # explicitly NOT reset here.
                 if window and window > 0 and now - int(window_start) >= int(window):
                     window_start = now
                     spend = 0.0
                     reqs = 0.0
                 spend += float(cost)
                 reqs += float(requests)
+                lifetime_spend += float(cost)
                 decision = _sensors.budget_decision(
                     prev_level=prev["status"] if prev else None,
                     now=now,
@@ -15979,6 +16092,8 @@ def record_budget_consumption(
                     rate_limit=knobs.get("rate_limit"),
                     warn_fraction=knobs.get("warn_fraction"),
                     window=window,
+                    lifetime_spend=lifetime_spend,
+                    lifetime_cap=knobs.get("lifetime_cap"),
                 )
                 _write_sensor_state(
                     conn, board=board_slug, kind="budget", key=key,
@@ -16059,7 +16174,31 @@ def _sensor_dispatch_blockers(
         elif row["sensor_kind"] == "budget":
             over_budget = bool(state.get("over_budget"))
             over_rate = bool(state.get("over_rate"))
-            if over_budget or over_rate:
+            over_lifetime = bool(state.get("over_lifetime"))
+            if over_lifetime:
+                # D3: a breached lifetime ceiling is NOT cleared by a window
+                # roll -- only the owner raising/removing lifetime_cap can. We
+                # surface it as a distinct, sticky blocker so the operator sees
+                # it is a hard cumulative ceiling, not a transient window trip.
+                blockers.append({
+                    "code": "budget_over_lifetime",
+                    "sensor_key": row["sensor_key"],
+                    "over_budget": over_budget,
+                    "over_rate": over_rate,
+                    "over_lifetime": True,
+                    "lifetime_spend": state.get("lifetime_spend"),
+                    "lifetime_cap": state.get("lifetime_cap"),
+                    "usage_fraction": state.get("usage_fraction"),
+                    "pacing": state.get("pacing"),
+                    "message": (
+                        f"budget sensor {row['sensor_key']!r} has hit its "
+                        f"LIFETIME ceiling (spend={state.get('lifetime_spend')} "
+                        f">= cap={state.get('lifetime_cap')}) -- dispatch is "
+                        f"blocked until the owner raises the lifetime_cap "
+                        f"(a window roll will NOT clear this)."
+                    ),
+                })
+            elif over_budget or over_rate:
                 blockers.append({
                     "code": "budget_exceeded",
                     "sensor_key": row["sensor_key"],
@@ -16618,11 +16757,28 @@ def apply_knob_update(
     known = spec is not None
     in_bounds = known and _opt.knob_value_in_bounds(spec, new_value)
 
-    # --- Refused: out-of-bounds or unknown knob -> human approval gate. -----
-    if not known or not in_bounds:
-        deny_reason = (
-            "unknown_knob" if not known else "out_of_bounds"
-        )
+    # --- D1 owner-class boundary (safety-by-construction). ------------------
+    # An AUTONOMOUS write (actor == "optimizer") may only move a knob the
+    # contract declares ``optimizer-tunable`` (or one of the legacy managed
+    # knobs, treated as optimizer-tunable). A KNOWN, in-bounds proposal against
+    # an ``owner-tunable`` / ``infra-fixed`` knob is REFUSED here and routed to
+    # the same owner approval gate as an out-of-bounds proposal -- the optimizer
+    # structurally cannot raise its own ceiling, even within the declared range.
+    # An owner/human/ceo actor is NOT subject to this (they ARE the gate).
+    autonomous = str(actor or "").strip().lower() == "optimizer"
+    owner_class_blocked = bool(
+        known and in_bounds and autonomous
+        and not _opt.is_optimizer_writable(spec, knob=knob)
+    )
+
+    # --- Refused: out-of-bounds, unknown knob, or owner-class -> approval. ---
+    if not known or not in_bounds or owner_class_blocked:
+        if not known:
+            deny_reason = "unknown_knob"
+        elif not in_bounds:
+            deny_reason = "out_of_bounds"
+        else:
+            deny_reason = "owner_class"
         with write_txn(conn):
             audit_id = _record_knob_audit(
                 conn, board=board_slug, knob=knob, old_value=old_value,
@@ -16658,9 +16814,12 @@ def apply_knob_update(
         # ``optimizer``) that widens the range to include ``new_value``, instead
         # of leaving a dead-end ``approval_required`` record. An UNKNOWN knob
         # (inventing a new tunable) is a larger structural change left as an
-        # explicit hook (no auto-draft). Best-effort: never break the knob path.
+        # explicit hook (no auto-draft). An OWNER-CLASS refusal is NOT a range
+        # problem (the value is in-bounds) -- it is a deliberate authority gate,
+        # so we do NOT auto-draft a range-widening amendment for it. Best-effort:
+        # never break the knob path.
         amendment_id: Optional[str] = None
-        if known:
+        if known and not owner_class_blocked:
             try:
                 amendment_id = _propose_knob_range_amendment(
                     conn, board=board_slug, contract=contract, knob=knob,
@@ -16684,6 +16843,8 @@ def apply_knob_update(
             "signal_id": signal_id,
             "contract_version": contract_version,
             "amendment_id": amendment_id,
+            "owner_class": _opt.knob_owner_class(spec, knob=knob) if known else None,
+            "owner_class_blocked": owner_class_blocked,
         }
 
     # --- No-op: proposal equals the current value. --------------------------

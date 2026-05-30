@@ -223,6 +223,62 @@ def test_budget_over_rate_blocks_with_pacing_delay():
     assert d.state["pacing"]["delay_seconds"] == 900  # (0+1000) - 100
 
 
+# ---------------------------------------------------------------------------
+# D3 cumulative lifetime ceiling (additive; only active when lifetime_cap set).
+# ---------------------------------------------------------------------------
+def test_budget_no_lifetime_cap_behaves_as_before():
+    # No lifetime_cap declared -> the lifetime branch is inert; a within-window
+    # spend stays 'ok' even though lifetime_spend is large.
+    d = ks.budget_decision(
+        prev_level=None, now=0, window_start=0, spend=10, requests=0,
+        budget_cap=100, rate_limit=None, warn_fraction=0.8, window=1000,
+        lifetime_spend=999999, lifetime_cap=None,
+    )
+    assert d.status == ks.BUDGET_OK
+    assert not d.blocking
+    assert d.state["over_lifetime"] is False
+
+
+def test_budget_over_lifetime_blocks_independent_of_window():
+    # Window meter is well under cap, but the cumulative lifetime ceiling is hit.
+    d = ks.budget_decision(
+        prev_level=ks.BUDGET_OK, now=0, window_start=0, spend=5, requests=0,
+        budget_cap=100, rate_limit=None, warn_fraction=0.8, window=1000,
+        lifetime_spend=500, lifetime_cap=500,
+    )
+    assert d.status == ks.BUDGET_OVER_LIFETIME
+    assert d.blocking and d.state["over_lifetime"] is True
+    # A lifetime breach cannot be waited out -> no pacing delay is advised.
+    assert d.state["pacing"]["allow"] is False
+    assert d.state["pacing"]["delay_seconds"] == 0
+
+
+def test_budget_over_lifetime_survives_a_window_roll():
+    # The window rolls (now - start >= window) and zeroes the per-window spend,
+    # but the lifetime ceiling (passed in by the DB accumulator) still blocks.
+    d = ks.budget_decision(
+        prev_level=ks.BUDGET_OVER_LIFETIME, now=2000, window_start=0,
+        spend=100, requests=50, budget_cap=100, rate_limit=10,
+        warn_fraction=0.8, window=1000,
+        lifetime_spend=500, lifetime_cap=500,
+    )
+    assert d.state["window_reset"] is True
+    assert d.state["spend"] == 0.0  # window meter zeroed
+    assert d.status == ks.BUDGET_OVER_LIFETIME  # but lifetime ceiling persists
+    assert d.blocking and d.state["over_lifetime"] is True
+
+
+def test_budget_under_lifetime_cap_is_not_blocked():
+    d = ks.budget_decision(
+        prev_level=ks.BUDGET_OK, now=0, window_start=0, spend=5, requests=0,
+        budget_cap=100, rate_limit=None, warn_fraction=0.8, window=1000,
+        lifetime_spend=499.99, lifetime_cap=500,
+    )
+    assert d.status == ks.BUDGET_OK
+    assert not d.blocking and d.state["over_lifetime"] is False
+    assert d.state["lifetime_fraction"] == round(499.99 / 500, 4)
+
+
 # ===========================================================================
 # resolve_sensor_knobs
 # ===========================================================================
@@ -241,8 +297,14 @@ def test_resolve_sensor_knobs_reads_tunable_defaults():
         "win": {"default": 3600, "range": [60, 86400]},
     }
     resolved = ks.resolve_sensor_knobs(sensor, tunables)
-    assert resolved == {"budget_cap": 250.0, "rate_limit": 7.0,
-                        "warn_fraction": 0.75, "window": 3600.0}
+    # Required knobs resolve to their bound tunable defaults.
+    assert resolved["budget_cap"] == 250.0
+    assert resolved["rate_limit"] == 7.0
+    assert resolved["warn_fraction"] == 0.75
+    assert resolved["window"] == 3600.0
+    # D3: lifetime_cap is an OPTIONAL budget knob -- unbound here, so it resolves
+    # to None (treated as unset; the lifetime ceiling is simply inactive).
+    assert resolved.get("lifetime_cap") is None
 
 
 # ===========================================================================
@@ -582,3 +644,196 @@ def test_sensor_signals_pruned_as_telemetry_not_outcomes(fresh_home):
             "SELECT COUNT(*) FROM board_signal_rollup WHERE board='ret'"
         ).fetchone()[0]
         assert rollup == 0
+
+
+# ===========================================================================
+# D3 lifetime ceiling -- DB integration (non-resetting accumulator)
+# ===========================================================================
+def _lifetime_sensor_contract(*, lifetime_cap: float = 10.0) -> dict:
+    contract = _sensor_contract()
+    # Add a bounded lifetime_cap tunable and bind it on the budget sensor.
+    contract["tunables"]["budget_lifetime_cap_units"] = {
+        "default": lifetime_cap, "range": [1, 1_000_000]
+    }
+    for sensor in contract["sensors"]:
+        if sensor.get("kind") == "budget":
+            sensor["knobs"]["lifetime_cap"] = "budget_lifetime_cap_units"
+    return contract
+
+
+def _make_lifetime_board(slug: str, *, lifetime_cap: float = 10.0) -> None:
+    kb.create_board(slug)
+    kb.write_board_metadata(
+        slug, business_contract=_lifetime_sensor_contract(lifetime_cap=lifetime_cap)
+    )
+
+
+def test_lifetime_cap_blocks_dispatch_and_survives_window_roll(fresh_home):
+    _make_lifetime_board("life", lifetime_cap=10.0)
+    with kb.connect(board="life") as conn:
+        worker = kb.create_task(conn, title="ready work", assignee="mock-ceo",
+                                board="life", initial_status="blocked")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (worker,))
+
+        # Spend across two windows so the per-window meter rolls but the lifetime
+        # accumulator keeps climbing. budget_cap_units=100 so we stay under the
+        # per-window cap the whole time; the lifetime cap (10) is the binding one.
+        kb.record_budget_consumption(conn, board="life", cost=6.0, requests=1.0, now=5000)
+        mid = kb.evaluate_dispatch_eligibility(conn, worker, board="life")
+        assert mid["ok"], mid["blockers"]
+
+        # Window=1000 -> roll the window, but lifetime spend keeps accumulating.
+        meter = kb.record_budget_consumption(
+            conn, board="life", cost=6.0, requests=1.0, now=5000 + 1001
+        )
+        assert meter["metered"][0]["level"] == "over_lifetime"
+
+        st = {s["sensor_kind"]: s for s in kb.get_sensor_states(conn, board="life")}
+        bud_state = st["budget"]["state"]
+        # Window meter reset (6.0, not 12.0) but lifetime accumulator is 12.0.
+        assert bud_state["spend"] == 6.0
+        assert bud_state["lifetime_spend"] == 12.0
+        assert bud_state["over_lifetime"] is True
+
+        blocked = kb.evaluate_dispatch_eligibility(conn, worker, board="life")
+        assert not blocked["ok"]
+        life_block = next(
+            b for b in blocked["blockers"] if b["code"] == "budget_over_lifetime"
+        )
+        assert life_block["over_lifetime"] is True
+        assert life_block["lifetime_spend"] == 12.0
+        assert life_block["lifetime_cap"] == 10.0
+
+        # A further window roll via sensors_tick must NOT clear the lifetime block.
+        kb.sensors_tick(conn, board="life", now=5000 + 5000)
+        st2 = {s["sensor_kind"]: s for s in kb.get_sensor_states(conn, board="life")}
+        assert st2["budget"]["status"] == "over_lifetime"
+        still = kb.evaluate_dispatch_eligibility(conn, worker, board="life")
+        assert not still["ok"]
+        assert any(b["code"] == "budget_over_lifetime" for b in still["blockers"])
+
+
+def test_no_lifetime_cap_board_unaffected(fresh_home):
+    # A board with NO lifetime_cap declared behaves exactly as before: large
+    # cumulative spend never produces an over_lifetime block.
+    _make_sensor_board("nolife")
+    with kb.connect(board="nolife") as conn:
+        worker = kb.create_task(conn, title="ready work", assignee="mock-ceo",
+                                board="nolife", initial_status="blocked")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (worker,))
+        # Spend a lot of cost over many rolled windows; budget_cap_units=100 and
+        # we keep each window small, so no per-window trip and no lifetime concept.
+        for i in range(5):
+            kb.record_budget_consumption(
+                conn, board="nolife", cost=50.0, requests=0.0, now=5000 + i * 2000
+            )
+        st = {s["sensor_kind"]: s for s in kb.get_sensor_states(conn, board="nolife")}
+        assert st["budget"]["status"] != "over_lifetime"
+        assert st["budget"]["state"].get("over_lifetime") is False
+        ok = kb.evaluate_dispatch_eligibility(conn, worker, board="nolife")
+        assert ok["ok"], ok["blockers"]
+
+
+# ===========================================================================
+# D2 circuit-breaker owner force-close (human re-enable)
+# ===========================================================================
+def test_force_close_circuit_breaker_owner_override(fresh_home):
+    _make_sensor_board("force")
+    with kb.connect(board="force") as conn:
+        worker = kb.create_task(conn, title="ready work", assignee="mock-ceo",
+                                board="force", initial_status="blocked")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (worker,))
+            for _ in range(4):
+                _insert_run(conn, task_id=worker, outcome="crashed", ended_at=9990)
+            _insert_run(conn, task_id=worker, outcome="completed", ended_at=9990)
+        # Trip the breaker open.
+        kb.sensors_tick(conn, board="force", now=10000)
+        st = {s["sensor_kind"]: s for s in kb.get_sensor_states(conn, board="force")}
+        assert st["circuit_breaker"]["status"] == "open"
+        blocked = kb.evaluate_dispatch_eligibility(conn, worker, board="force")
+        assert not blocked["ok"]
+
+        # Owner force-closes it (auto-recovery would otherwise wait the cooldown).
+        # The DB primitive takes the sensor KEY ("dispatch" for this contract);
+        # the CLI maps the friendly "circuit_breaker" kind token to "reset all".
+        result = kb.force_close_circuit_breaker(
+            conn, board="force", sensor_key="dispatch", actor="owner",
+            reason="fixed the upstream fault", now=10010,
+        )
+        assert result["reset"], result
+        entry = result["reset"][0]
+        assert entry["previous_status"] == "open"
+        assert entry["status"] == "closed"
+        assert entry["transitioned"] is True
+
+        # Persisted state is now closed with cleared counters.
+        st2 = {s["sensor_kind"]: s for s in kb.get_sensor_states(conn, board="force")}
+        cb = st2["circuit_breaker"]
+        assert cb["status"] == "closed"
+        assert cb["state"]["failures"] == 0
+        assert cb["state"]["opened_at"] is None
+        assert cb["state"]["forced_by"] == "owner"
+
+        # Dispatch is restored immediately.
+        ok = kb.evaluate_dispatch_eligibility(conn, worker, board="force")
+        assert ok["ok"], ok["blockers"]
+
+        # An audited recovery transition signal was emitted (forced=True).
+        sig = conn.execute(
+            "SELECT action FROM board_signals "
+            "WHERE board='force' AND primitive_kind='sensor_circuit' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        assert '"forced": true' in sig
+        assert "open->closed" in sig
+
+
+def test_force_close_resets_all_breakers_when_no_key(fresh_home):
+    _make_sensor_board("forceall")
+    with kb.connect(board="forceall") as conn:
+        with kb.write_txn(conn):
+            kb._write_sensor_state(
+                conn, board="forceall", kind="circuit_breaker", key="dispatch",
+                entity_ref=kb._SENSOR_BOARD_ENTITY, status="open",
+                state={"failure_rate": 0.9, "opened_at": 100}, now=1,
+            )
+        result = kb.force_close_circuit_breaker(conn, board="forceall", now=200)
+        assert any(r["sensor_key"] == "dispatch" and r["status"] == "closed"
+                   for r in result["reset"])
+
+
+def test_force_close_already_closed_is_idempotent(fresh_home):
+    _make_sensor_board("idem")
+    with kb.connect(board="idem") as conn:
+        with kb.write_txn(conn):
+            kb._write_sensor_state(
+                conn, board="idem", kind="circuit_breaker", key="dispatch",
+                entity_ref=kb._SENSOR_BOARD_ENTITY, status="closed",
+                state={"failures": 0, "opened_at": None}, now=1,
+            )
+        before = conn.execute(
+            "SELECT COUNT(*) FROM board_signals "
+            "WHERE board='idem' AND primitive_kind='sensor_circuit'"
+        ).fetchone()[0]
+        result = kb.force_close_circuit_breaker(conn, board="idem", now=200)
+        entry = next(r for r in result["reset"] if r["sensor_key"] == "dispatch")
+        assert entry["transitioned"] is False
+        # No spurious transition signal for an already-closed breaker.
+        after = conn.execute(
+            "SELECT COUNT(*) FROM board_signals "
+            "WHERE board='idem' AND primitive_kind='sensor_circuit'"
+        ).fetchone()[0]
+        assert after == before
+
+
+def test_force_close_missing_breaker_reports_not_found(fresh_home):
+    _make_sensor_board("missing")
+    with kb.connect(board="missing") as conn:
+        result = kb.force_close_circuit_breaker(
+            conn, board="missing", sensor_key="does_not_exist", now=200
+        )
+        assert result["reset"] == []
+        assert result.get("not_found") is True
