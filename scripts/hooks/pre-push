@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Hermes kanban pre-push gate.
+#
+# Runs the full kanban safety net (`make test-full` = `-n auto`, slow tests
+# included) before every push so the complete suite is exercised automatically.
+#
+# Install (opt-in, never auto-installed): `make install-hooks`
+#
+# Bypass for emergencies (documented):
+#   * git push --no-verify           # standard git escape hatch
+#   * HERMES_SKIP_PREPUSH=1 git push # explicit env opt-out
+set -euo pipefail
+
+if [ "${HERMES_SKIP_PREPUSH:-}" = "1" ]; then
+  echo "pre-push: HERMES_SKIP_PREPUSH=1 set — skipping kanban test gate." >&2
+  exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+echo "▶ pre-push: running 'make test-full' (kanban safety net)…" >&2
+if ! make test-full; then
+  echo "✖ pre-push: test-full failed — push aborted." >&2
+  echo "  Fix the failures, or bypass with: git push --no-verify" >&2
+  exit 1
+fi
+echo "✔ pre-push: test-full green." >&2
+exit 0
