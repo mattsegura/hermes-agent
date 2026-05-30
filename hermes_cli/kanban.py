@@ -286,6 +286,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "to see all boards."
         ),
     )
+    # --- global --debug flag ---
+    # By default the kanban CLI catches unexpected errors at the top level and
+    # prints an operator-friendly message + hint (no raw traceback). --debug
+    # (or the HERMES_DEBUG env var) re-raises the full traceback for diagnosis.
+    kanban_parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Show the full Python traceback on unexpected errors (for diagnosis).",
+    )
     sub = kanban_parser.add_subparsers(dest="kanban_action")
 
     # --- init ---
@@ -1294,10 +1304,56 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 # Command dispatch
 # ---------------------------------------------------------------------------
 
+def _kanban_debug_enabled(args: argparse.Namespace) -> bool:
+    """True when the operator asked for full tracebacks (``--debug`` or env)."""
+    if getattr(args, "debug", False):
+        return True
+    val = os.environ.get("HERMES_DEBUG", "")
+    return val.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _operator_error_message(action: Optional[str], exc: BaseException) -> str:
+    """Render an unexpected exception as a clear operator-facing message.
+
+    Keeps the message short and actionable: what failed, the underlying error,
+    and a hint to re-run with ``--debug`` for the full traceback. Specific
+    well-known failure shapes get a tailored hint.
+    """
+    kind = type(exc).__name__
+    detail = str(exc).strip() or kind
+    where = f" while running `kanban {action}`" if action else ""
+    lines = [f"kanban: unexpected error{where}: {detail}"]
+    # Tailored, actionable hints for the failure shapes an operator hits most.
+    import sqlite3 as _sqlite3
+
+    low = detail.lower()
+    if isinstance(exc, _sqlite3.OperationalError) and "locked" in low:
+        lines.append(
+            "  hint: the board database is locked by another process. "
+            "Stop other `hermes kanban`/gateway processes and retry."
+        )
+    elif isinstance(exc, _sqlite3.DatabaseError):
+        lines.append(
+            "  hint: the board database may be corrupt or from an incompatible "
+            "version. Run `hermes kanban doctor` to inspect it."
+        )
+    elif isinstance(exc, (FileNotFoundError, PermissionError)):
+        lines.append(
+            "  hint: check HERMES_HOME and that the board exists "
+            "(`hermes kanban boards list`)."
+        )
+    lines.append("  Re-run with --debug (or HERMES_DEBUG=1) for the full traceback.")
+    return "\n".join(lines)
+
+
 def kanban_command(args: argparse.Namespace) -> int:
     """Entry point from ``hermes kanban …`` argparse dispatch.
 
-    Returns a shell-style exit code (0 on success, non-zero on error).
+    Returns a shell-style exit code (0 on success, non-zero on error). Wraps
+    the whole dispatch in an operator-friendly error boundary: unexpected
+    exceptions become a clear message + actionable hint + nonzero exit instead
+    of a raw traceback. Pass ``--debug`` (or set ``HERMES_DEBUG``) to re-raise
+    the full traceback for diagnosis.
     """
     action = getattr(args, "kanban_action", None)
     if not action:
@@ -1313,6 +1369,22 @@ def kanban_command(args: argparse.Namespace) -> int:
             )
         return 0
 
+    try:
+        return _kanban_command_dispatch(args, action)
+    except (BrokenPipeError, KeyboardInterrupt):
+        # Don't swallow operator interrupts / closed pipes (e.g. `| head`).
+        raise
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - top-level operator boundary
+        if _kanban_debug_enabled(args):
+            raise
+        print(_operator_error_message(action, exc), file=sys.stderr)
+        return 1
+
+
+def _kanban_command_dispatch(args: argparse.Namespace, action: str) -> int:
+    """Dispatch a resolved kanban ``action`` (wrapped by kanban_command)."""
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
