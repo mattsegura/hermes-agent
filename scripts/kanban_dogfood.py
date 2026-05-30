@@ -378,6 +378,187 @@ def scenario_amendment() -> list[str]:
     return findings
 
 
+def scenario_amendment_triggers() -> list[str]:
+    """S6: drive ALL THREE amendment triggers end-to-end through CAS mint.
+
+    (a) optimizer out-of-range knob, (b) circuit-breaker open on a side-effect
+    path, (c) owner-initiated. Each must propose -> approve (token + inputs) ->
+    validate -> mint (version bump + recompile).
+    """
+    findings: list[str] = []
+    from hermes_cli import kanban_db as kb
+
+    base = load_contract("insurance_recruiting")
+
+    def activate(board):
+        kb.review_business_launch_contract(board, contract=base, create_if_missing=True)
+        tok = kb.issue_board_launch_approval_token(
+            board, contract=base, approved_by="owner",
+            approval_evidence={"s": "x"}, owner_authority_confirmed=True)["token"]
+        kb.review_business_launch_contract(board, contract=base, approve=True, approval_token=tok)
+
+    # (a) optimizer out-of-range knob -----------------------------------------
+    banner("S6 triggers :: (a) optimizer out-of-range knob -> mint")
+    activate("trig_opt")
+    with kb.connect(board="trig_opt") as conn:
+        # Find a tunable with a declared range and propose a value past its top.
+        bc = kb._metadata_as_business_contract(kb.read_board_metadata("trig_opt"))
+        tun = bc.get("tunables") or (bc.get("runtime") or {}).get("tunables") or {}
+        knob = next((k for k, s in tun.items() if isinstance(s, dict) and ("range" in s or "max" in s)), None)
+        print(f"  knob={knob}")
+        if knob is None:
+            findings.append("[trigger-a] no ranged tunable to drive optimizer out-of-range")
+        else:
+            spec = tun[knob]
+            top = (spec.get("range") or [0, spec.get("max", 1)])[1]
+            out = kb.apply_knob_update(conn, board="trig_opt", knob=knob,
+                                       new_value=float(top) + 50, actor="optimizer")
+            print(f"  apply_knob_update -> status={out['status']} amendment={out.get('amendment_id')}")
+            aid = out.get("amendment_id")
+            if not aid:
+                findings.append(f"[trigger-a] out-of-range knob did not draft an amendment: {out}")
+            else:
+                amd = kb.get_contract_amendment(conn, aid, board="trig_opt")
+                if amd["origin"] != "optimizer":
+                    findings.append(f"[trigger-a] origin != optimizer: {amd['origin']}")
+                tok = kb.issue_board_launch_approval_token(
+                    "trig_opt", amendment_id=aid, approved_by="owner",
+                    approval_evidence={"s": "x"}, owner_authority_confirmed=True)["token"]
+                kb.approve_contract_amendment(conn, aid, board="trig_opt", approver="owner", token=tok)
+                v = kb.validate_contract_amendment(conn, aid, board="trig_opt")
+                m = kb.mint_contract_amendment(conn, aid, board="trig_opt")
+                print(f"  validated={v['status']} minted={m['status']} v={m.get('minted_version')}")
+                if m["status"] != kb.AMENDMENT_STATUS_ACTIVE or m.get("minted_version") != 2:
+                    findings.append(f"[trigger-a] optimizer amendment did not mint to v2: {m}")
+
+    # (b) circuit-breaker open on a side-effect path ---------------------------
+    banner("S6 triggers :: (b) circuit-breaker open -> sensor amendment -> mint")
+    activate("trig_cb")  # golden contract carries a side-effect-gating breaker
+    now = 10_000_000
+    with kb.connect(board="trig_cb") as conn:
+        with kb.write_txn(conn):
+            for i in range(6):
+                conn.execute(
+                    "INSERT INTO task_runs (task_id,status,started_at,ended_at,outcome) "
+                    "VALUES (?, 'crashed', ?, ?, 'crashed')", (f"t{i}", now - 100, now - 10))
+        tick = kb.sensors_tick(conn, board="trig_cb", now=now)
+        proposed = tick.get("amendments_proposed") or []
+        print(f"  circuit={[c.get('status') for c in (tick.get('circuit') or [])]} proposed={proposed}")
+        if not proposed:
+            findings.append(f"[trigger-b] circuit open did not propose a sensor amendment: {tick}")
+        else:
+            aid = proposed[0]
+            amd = kb.get_contract_amendment(conn, aid, board="trig_cb")
+            print(f"  origin={amd['origin']} status={amd['status']} inputs={[i['key'] for i in amd['required_inputs']]}")
+            if amd["origin"] != "sensor":
+                findings.append(f"[trigger-b] origin != sensor: {amd['origin']}")
+            # Supply the required owner api_key input, then approve->validate->mint.
+            kb.submit_amendment_inputs(conn, aid, {"api_key": "sk-test-12345"}, board="trig_cb")
+            base_v = kb.read_board_metadata("trig_cb").get("contract_version") or 1
+            tok = kb.issue_board_launch_approval_token(
+                "trig_cb", amendment_id=aid, approved_by="owner",
+                approval_evidence={"s": "x"}, owner_authority_confirmed=True)["token"]
+            kb.approve_contract_amendment(conn, aid, board="trig_cb", approver="owner", token=tok)
+            v = kb.validate_contract_amendment(conn, aid, board="trig_cb")
+            m = kb.mint_contract_amendment(conn, aid, board="trig_cb")
+            print(f"  validated={v['status']} minted={m['status']} v={m.get('minted_version')}")
+            if m["status"] != kb.AMENDMENT_STATUS_ACTIVE:
+                findings.append(f"[trigger-b] sensor amendment did not mint active: {m}")
+
+    return findings
+
+
+def scenario_steering() -> list[str]:
+    """S7: P6 conversational CEO steering -> ceo-origin P5 amendment -> mint.
+
+    Drives both session modes with a DETERMINISTIC CEO stub (the aux model is
+    monkeypatched the way the tests do), confirms a structured proposal becomes
+    a ceo-origin amendment surfaced back into the chat, mints it through the P5
+    rail, and confirms the conversation + state survive a fresh connection.
+    """
+    import copy
+    findings: list[str] = []
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_launch_intake as kli
+
+    base = load_contract("insurance_recruiting")
+
+    def activate(board):
+        kb.review_business_launch_contract(board, contract=base, create_if_missing=True)
+        tok = kb.issue_board_launch_approval_token(
+            board, contract=base, approved_by="owner",
+            approval_evidence={"s": "x"}, owner_authority_confirmed=True)["token"]
+        kb.review_business_launch_contract(board, contract=base, approve=True, approval_token=tok)
+
+    # Build a valid in-range widening proposal for a ranged tunable.
+    proposed = copy.deepcopy(base)
+    tun = proposed.get("tunables") or {}
+    knob = next((k for k, s in tun.items() if isinstance(s, dict) and "range" in s), None)
+    if knob is not None:
+        lo, hi = tun[knob]["range"]
+        tun[knob]["range"] = [lo, hi + 5]
+
+    # Deterministic CEO stub: run_ceo_turn parses this canned JSON offline.
+    def _fake_call_model(system_prompt, user_payload, **kwargs):
+        return __import__("json").dumps({
+            "reply": "Agreed -- here's the change for your approval.",
+            "amendment": {"rationale": "widen via chat", "proposed_contract": proposed},
+            "research_query": "",
+        }), False
+    _orig_call, _orig_aux = kli._call_model, kli.aux_configured
+    kli._call_model = _fake_call_model
+    kli.aux_configured = lambda: True
+    try:
+        for mode in ("launch_buildout", "runtime_evolution"):
+            banner(f"S7 steering :: {mode} -> ceo amendment -> mint")
+            board = f"steer_{mode}"
+            activate(board)
+            with kb.connect(board=board) as conn:
+                try:
+                    sid = kb.open_steering_session(conn, board=board, mode=mode)["session_id"]
+                except Exception as exc:
+                    findings.append(f"[steer:{mode}] open_steering_session crashed: {exc!r}")
+                    continue
+                result = kb.steer_send_message(
+                    conn, board=board, session_id=sid,
+                    owner_message="Our nudge cap feels too low; please widen it.")
+                amd = result.get("amendment")
+                if not amd:
+                    findings.append(f"[steer:{mode}] CEO turn produced no amendment: {result}")
+                    continue
+                print(f"  amendment origin={amd['origin']} status={amd['status']} id={amd['amendment_id']}")
+                if amd["origin"] != "ceo":
+                    findings.append(f"[steer:{mode}] amendment origin != ceo: {amd['origin']}")
+                # CEO reply must reference the amendment back into the chat.
+                ceo_msg = result.get("ceo_message") or {}
+                if (ceo_msg.get("attachments") or {}).get("amendment_id") != amd["amendment_id"]:
+                    findings.append(f"[steer:{mode}] CEO reply did not surface the amendment id")
+                aid = amd["amendment_id"]
+                tok = kb.issue_board_launch_approval_token(
+                    board, amendment_id=aid, approved_by="owner",
+                    approval_evidence={"s": "x"}, owner_authority_confirmed=True)["token"]
+                kb.approve_contract_amendment(conn, aid, board=board, approver="owner", token=tok)
+                kb.validate_contract_amendment(conn, aid, board=board)
+                m = kb.mint_contract_amendment(conn, aid, board=board)
+                print(f"  minted status={m['status']} v={m.get('minted_version')}")
+                if m["status"] != kb.AMENDMENT_STATUS_ACTIVE or m.get("minted_version") != 2:
+                    findings.append(f"[steer:{mode}] ceo amendment did not mint to v2: {m}")
+                # Conversation reflects activation.
+                refl = kb.steer_reflect_amendment_state(conn, session_id=sid, amendment_id=aid, board=board)
+                if "minted" not in (refl.get("content") or "").lower():
+                    findings.append(f"[steer:{mode}] conversation did not reflect mint: {refl.get('content')}")
+            # Durability across a FRESH connection.
+            with kb.connect(board=board) as conn:
+                msgs = kb.get_steering_messages(conn, sid, board=board)
+                roles = [m["role"] for m in msgs]
+                print(f"  durable reload: {len(msgs)} msgs roles={roles}")
+                if not msgs or roles[0] != "owner":
+                    findings.append(f"[steer:{mode}] steering log not durable across reconnect")
+    finally:
+        kli._call_model, kli.aux_configured = _orig_call, _orig_aux
+    return findings
+
+
 def scenario_perf() -> list[str]:
     """S8a: volume/perf -- many tasks, ticks, signals; watch for superlinear scaling."""
     findings: list[str] = []
@@ -630,6 +811,8 @@ SCENARIOS = {
     "sensors": scenario_sensors,
     "optimizer": scenario_optimizer,
     "amendment": scenario_amendment,
+    "triggers": scenario_amendment_triggers,
+    "steering": scenario_steering,
     "perf": scenario_perf,
     "restart": scenario_restart,
     "concurrency": scenario_concurrency,
