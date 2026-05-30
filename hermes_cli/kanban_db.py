@@ -6565,10 +6565,18 @@ def set_profile_board_binding(profile: str, board: str) -> Path:
 def board_role_profiles(board: Optional[str] = None) -> dict[str, str]:
     """Return the ``role -> profile`` map a board's contract declares.
 
-    Sources (in precedence): ``runtime.dispatcher.profile`` (role
-    ``dispatcher``) and ``runtime.profiles`` (ceo / optimizer / worker / …).
-    Empty dict when the board declares no roles. This is the on-architecture
-    statement of "one business = one board + a known set of agent profiles".
+    Harvests every profile the contract names so all of them bind to the one
+    board (the on-architecture statement of "one business = one board + a
+    known set of agent profiles"):
+
+    * ``runtime.dispatcher.profile`` (role ``dispatcher``),
+    * ``runtime.profiles`` (the normalized ceo / optimizer / worker slots),
+    * ``runtime.agents`` (list of ``{role, profile}`` — the extension point for
+      extra named agents like negotiator/operator that normalization would
+      otherwise drop from ``runtime.profiles``), and
+    * ``runtime.worker_envelopes`` (per-role envelopes that pin a profile).
+
+    Empty dict when the board declares no roles.
     """
     meta = read_board_metadata(board)
     runtime = meta.get("runtime")
