@@ -532,6 +532,40 @@ def test_circuit_breaker_open_drafts_sensor_amendment(fresh_home):
         assert not (tick2.get("amendments_proposed") or [])
 
 
+def test_amendment_reflection_leads_with_rationale(fresh_home):
+    """A drafted/pending amendment surfaces its plain-language WHY to the owner.
+
+    Sensor- and optimizer-originated amendments have no separate CEO reply, so
+    the reflection message itself must tell the owner what is being changed and
+    why -- not just an opaque amendment id + mint jargon.
+    """
+    drafted = {
+        "amendment_id": "cam_abc",
+        "status": kb.AMENDMENT_STATUS_DRAFTED,
+        "origin": "optimizer",
+        "rationale": "Widen max_nudges so the optimizer can push follow-ups to 6.",
+        "required_inputs": [],
+        "provided_inputs": {},
+        "validation_report": {},
+    }
+    content, _attach = kb._compose_amendment_reflection(drafted, live_version=1)
+    assert "what I want to change and why" in content
+    assert "Widen max_nudges" in content
+
+    pending = {
+        "amendment_id": "cam_def",
+        "status": kb.AMENDMENT_STATUS_PENDING_INPUT,
+        "origin": "sensor",
+        "rationale": "Add a circuit breaker on outbound sends after an error spike.",
+        "required_inputs": [{"key": "api_key", "label": "API key", "required": True}],
+        "provided_inputs": {},
+        "validation_report": {},
+    }
+    content2, _ = kb._compose_amendment_reflection(pending, live_version=1)
+    assert "Add a circuit breaker" in content2
+    assert "API key" in content2
+
+
 # ---------------------------------------------------------------------------
 # Read-model surfacing
 # ---------------------------------------------------------------------------

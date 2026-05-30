@@ -6225,6 +6225,11 @@ def _compose_amendment_reflection(
         "missing_inputs": missing,
         "inputs_satisfied": satisfied,
     }
+    # Lead drafted/pending messages with the plain-language WHY (the rationale)
+    # so the owner sees what is being changed and why -- this matters most for
+    # sensor/optimizer-originated amendments, which have no separate CEO reply.
+    why = str(amendment.get("rationale") or "").strip()
+    why_line = f"Here's what I want to change and why: {why}\n\n" if why else ""
     if status == AMENDMENT_STATUS_PENDING_INPUT:
         labels = ", ".join(
             spec.get("label") or spec.get("key")
@@ -6232,12 +6237,14 @@ def _compose_amendment_reflection(
             if spec.get("key") in missing
         )
         content = (
+            f"{why_line}"
             f"I've drafted amendment {aid}, but it needs your input before it can be "
             f"approved: {labels}. Supply these, then approve -> validate -> mint to "
             f"apply it. The live contract is unchanged until then."
         )
     elif status == AMENDMENT_STATUS_DRAFTED:
         content = (
+            f"{why_line}"
             f"I've drafted amendment {aid} for your review. To apply it: issue an "
             f"owner approval token for this amendment, approve, then validate and "
             f"mint. Nothing changes on the live board until you mint it."
