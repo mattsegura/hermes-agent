@@ -3805,7 +3805,80 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     return meta
 
 
-def write_board_metadata(
+# Process-local per-board locks guarding the board.json compare-and-swap.
+# The connection flock (.kanban.lock) is reference-counted per-process, so two
+# THREADS in one process can both "hold" it without mutual exclusion — and
+# write_board_metadata may be called with no open connection at all. Without a
+# real critical section the version CAS is a TOCTOU: every concurrent writer
+# reads the same on-disk version, all pass the expected_version check, and the
+# last os.replace wins (silent clobber / lost update). These locks make the CAS
+# self-contained and exactly-once.
+_BOARD_META_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_BOARD_META_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _board_meta_thread_lock(slug: str) -> threading.Lock:
+    with _BOARD_META_THREAD_LOCKS_GUARD:
+        lk = _BOARD_META_THREAD_LOCKS.get(slug)
+        if lk is None:
+            lk = threading.Lock()
+            _BOARD_META_THREAD_LOCKS[slug] = lk
+        return lk
+
+
+@contextlib.contextmanager
+def _board_metadata_cas_lock(slug: str):
+    """Serialize the board.json compare-and-swap across threads AND processes.
+
+    A process-local per-board :class:`threading.Lock` serializes threads (the
+    refcounted flock can't), and the cross-process ``.kanban.lock`` flock —
+    the SAME lockfile :func:`connect` takes, so a connection-holding minter and
+    a bare ``write_board_metadata`` CAS contend on one lock — serializes
+    processes. Together exactly one concurrent writer passes the
+    ``expected_version`` check and advances the contract; the rest read the
+    advanced version and raise :class:`ContractVersionConflict` (clean
+    supersede, no clobber). In-process flock acquisition is re-entrant and
+    non-blocking, so this can't deadlock against a caller that already holds a
+    connection on the same board.
+    """
+    tlock = _board_meta_thread_lock(slug)
+    tlock.acquire()
+    locked_path: Optional[Path] = None
+    try:
+        if not _IS_WINDOWS and fcntl is not None:
+            db_path = kanban_db_path(slug)
+            try:
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            _acquire_db_lock(db_path)
+            locked_path = db_path
+        yield
+    finally:
+        if locked_path is not None:
+            _release_db_lock(locked_path)
+        tlock.release()
+
+
+def write_board_metadata(board: Optional[str], **kwargs: Any) -> dict:
+    """Create / update ``board.json`` (see :func:`_write_board_metadata_impl`).
+
+    Thin wrapper that makes the ``expected_version`` compare-and-swap atomic:
+    when a CAS is requested the read→check→write runs under
+    :func:`_board_metadata_cas_lock` (per-board thread lock + cross-process
+    flock) so exactly one concurrent writer can advance the contract and the
+    rest cleanly raise :class:`ContractVersionConflict`. Plain (non-CAS) writes
+    skip the lock to preserve their existing cost/behavior.
+    """
+    expected = kwargs.get("expected_version", _UNSET)
+    if expected is not _UNSET and expected is not None:
+        slug = _normalize_board_slug(board) or DEFAULT_BOARD
+        with _board_metadata_cas_lock(slug):
+            return _write_board_metadata_impl(board, **kwargs)
+    return _write_board_metadata_impl(board, **kwargs)
+
+
+def _write_board_metadata_impl(
     board: Optional[str],
     *,
     name: Optional[str] = None,

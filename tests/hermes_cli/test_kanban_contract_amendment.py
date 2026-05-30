@@ -318,6 +318,59 @@ def test_concurrency_two_amendments_race_to_mint_exactly_one_wins(fresh_home):
     assert meta["business_contract"]["tunables"]["max_nudges"]["default"] == 6
 
 
+def test_concurrency_N_amendments_mint_in_parallel_exactly_one_wins(fresh_home):
+    """Reproduce the steering-vs-optimizer race: N validated amendments (all
+    based on version 1) mint CONCURRENTLY from N threads, each on its own
+    connection. The CAS guard must let exactly one advance the contract and
+    cleanly supersede the rest -- no clobber, no lost update, no partial
+    board.json, no deadlock.
+
+    Pre-fix this raced: write_board_metadata's expected_version check was a
+    TOCTOU with no lock spanning read->write (the connection flock is
+    refcounted per-process, so threads don't serialize on it), so every writer
+    passed the CAS and the last os.replace silently won.
+    """
+    import threading
+
+    contract = _base_contract()
+    _activate_board("prace", contract)
+
+    N = 8
+    # Each amendment proposes a distinct max_nudges default, all based on v1.
+    aids = [_drive_to_validated("prace", contract, default=4 + i) for i in range(N)]
+    assert kb.read_board_metadata("prace")["contract_version"] == 1
+
+    results: dict[str, str] = {}
+    res_lock = threading.Lock()
+    barrier = threading.Barrier(N)
+
+    def mint(aid: str) -> None:
+        barrier.wait()  # release all writers at once -> maximal contention
+        with kb.connect(board="prace") as conn:
+            out = kb.mint_contract_amendment(conn, aid, board="prace")
+        with res_lock:
+            results[aid] = out["status"]
+
+    threads = [threading.Thread(target=mint, args=(aid,)) for aid in aids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "a minter deadlocked / hung"
+
+    active = [a for a, s in results.items() if s == kb.AMENDMENT_STATUS_ACTIVE]
+    superseded = [a for a, s in results.items() if s == kb.AMENDMENT_STATUS_SUPERSEDED]
+    assert len(active) == 1, f"expected exactly one mint, got {results}"
+    assert len(superseded) == N - 1, f"others must cleanly supersede, got {results}"
+
+    meta = kb.read_board_metadata("prace")
+    assert meta.get("metadata_error") is None  # board.json never corrupted
+    assert meta["contract_version"] == 2  # advanced by exactly one
+    # The live value belongs to the single winner (one coherent contract).
+    live_default = meta["business_contract"]["tunables"]["max_nudges"]["default"]
+    assert live_default in {4 + i for i in range(N)}
+
+
 def test_approve_on_stale_base_version_supersedes(fresh_home):
     contract = _base_contract()
     _activate_board("stale", contract)
