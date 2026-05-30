@@ -5586,9 +5586,26 @@ class GatewayRunner:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            # Preflight: never dispatch an orphan board (a kanban.db with no
+            # board.json). It has no contract/launch metadata, so driving it
+            # would be operating on a ghost. Computed from the real FS so it's
+            # a no-op under unit tests that mock list_boards with synthetic
+            # metadata (no on-disk boards dir → no orphans).
+            try:
+                orphan_slugs = {o["slug"] for o in _kb.scan_orphan_boards()}
+            except Exception:
+                orphan_slugs = set()
             selected: list[dict] = []
             for board_meta in boards:
                 slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                if slug in orphan_slugs:
+                    logger.warning(
+                        "kanban dispatcher: refusing to dispatch orphan board %s "
+                        "(kanban.db with no board.json). Run `hermes kanban boards "
+                        "quarantine-orphans` to clean it up.",
+                        slug,
+                    )
+                    continue
                 if _board_is_dispatchable(board_meta):
                     selected.append(board_meta)
                 else:

@@ -386,6 +386,18 @@ def _hermetic_environment(tmp_path, monkeypatch):
     #     hermes_cli/kanban_db.py::_resolve_lock_timeout_seconds.
     monkeypatch.setenv("HERMES_KANBAN_LOCK_TIMEOUT_SECONDS", "2")
 
+    # 4d. Opt the whole test session into implicit kanban-board creation.
+    #     Production default is fail-loud: connect()/init_db() refuse to
+    #     materialize a brand-new named board (no board.json AND no
+    #     kanban.db) so a misconfigured daemon can't fabricate an orphan
+    #     board (the board↔profile fragmentation root cause). The ~280
+    #     existing `connect(board="…")` test call sites rely on implicit
+    #     creation, so we re-enable it here for the session rather than
+    #     editing every site. Tests that assert the *strict* fail-loud
+    #     behavior monkeypatch.delenv this explicitly. See
+    #     hermes_cli/kanban_db.py::_implicit_board_create_allowed.
+    monkeypatch.setenv("HERMES_KANBAN_ALLOW_IMPLICIT_BOARD", "1")
+
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
     #    singleton might still be cached from a previous test).

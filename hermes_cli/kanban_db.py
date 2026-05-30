@@ -6305,6 +6305,357 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Board ↔ profile binding (HARD RAIL: declare / validate / fail-loud)
+# ---------------------------------------------------------------------------
+#
+# Root cause this closes: board identity used to resolve via a silent
+# fallback chain (env → current symlink → 'default') and connect() would
+# materialize a kanban.db for whatever slug it landed on. Gateways for
+# profiles like `land-ceo` / `land-pipeline-optimizer` each fabricated their
+# own orphan board instead of all operating the single real board. The cure
+# is the same shape as every other safety fix here: make the binding an
+# explicit, declared, validated fact and fail loudly when it's missing —
+# never infer it.
+#
+# The reserved holding directories under boards/ that are NOT boards.
+_NON_BOARD_DIRS = frozenset({"_archived", "_quarantine"})
+
+
+class GatewayBoardBindingError(RuntimeError):
+    """Raised when a daemon/gateway has no explicit board binding.
+
+    A long-lived dispatcher MUST operate a board that was declared for it
+    (via ``HERMES_KANBAN_BOARD`` or a profile's ``kanban_board:`` in
+    config.yaml). Falling through to ``'default'`` is exactly how the
+    board↔profile fragmentation happened, so we refuse and tell the
+    operator how to bind it.
+    """
+
+
+def board_is_configured(board: Optional[str] = None) -> bool:
+    """True iff the board has a ``board.json`` on disk (or is ``default``).
+
+    Stricter than :func:`board_exists`, which also returns True for a bare
+    ``kanban.db`` with no metadata (an *orphan*). Preflight and the binding
+    invariants use *this* — a board the runtime should drive must be
+    configured, not merely materialized.
+    """
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    if slug == DEFAULT_BOARD:
+        return True
+    return board_metadata_path(slug).exists()
+
+
+def scan_orphan_boards() -> list[dict]:
+    """Return boards that have a ``kanban.db`` but no ``board.json``.
+
+    These are the ghost boards the no-silent-auto-create rail now prevents
+    at the source; this finds any that already accumulated (or were created
+    by an older build). ``default`` and the ``_archived``/``_quarantine``
+    holding dirs are never reported.
+
+    Each entry: ``{"slug", "path", "db_path", "task_count"}``. ``task_count``
+    is best-effort (``-1`` if the db can't be opened read-only).
+    """
+    orphans: list[dict] = []
+    root = boards_root()
+    if not root.is_dir():
+        return orphans
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir() or child.name in _NON_BOARD_DIRS:
+            continue
+        try:
+            normed = _normalize_board_slug(child.name)
+        except ValueError:
+            continue
+        if not normed or normed == DEFAULT_BOARD:
+            continue
+        db = child / "kanban.db"
+        meta = child / "board.json"
+        if db.exists() and not meta.exists():
+            task_count = -1
+            try:
+                ro = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                try:
+                    row = ro.execute("SELECT COUNT(*) FROM tasks").fetchone()
+                    task_count = int(row[0]) if row else 0
+                finally:
+                    ro.close()
+            except Exception:
+                task_count = -1
+            orphans.append({
+                "slug": normed,
+                "path": str(child),
+                "db_path": str(db),
+                "task_count": task_count,
+            })
+    return orphans
+
+
+def quarantine_orphan_board(slug: str) -> dict:
+    """Move an orphan board's directory aside to ``boards/_quarantine/``.
+
+    Non-destructive (a rename, not a delete) so the data is recoverable.
+    Refuses to quarantine a *configured* board (one with a board.json) — use
+    :func:`remove_board` for those. Returns ``{"slug", "action", "new_path"}``.
+    """
+    normed = _normalize_board_slug(slug)
+    if not normed:
+        raise ValueError("board slug is required")
+    if normed == DEFAULT_BOARD:
+        raise ValueError("the 'default' board cannot be quarantined")
+    d = board_dir(normed)
+    if not d.is_dir():
+        raise ValueError(f"board {normed!r} does not exist")
+    if (d / "board.json").exists():
+        raise ValueError(
+            f"board {normed!r} is configured (has board.json) — it is not an "
+            f"orphan. Use remove_board() to archive/delete it."
+        )
+    q_root = boards_root() / "_quarantine"
+    q_root.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time())
+    target = q_root / f"{normed}-{ts}"
+    suffix = 1
+    while target.exists():
+        target = q_root / f"{normed}-{ts}-{suffix}"
+        suffix += 1
+    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+    d.rename(target)
+    return {"slug": normed, "action": "quarantined", "new_path": str(target)}
+
+
+def adopt_orphan_board(slug: str, *, name: Optional[str] = None) -> dict:
+    """Stamp a minimal ``board.json`` onto an orphan so it's configured.
+
+    The opposite of :func:`quarantine_orphan_board`: keep the data in place
+    and promote it to a first-class board. Returns the new metadata.
+    """
+    normed = _normalize_board_slug(slug)
+    if not normed:
+        raise ValueError("board slug is required")
+    d = board_dir(normed)
+    if not (d / "kanban.db").exists():
+        raise ValueError(f"board {normed!r} has no kanban.db to adopt")
+    if (d / "board.json").exists():
+        return read_board_metadata(normed)
+    return write_board_metadata(normed, name=name or _default_board_display_name(normed))
+
+
+# ----- profile → board binding (config.yaml: kanban_board) -----
+
+_KANBAN_BOARD_LINE_RE = re.compile(r"^kanban_board\s*:.*$", re.MULTILINE)
+
+
+def _profile_config_path(profile: str) -> Path:
+    """Return the config.yaml path for a profile (``default`` → root config)."""
+    from hermes_cli.profiles import get_profile_dir
+    return get_profile_dir(profile) / "config.yaml"
+
+
+def profile_board_binding(profile: str) -> Optional[str]:
+    """Return the board slug a profile is explicitly bound to, or None.
+
+    Reads the top-level ``kanban_board:`` key from the profile's config.yaml.
+    Never raises for a missing/garbled file — returns None so callers can
+    decide whether the absence is fatal (a daemon) or fine (ad-hoc CLI).
+    """
+    path = _profile_config_path(profile)
+    if not path.exists():
+        return None
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        if not isinstance(cfg, dict):
+            return None
+        raw = cfg.get("kanban_board")
+        if not raw:
+            return None
+        return _normalize_board_slug(str(raw))
+    except Exception:
+        return None
+
+
+def set_profile_board_binding(profile: str, board: str) -> Path:
+    """Bind a profile to a board by setting ``kanban_board:`` in config.yaml.
+
+    Surgical, comment-preserving edit: replaces an existing top-level
+    ``kanban_board:`` line if present, else appends one. Avoids re-dumping
+    the (potentially large, comment-rich) config. Creates the profile's
+    config.yaml if it doesn't exist yet. Returns the path written.
+    """
+    normed_board = _normalize_board_slug(board)
+    if not normed_board:
+        raise ValueError("board slug is required")
+    path = _profile_config_path(profile)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = ""
+    if path.exists():
+        try:
+            existing = path.read_text(encoding="utf-8")
+        except OSError:
+            existing = ""
+    new_line = f"kanban_board: {normed_board}"
+    if _KANBAN_BOARD_LINE_RE.search(existing):
+        updated = _KANBAN_BOARD_LINE_RE.sub(new_line, existing, count=1)
+    elif existing.strip():
+        sep = "" if existing.endswith("\n") else "\n"
+        updated = f"{existing}{sep}{new_line}\n"
+    else:
+        updated = new_line + "\n"
+    _atomic_write_text(path, updated)
+    return path
+
+
+def board_role_profiles(board: Optional[str] = None) -> dict[str, str]:
+    """Return the ``role -> profile`` map a board's contract declares.
+
+    Sources (in precedence): ``runtime.dispatcher.profile`` (role
+    ``dispatcher``) and ``runtime.profiles`` (ceo / optimizer / worker / …).
+    Empty dict when the board declares no roles. This is the on-architecture
+    statement of "one business = one board + a known set of agent profiles".
+    """
+    meta = read_board_metadata(board)
+    runtime = meta.get("runtime")
+    roles: dict[str, str] = {}
+    if not isinstance(runtime, dict):
+        return roles
+    dispatcher = runtime.get("dispatcher")
+    if isinstance(dispatcher, dict):
+        prof = str(dispatcher.get("profile") or "").strip()
+        if prof:
+            roles["dispatcher"] = prof
+    profiles = runtime.get("profiles")
+    if isinstance(profiles, dict):
+        for role, prof in profiles.items():
+            prof_s = str(prof or "").strip()
+            if prof_s:
+                roles[str(role)] = prof_s
+    return roles
+
+
+def bind_contract_roles_to_board(board: Optional[str] = None) -> dict:
+    """Bind every profile a board's contract names to that ONE board.
+
+    HARD RAIL for "many profiles → one board, explicit and intentional":
+    reads the contract roles (:func:`board_role_profiles`) and writes
+    ``kanban_board: <slug>`` into each role profile's config.yaml. Returns
+    ``{"board", "bound": {profile: slug}, "conflicts": [...]}`` where
+    ``conflicts`` lists profiles that were already bound to a *different*
+    board (those are re-bound to this board — last launch wins — and the
+    prior value is reported so the operator can see the move).
+    """
+    meta = read_board_metadata(board)
+    slug = meta.get("slug") or _normalize_board_slug(board)
+    if not slug:
+        raise ValueError("board slug is required")
+    roles = board_role_profiles(slug)
+    bound: dict[str, str] = {}
+    conflicts: list[dict] = []
+    for _role, profile in roles.items():
+        prior = profile_board_binding(profile)
+        if prior and prior != slug:
+            conflicts.append({"profile": profile, "was": prior, "now": slug})
+        set_profile_board_binding(profile, slug)
+        bound[profile] = slug
+    return {"board": slug, "bound": bound, "conflicts": conflicts}
+
+
+def resolve_daemon_board(profile: Optional[str] = None) -> str:
+    """Strictly resolve the board a daemon/gateway must operate. Fail-loud.
+
+    Order: ``HERMES_KANBAN_BOARD`` env (if set AND configured) → the
+    profile's ``kanban_board:`` binding (if configured) → **raise**
+    :class:`GatewayBoardBindingError`. Unlike :func:`get_current_board`,
+    this NEVER falls through to ``'default'`` — a daemon with no explicit,
+    configured binding is a misconfiguration we refuse rather than paper
+    over by fabricating work on the wrong board.
+    """
+    env = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if env:
+        try:
+            normed = _normalize_board_slug(env)
+        except ValueError:
+            normed = None
+        if normed:
+            if board_is_configured(normed):
+                return normed
+            raise GatewayBoardBindingError(
+                f"HERMES_KANBAN_BOARD={env!r} is not a configured board "
+                f"(no board.json). Create it (`hermes kanban boards create "
+                f"{normed}`) or fix the binding; the daemon will not fabricate it."
+            )
+    if profile:
+        bound = profile_board_binding(profile)
+        if bound:
+            if board_is_configured(bound):
+                return bound
+            raise GatewayBoardBindingError(
+                f"profile {profile!r} is bound to board {bound!r} which is not "
+                f"configured (no board.json). Create it or fix kanban_board in "
+                f"the profile's config.yaml."
+            )
+    raise GatewayBoardBindingError(
+        "no explicit kanban board binding for this daemon — refusing to fall "
+        "through to 'default'. Set HERMES_KANBAN_BOARD or add `kanban_board: "
+        "<slug>` to the profile's config.yaml "
+        + (f"(profile={profile!r})." if profile else "(no profile given).")
+    )
+
+
+def board_binding_health() -> dict:
+    """Aggregate board↔profile binding health for ``kanban doctor``.
+
+    Returns ``{"ok", "orphans", "bad_profile_bindings", "role_bindings"}``:
+
+    * ``orphans`` — boards with a kanban.db but no board.json. (Fails ``ok``.)
+    * ``bad_profile_bindings`` — profiles whose ``kanban_board`` points at a
+      board that isn't configured. (Fails ``ok``.)
+    * ``role_bindings`` — advisory: for each non-default board, the role
+      profiles it declares and whether each carries an explicit
+      ``kanban_board`` binding. Does NOT fail ``ok`` — a board declaring
+      role profiles is the normal case, and the existing dispatcher routes by
+      ``runtime.dispatcher.profile`` (board→owner). Surfaced purely so an
+      operator can SEE which profiles still rely on implicit resolution.
+    """
+    orphans = scan_orphan_boards()
+    bad_bindings: list[dict] = []
+    try:
+        from hermes_cli.profiles import list_profiles
+        profiles = [p.name for p in list_profiles()]
+    except Exception:
+        profiles = []
+    for prof in profiles:
+        bound = profile_board_binding(prof)
+        if bound and not board_is_configured(bound):
+            bad_bindings.append({"profile": prof, "board": bound})
+    role_bindings: list[dict] = []
+    try:
+        boards = list_boards(include_archived=False)
+    except Exception:
+        boards = []
+    for meta in boards:
+        slug = meta.get("slug") or DEFAULT_BOARD
+        if slug == DEFAULT_BOARD:
+            continue
+        roles = board_role_profiles(slug)
+        for role, prof in roles.items():
+            role_bindings.append({
+                "board": slug,
+                "role": role,
+                "profile": prof,
+                "bound": profile_board_binding(prof) == slug,
+            })
+    return {
+        "ok": not orphans and not bad_bindings,
+        "orphans": orphans,
+        "bad_profile_bindings": bad_bindings,
+        "role_bindings": role_bindings,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
@@ -7758,10 +8109,62 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
+class BoardNotFoundError(ValueError):
+    """Raised when opening a board that was never explicitly created.
+
+    HARD RAIL against the ghost-board failure class: a daemon/gateway that
+    resolves a board slug (via ``HERMES_KANBAN_BOARD``/``--board``) which has
+    neither a ``board.json`` nor a ``kanban.db`` on disk must FAIL LOUDLY
+    rather than silently materialize an orphan ``kanban.db`` for it. Board
+    creation is an explicit, declared act (:func:`create_board`,
+    :func:`init_db`, ``hermes kanban boards create``) — opening is not.
+
+    Subclasses :class:`ValueError` so the many ``except ValueError`` callers
+    and tests that already treat board-slug problems as value errors keep
+    working, while still being a distinct, catchable type.
+    """
+
+    def __init__(self, slug: str, *, message: Optional[str] = None) -> None:
+        self.slug = slug
+        super().__init__(
+            message
+            or (
+                f"board {slug!r} not found — it has no board.json or kanban.db "
+                f"on disk. Create it explicitly with "
+                f"`hermes kanban boards create {slug}` (or kb.create_board("
+                f"{slug!r})) before opening it. The runtime refuses to "
+                f"silently fabricate a board so a misconfigured daemon can't "
+                f"spawn an orphan board."
+            )
+        )
+
+
+def _implicit_board_create_allowed() -> bool:
+    """True when :func:`connect` may auto-materialize a brand-new board.
+
+    Production default is **False** (fail-loud): only the explicit creation
+    entry points (:func:`create_board`, :func:`init_db`, which pass
+    ``create=True``) may bring a new non-default board into existence. This
+    is what stops a daemon that resolved a bogus board slug from fabricating
+    a ghost ``kanban.db``.
+
+    The test suite opts the *whole* session back into permissive auto-create
+    by exporting ``HERMES_KANBAN_ALLOW_IMPLICIT_BOARD=1`` from the hermetic
+    conftest, so the ~280 existing ``connect(board="…")`` call sites that
+    rely on implicit creation keep working without per-site edits. The env
+    var (not a module global) is deliberate: kanban spawns real worker
+    subprocesses and cross-process dispatcher ticks, and the env var
+    propagates to them while a module global would not.
+    """
+    val = os.environ.get("HERMES_KANBAN_ALLOW_IMPLICIT_BOARD", "")
+    return val.strip().lower() not in ("", "0", "false", "no", "off")
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    create: Optional[bool] = None,
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
@@ -7790,6 +8193,21 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    # HARD RAIL: no silent auto-create of a brand-new board. If the resolved
+    # path maps to a *named* non-default board that exists nowhere on disk
+    # (no board.json AND no kanban.db), refuse to materialize it unless the
+    # caller explicitly opted into creation (create=True — used by
+    # create_board / init_db) or the process enabled implicit creation
+    # (tests, via HERMES_KANBAN_ALLOW_IMPLICIT_BOARD). This is what stops a
+    # daemon that resolved a bogus HERMES_KANBAN_BOARD from spawning an
+    # orphan board. ``default`` is always exempt (board_exists short-circuits
+    # it True) and explicit db_path callers that don't map to a board slug
+    # (legacy/tests with a tmp path) are unaffected (_gate_slug is None).
+    _gate_slug = _board_slug_for_db_path(path)
+    if _gate_slug is not None and _gate_slug != DEFAULT_BOARD and not board_exists(_gate_slug):
+        allow_create = create if create is not None else _implicit_board_create_allowed()
+        if not allow_create:
+            raise BoardNotFoundError(_gate_slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Acquire cross-process lock BEFORE any DB I/O. On Windows, skip
     # (fcntl is Unix-only) and fall back to SQLite's built-in locking.
@@ -7922,7 +8340,10 @@ def init_db(
     # schema + migration pass unconditionally.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(resolved)
-    with contextlib.closing(connect(path)):
+    # init_db IS the explicit board-creation/schema entry point, so it always
+    # opts into creation — the no-silent-auto-create rail in connect() guards
+    # *opening*, not the declared act of initializing a board.
+    with contextlib.closing(connect(path, create=True)):
         pass
     return path
 

@@ -569,6 +569,22 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     am_reject.add_argument("--board", default=None, help="Board slug (defaults to current)")
     am_reject.add_argument("--json", action="store_true")
 
+    # --- orphan cleanup + role binding (board↔profile fragmentation guard) ---
+    b_quar = boards_sub.add_parser(
+        "quarantine-orphans",
+        help="Find/quarantine orphan boards (a kanban.db with no board.json)",
+    )
+    b_quar.add_argument("--apply", action="store_true",
+                        help="Actually act (default is a dry-run listing)")
+    b_quar.add_argument("--adopt", action="store_true",
+                        help="Stamp a board.json onto each orphan instead of quarantining it")
+    b_bind = boards_sub.add_parser(
+        "bind-roles",
+        help="Bind every profile a board's contract names to that ONE board",
+    )
+    b_bind.add_argument("slug", nargs="?", default=None,
+                        help="Board slug (defaults to current board)")
+
     # --- P6 conversational CEO steering channel ---
     p_steer = sub.add_parser(
         "steer",
@@ -1327,7 +1343,13 @@ def _operator_error_message(action: Optional[str], exc: BaseException) -> str:
     import sqlite3 as _sqlite3
 
     low = detail.lower()
-    if isinstance(exc, _sqlite3.OperationalError) and "locked" in low:
+    if isinstance(exc, kb.BoardNotFoundError):
+        lines.append(
+            f"  hint: board {exc.slug!r} has no board.json/kanban.db. Create it "
+            f"explicitly with `hermes kanban boards create {exc.slug}`, or check "
+            "HERMES_KANBAN_BOARD / --board for a typo (`hermes kanban boards list`)."
+        )
+    elif isinstance(exc, _sqlite3.OperationalError) and "locked" in low:
         lines.append(
             "  hint: the board database is locked by another process. "
             "Stop other `hermes kanban`/gateway processes and retry."
@@ -1556,8 +1578,64 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_workflow(args)
     if sub == "contract":
         return _cmd_boards_contract(args)
+    if sub == "quarantine-orphans":
+        return _cmd_boards_quarantine_orphans(args)
+    if sub == "bind-roles":
+        return _cmd_boards_bind_roles(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
+
+
+def _cmd_boards_quarantine_orphans(args: argparse.Namespace) -> int:
+    """One-time cleanup: move orphan boards (kanban.db, no board.json) aside.
+
+    Dry-run by default — pass ``--apply`` to actually quarantine. ``--adopt``
+    instead stamps a board.json onto each orphan (keep the data in place).
+    """
+    orphans = kb.scan_orphan_boards()
+    if not orphans:
+        print("No orphan boards found (every kanban.db has a board.json).")
+        return 0
+    apply = getattr(args, "apply", False)
+    adopt = getattr(args, "adopt", False)
+    for o in orphans:
+        label = f"{o['slug']} ({o['task_count']} task(s)) at {o['path']}"
+        if not apply:
+            verb = "would adopt" if adopt else "would quarantine"
+            print(f"  {verb}: {label}")
+            continue
+        if adopt:
+            kb.adopt_orphan_board(o["slug"])
+            print(f"  adopted (board.json written): {label}")
+        else:
+            res = kb.quarantine_orphan_board(o["slug"])
+            print(f"  quarantined -> {res['new_path']}: {label}")
+    if not apply:
+        print(f"\n{len(orphans)} orphan(s). Re-run with --apply to act "
+              f"(add --adopt to keep them as boards instead of quarantining).")
+    return 0
+
+
+def _cmd_boards_bind_roles(args: argparse.Namespace) -> int:
+    """Bind every profile a board's contract names to that ONE board.
+
+    Writes ``kanban_board: <slug>`` into each role profile's config.yaml so a
+    gateway for any of them operates the single shared board (never 'default').
+    """
+    slug = getattr(args, "slug", None)
+    res = kb.bind_contract_roles_to_board(slug)
+    bound = res.get("bound", {})
+    if not bound:
+        print(f"board {res.get('board')!r} declares no contract role profiles "
+              f"to bind (runtime.dispatcher.profile / runtime.profiles).")
+        return 0
+    print(f"Bound {len(bound)} profile(s) to board {res['board']!r}:")
+    for prof, b in bound.items():
+        print(f"  {prof} -> {b}")
+    for c in res.get("conflicts", []):
+        print(f"  note: {c['profile']} was bound to {c['was']!r}, re-bound to "
+              f"{c['now']!r}", file=sys.stderr)
+    return 0
 
 
 def _board_task_counts(slug: str) -> dict[str, int]:
@@ -4374,14 +4452,44 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
     reports: list[dict] = []
     for slug in slugs:
+        # Skip orphans (kanban.db, no board.json) here — they're reported by
+        # the binding-health section below, and connecting would only confirm
+        # they have no live work. Configured boards + default get the
+        # tick-staleness probe.
+        if slug != kb.DEFAULT_BOARD and not kb.board_is_configured(slug):
+            continue
         with kb.connect_closing(board=slug) as conn:
             reports.append(kb.board_tick_stale(conn, board=slug, staleness_seconds=staleness))
 
     stale = [r for r in reports if r.get("stale")]
 
+    # Board↔profile binding health (orphan boards, profiles bound to a
+    # nonexistent board, role profiles with no binding). Fail-loud signal so
+    # the fragmentation that spawned orphan boards can't silently re-accumulate.
+    binding = kb.board_binding_health()
+    binding_unhealthy = not binding.get("ok", True)
+
     if as_json:
-        print(json.dumps({"healthy": not stale, "boards": reports}, indent=2))
-        return 1 if stale else 0
+        print(json.dumps({
+            "healthy": not stale and not binding_unhealthy,
+            "boards": reports,
+            "binding": binding,
+        }, indent=2))
+        return 1 if (stale or binding_unhealthy) else 0
+
+    for orphan in binding.get("orphans", []):
+        print(
+            f"ORPHAN     {orphan['slug']} (kanban.db, no board.json; "
+            f"{orphan['task_count']} task(s)) — `hermes kanban boards "
+            f"quarantine-orphans` or adopt it",
+            file=sys.stderr,
+        )
+    for bad in binding.get("bad_profile_bindings", []):
+        print(
+            f"BAD-BIND   profile {bad['profile']!r} -> board {bad['board']!r} "
+            f"which has no board.json",
+            file=sys.stderr,
+        )
 
     for r in reports:
         slug = r["board"]
@@ -4402,6 +4510,16 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             f"being ticked. Is `hermes gateway start` running?",
             file=sys.stderr,
         )
+    if binding_unhealthy:
+        n_orph = len(binding.get("orphans", []))
+        n_bad = len(binding.get("bad_profile_bindings", []))
+        print(
+            f"\nkanban doctor: board↔profile binding issues — "
+            f"{n_orph} orphan board(s), {n_bad} bad binding(s). "
+            f"See messages above.",
+            file=sys.stderr,
+        )
+    if stale or binding_unhealthy:
         return 1
     return 0
 
