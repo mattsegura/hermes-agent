@@ -1238,7 +1238,22 @@ def _normalize_policy_map(value: Optional[Any], *, field: str) -> dict:
         elif isinstance(raw_policy, dict):
             out[key] = dict(raw_policy)
         else:
-            raise ValueError(f"{field}.{key} must be an object")
+            # Preserve non-object policy values verbatim instead of raising.
+            #
+            # A policy map's entries are normally route objects, but real
+            # synthesized contracts carry legitimate cross-cutting metadata
+            # under the same map -- e.g. ``provider_policy.global_rules`` is a
+            # list of guardrail strings. Hard-raising here made normalization
+            # non-total: ``validate_business_runtime_contract`` caught the
+            # ValueError and reported the whole contract as missing, but the
+            # review/launch path (``review_business_launch_contract``) crashed
+            # with a raw traceback instead of a structured readiness result.
+            # Keeping the value means launch/validate behave identically and
+            # safety is unaffected: every consumer coerces a policy entry via
+            # ``_contract_object`` (non-dict -> {}) and a non-route entry can
+            # never satisfy ``_policy_has_material_route``, so the dispatch gate
+            # still fails closed on a malformed route.
+            out[key] = raw_policy
     return out
 
 
@@ -3152,6 +3167,21 @@ def _synthesize_launch_contract_from_intake(draft: dict[str, Any]) -> dict[str, 
     )
 
 
+class ContractNormalizationError(ValueError):
+    """A board contract could not be normalized against the launch grammar.
+
+    Raised by :func:`build_business_runtime_contract_draft` when
+    :func:`normalize_board_operating_contract` rejects the contract's *shape*
+    (e.g. a malformed workflow stage, an invalid trigger, or a bad policy
+    entry). This is a distinct subclass so the review/launch path can degrade a
+    structural-grammar failure to a clean readiness error WITHOUT also swallowing
+    the intake-flow control-signal ``ValueError``s (stale ``answers_hash``,
+    round mismatch, ...) that must propagate to the caller. It remains a
+    ``ValueError`` so existing ``except ValueError`` handlers (e.g.
+    :func:`validate_business_runtime_contract`) keep working unchanged.
+    """
+
+
 def build_business_runtime_contract_draft(
     contract: Optional[Any] = None,
     *,
@@ -3159,7 +3189,10 @@ def build_business_runtime_contract_draft(
     intake_answers: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Return a normalized launch contract seeded from a rough owner goal."""
-    draft = normalize_board_operating_contract(contract)
+    try:
+        draft = normalize_board_operating_contract(contract)
+    except ValueError as exc:
+        raise ContractNormalizationError(str(exc)) from exc
     rough = str(rough_goal or "").strip()
     objective = draft.get("objective") if isinstance(draft.get("objective"), dict) else {}
     if rough and not str(objective.get("statement") or "").strip():
@@ -4134,17 +4167,60 @@ def _review_business_launch_contract_unlocked(
         normed_for_intake = _normalize_board_slug(board)
         if normed_for_intake and board_exists(normed_for_intake):
             base_contract = _metadata_as_business_contract(read_board_metadata(normed_for_intake))
-    draft, readiness = _prepare_business_runtime_contract_for_review(
-        base_contract,
-        rough_goal=rough_goal,
-        intake_answers=intake_answers,
-    )
-    if existing_contract_for_intake is not None and contract is not None:
-        draft = _reconcile_launch_intake_draft_with_existing(
-            draft,
-            existing_contract_for_intake,
+    try:
+        draft, readiness = _prepare_business_runtime_contract_for_review(
+            base_contract,
+            rough_goal=rough_goal,
+            intake_answers=intake_answers,
         )
-        draft, readiness = _finalize_business_runtime_contract_for_review(draft)
+        if existing_contract_for_intake is not None and contract is not None:
+            draft = _reconcile_launch_intake_draft_with_existing(
+                draft,
+                existing_contract_for_intake,
+            )
+            draft, readiness = _finalize_business_runtime_contract_for_review(draft)
+    except ContractNormalizationError as exc:
+        # Normalization rejected the contract outright (e.g. a malformed
+        # workflow stage exit_criteria, an invalid trigger, or a bad policy
+        # entry). ``validate_business_runtime_contract`` already degrades such
+        # input to a structured ``{ok: False, status: "invalid", errors: [...]}``
+        # result; the review/launch path must do the same instead of crashing
+        # the operator with a raw traceback. Leave board state completely
+        # untouched -- a contract too malformed to even normalize must be fixed
+        # before it can create or mutate a board.
+        normed_existing = _normalize_board_slug(board) if board else None
+        current_phase = "contract_review"
+        if normed_existing and board_exists(normed_existing):
+            current_phase = normalize_board_launch_phase(
+                read_board_metadata(normed_existing).get("launch_phase"),
+                default="active",
+            )
+        readiness = {
+            "ok": False,
+            "status": "invalid",
+            "errors": [str(exc)],
+            "warnings": [],
+            "missing": ["contract"],
+            "questions": ["Can you fix the contract so it matches the launch grammar?"],
+            "assumptions": [],
+            "requires_owner_review": False,
+            "owner_summary": None,
+        }
+        return {
+            "ok": False,
+            "status": "invalid",
+            "launch_phase": current_phase,
+            "launch_review_id": None,
+            "approval": None,
+            "contract": None,
+            "readiness": readiness,
+            "questions": readiness["questions"],
+            "readiness_questions": readiness["questions"],
+            "launch_intake": None,
+            "assumptions": [],
+            "owner_summary": None,
+            "board": None,
+        }
     readiness_questions = _string_list(readiness.get("questions"))
     review_questions = _launch_review_questions(draft, readiness)
     phase = "active" if approve and readiness.get("ok") else "contract_review"
