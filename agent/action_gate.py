@@ -140,13 +140,27 @@ def _ensure_queue_db() -> sqlite3.Connection:
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
                 session_id TEXT,
-                task_id TEXT
+                task_id TEXT,
+                notified INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_pending_status
                 ON pending_actions(status, created_at);
             CREATE INDEX IF NOT EXISTS idx_pending_profile
                 ON pending_actions(profile, status);
         """)
+        # Additive migration for DBs created before the `notified` column
+        # existed. The gateway action-gate watcher (gateway/run.py) uses
+        # this flag to avoid re-sending an inline-keyboard card for a row
+        # it already notified the owner about. Idempotent across races:
+        # a concurrent connection that already added the column makes this
+        # raise "duplicate column name", which we swallow.
+        try:
+            conn.execute(
+                "ALTER TABLE pending_actions ADD COLUMN notified INTEGER NOT NULL DEFAULT 0"
+            )
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
     return conn
 
 
@@ -491,6 +505,16 @@ def _escalate_to_human(
     while time.monotonic() < deadline:
         time.sleep(2)
 
+        # Activity heartbeat: a human can take minutes to respond to an
+        # escalation, and this worker is blocked synchronously in this
+        # poll loop the whole time. Without a heartbeat the dispatcher's
+        # inactivity watchdog could reclaim an actively-waiting worker as
+        # stale (#31752). `heartbeat_current_worker_from_env()` is a no-op
+        # when not a dispatcher-spawned worker (no HERMES_KANBAN_TASK env),
+        # is rate-limited internally, and never raises — so this stays
+        # fully non-breaking for non-kanban escalations.
+        _heartbeat_during_wait()
+
         # Check file-based decision (HumanlessAI app)
         approved_file = approved_dir / f"{action_id}.yaml"
         denied_file = denied_dir / f"{action_id}.yaml"
@@ -557,6 +581,23 @@ def _escalate_to_human(
     )
 
 
+def _heartbeat_during_wait() -> None:
+    """Bump the kanban worker heartbeat while blocked waiting for a human.
+
+    Best-effort bridge to ``tools.kanban_tools.heartbeat_current_worker_from_env``.
+    That function is identity-driven entirely off env vars
+    (``HERMES_KANBAN_TASK`` etc.), is rate-limited internally, and is a
+    no-op when this process was not spawned by the kanban dispatcher.
+    Any failure (import error on a niche surface, transient DB lock) is
+    swallowed so it never breaks the escalation poll loop.
+    """
+    try:
+        from tools.kanban_tools import heartbeat_current_worker_from_env
+        heartbeat_current_worker_from_env()
+    except Exception:
+        pass
+
+
 def _update_db_decision(db_id: int, decision: str, decided_by: str) -> None:
     """Update the SQLite record with the decision."""
     if not db_id:
@@ -573,6 +614,64 @@ def _update_db_decision(db_id: int, decision: str, decided_by: str) -> None:
         conn.close()
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Notification queue API (called by the gateway action-gate watcher)
+# ---------------------------------------------------------------------------
+
+def fetch_unnotified_pending() -> list[dict]:
+    """Return pending actions that have not yet been pushed to the owner.
+
+    Used by the gateway's action-gate watcher to render an inline-keyboard
+    card per new escalation exactly once. A row qualifies when
+    ``status='pending'`` and ``notified=0``. Rows are returned oldest-first
+    so cards arrive in submission order.
+
+    Read-only and defensive: returns ``[]`` on any error (missing DB,
+    transient lock) so a watcher tick never crashes on it.
+    """
+    try:
+        conn = _ensure_queue_db()
+        try:
+            rows = conn.execute(
+                """SELECT id, profile, tool_name, tool_args, description,
+                          classification, created_at, expires_at,
+                          session_id, task_id
+                   FROM pending_actions
+                   WHERE status='pending' AND COALESCE(notified, 0) = 0
+                   ORDER BY created_at ASC, id ASC""",
+            ).fetchall()
+        finally:
+            conn.close()
+        return [dict(row) for row in rows]
+    except Exception as e:
+        _log.debug("fetch_unnotified_pending failed: %s", e)
+        return []
+
+
+def mark_notified(action_id: int) -> bool:
+    """Flag a pending action as having had its owner card delivered.
+
+    Returns True if a row was updated. Idempotent: re-marking an
+    already-notified row simply changes nothing and returns False, which
+    is how the watcher's dedup converges. Best-effort — swallows errors.
+    """
+    try:
+        conn = _ensure_queue_db()
+        try:
+            conn.execute(
+                "UPDATE pending_actions SET notified=1 WHERE id=?",
+                (action_id,),
+            )
+            conn.commit()
+            changed = conn.total_changes > 0
+        finally:
+            conn.close()
+        return changed
+    except Exception as e:
+        _log.debug("mark_notified failed: %s", e)
+        return False
 
 
 # ---------------------------------------------------------------------------
