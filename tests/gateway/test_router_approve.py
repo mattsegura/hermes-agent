@@ -278,6 +278,34 @@ async def test_approve_command_launches_and_binds(fresh_home):
 
 
 @pytest.mark.asyncio
+async def test_approve_message_shows_owner_summary(fresh_home):
+    """The /approve confirmation renders the deterministic owner summary.
+
+    The owner must see WHAT just went live (pipeline + approval boundary), not
+    just "phase: active" -- so the gateway renders the shared contract summary.
+    """
+    _draft_board("land-wholesaling")
+    runner = _make_runner()
+    out = await runner._handle_approve_command(_make_event("/approve land-wholesaling"))
+    # Explicit activation confirmation is preserved.
+    assert "active" in out.lower()
+    # …and the structured summary is appended.
+    assert "Pipeline" in out
+    assert "approval" in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_bare_approve_pending_list_shows_one_liner(fresh_home):
+    """`/approve` with a pending board shows a one-line shape per board."""
+    _draft_board("land-wholesaling")
+    runner = _make_runner()
+    out = await runner._handle_approve_command(_make_event("/approve"))
+    assert "land-wholesaling" in out
+    # The one-liner carries the arrowed pipeline so the owner sees the shape.
+    assert "→" in out
+
+
+@pytest.mark.asyncio
 async def test_approve_nonexistent_board_refuses(fresh_home):
     runner = _make_runner()
     out = await runner._handle_approve_command(_make_event("/approve ghost-board"))

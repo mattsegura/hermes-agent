@@ -14423,11 +14423,26 @@ class GatewayRunner:
                     pending.append(slug)
             if not pending:
                 return ""
-            listing = ", ".join(f"`{s}`" for s in sorted(pending))
-            return (
-                "\n\nBoards drafted and awaiting launch — approve with "
-                f"`/approve <board>`: {listing}"
-            )
+            try:
+                from hermes_cli.kanban_launch_summary import render_contract_one_liner
+            except Exception:
+                render_contract_one_liner = None  # type: ignore[assignment]
+            lines = ["\n\nBoards drafted and awaiting launch — approve with `/approve <board>`:"]
+            for slug in sorted(pending):
+                one_liner = ""
+                if render_contract_one_liner is not None:
+                    try:
+                        contract = kb._metadata_as_business_contract(
+                            kb.read_board_metadata(slug)
+                        )
+                        one_liner = render_contract_one_liner(contract)
+                    except Exception:
+                        one_liner = ""
+                if one_liner:
+                    lines.append(f"• `{slug}` — {one_liner}")
+                else:
+                    lines.append(f"• `{slug}`")
+            return "\n".join(lines)
         except Exception:
             return ""
 
@@ -14549,20 +14564,36 @@ class GatewayRunner:
             "\nBound profiles: " + ", ".join(f"`{p}`" for p in bound)
             if bound else ""
         )
-        owner_summary = ""
-        summary = result.get("owner_summary")
-        if isinstance(summary, dict):
-            owner_summary = str(summary.get("summary") or "").strip()
-        elif isinstance(summary, str):
-            owner_summary = summary.strip()
-        summary_line = f"\n{owner_summary}" if owner_summary else ""
+        # Prefer the deterministic, structured owner summary (pipeline, watchers,
+        # knobs, approval boundaries) so the owner sees exactly what just went
+        # live; fall back to the synthesizer's free-text owner_summary string.
+        summary_block = ""
+        result_contract = result.get("contract")
+        if isinstance(result_contract, dict):
+            try:
+                from hermes_cli.kanban_launch_summary import render_owner_contract_summary
+                summary_block = render_owner_contract_summary(
+                    result_contract, board=slug, include_approve_hint=False, active=True
+                )
+            except Exception:
+                logger.debug("owner contract summary render failed", exc_info=True)
+        if not summary_block:
+            owner_summary = ""
+            summary = result.get("owner_summary")
+            if isinstance(summary, dict):
+                owner_summary = str(summary.get("summary") or "").strip()
+            elif isinstance(summary, str):
+                owner_summary = summary.strip()
+            summary_block = owner_summary
 
         logger.info("Owner approved + launched board %s via /approve", slug)
-        return (
+        header = (
             f"✅ Board `{slug}` launched — phase: **active**. "
             "Runtime compiled and profiles bound."
-            f"{bound_line}{summary_line}"
         )
+        if summary_block:
+            return f"{header}{bound_line}\n\n{summary_block}"
+        return f"{header}{bound_line}"
 
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).

@@ -413,6 +413,32 @@ def _extract_launch_answer_assessment(payload: dict[str, Any]) -> Optional[dict[
     return None
 
 
+def _render_owner_contract_summary_for_payload(payload: dict[str, Any]) -> str:
+    """Render a deterministic owner-facing contract summary from a tool result.
+
+    Reads the normalized ``contract`` (and the board slug, when present) off a
+    launch-review result and returns the shared, human-legible Markdown summary.
+    Best-effort: any failure (missing/partial contract, import error) returns an
+    empty string so the caller falls back to the model-authored summary rather
+    than breaking the tool result.
+    """
+    contract = payload.get("contract")
+    if not isinstance(contract, dict):
+        return ""
+    board_slug = None
+    board_meta = payload.get("board")
+    if isinstance(board_meta, dict):
+        board_slug = board_meta.get("slug")
+    try:
+        from hermes_cli.kanban_launch_summary import render_owner_contract_summary
+        return render_owner_contract_summary(
+            contract, board=board_slug, include_approve_hint=True, active=False
+        )
+    except Exception:
+        logger.debug("owner contract summary render failed", exc_info=True)
+        return ""
+
+
 def _attach_launch_intake_followup(payload: dict[str, Any]) -> None:
     """Tell the model what to say next after a launch-intake tool call."""
     questions = payload.get("questions")
@@ -430,22 +456,32 @@ def _attach_launch_intake_followup(payload: dict[str, Any]) -> None:
             )
         )
         if intake_state == "ready_for_owner_review" and answer_sufficient:
-            payload["assistant_next_action"] = {
+            owner_summary_text = _render_owner_contract_summary_for_payload(payload)
+            next_action = {
                 "type": "launch_contract_owner_review",
                 "required": True,
                 "must_show_owner_review_now": True,
                 "instruction": (
-                    "Your next assistant response must summarize the drafted board operating "
-                    "contract for owner review in plain language. State that the board is still "
-                    "in contract_review, dispatch is disabled, and owner approval is required "
+                    "Your next assistant response must show the owner the drafted board "
+                    "operating contract in plain language. A deterministic, owner-ready "
+                    "summary is provided in this result as 'owner_contract_summary' -- relay "
+                    "it (you may lightly adjust tone, but keep every section: pipeline, what "
+                    "it watches, what needs approval, the auto-tunable dials, and the "
+                    "/approve call to action). State that the board is still in "
+                    "contract_review, dispatch is disabled, and owner approval is required "
                     "before activation. Do not call intake_answers again. Do not approve or "
                     "activate launch."
                 ),
                 "response_style": (
-                    "Keep it owner-facing and concise. Include the outcome, allowed work, "
-                    "approval boundaries, proof, and stop conditions."
+                    "Keep it owner-facing and concise. Prefer the provided "
+                    "owner_contract_summary over re-deriving your own; never dump raw "
+                    "contract JSON to the owner."
                 ),
             }
+            if owner_summary_text:
+                next_action["owner_contract_summary"] = owner_summary_text
+                payload["owner_contract_summary"] = owner_summary_text
+            payload["assistant_next_action"] = next_action
             return
     server_orchestrated = False
     if isinstance(intake, dict):

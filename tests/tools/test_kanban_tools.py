@@ -870,6 +870,17 @@ def test_business_launch_review_tool_returns_owner_review_action_for_clear_answe
     assert payload["assistant_next_action"]["type"] == "launch_contract_owner_review"
     assert "Do not call intake_answers again" in payload["assistant_next_action"]["instruction"]
 
+    # The launch-review result must carry a deterministic, owner-ready summary so
+    # the Telegram relay is grounded and never a JSON dump. The next-action must
+    # tell the model to relay it and never to dump raw contract JSON.
+    summary = payload.get("owner_contract_summary")
+    assert isinstance(summary, str) and summary.strip()
+    assert "/approve clear-answer-tool" in summary
+    assert "contract review" in summary.lower()
+    assert payload["assistant_next_action"]["owner_contract_summary"] == summary
+    assert "owner_contract_summary" in payload["assistant_next_action"]["instruction"]
+    assert "never dump raw" in payload["assistant_next_action"]["response_style"]
+
 
 def test_business_launch_review_tool_requires_approval_token(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
