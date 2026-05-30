@@ -2011,6 +2011,7 @@ def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.Completed
     )
 
 
+@pytest.mark.slow  # every method spawns a real `python -m hermes_cli.main` subprocess
 class TestCLI:
     def test_boards_list_default_only(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}

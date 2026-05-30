@@ -2558,7 +2558,7 @@ def test_latest_summary_returns_summary_after_complete(kanban_home):
         assert kb.latest_summary(conn, t) == handoff
 
 
-def test_latest_summary_picks_newest_when_multiple_runs(kanban_home):
+def test_latest_summary_picks_newest_when_multiple_runs(kanban_home, monkeypatch):
     """When a task has been re-run (block → unblock → complete), the
     newest run's summary wins. We unblock to take the task back to
     ``ready``, then complete a second time and verify the second
@@ -2573,9 +2573,14 @@ def test_latest_summary_picks_newest_when_multiple_runs(kanban_home):
             "UPDATE tasks SET status='ready', completed_at=NULL WHERE id=?",
             (t,),
         )
-        # Sleep 1s so the second run's ended_at is provably later than
-        # the first (complete_task uses int(time.time())).
-        time.sleep(1.05)
+        # Advance the clock the runtime reads instead of sleeping a real
+        # second: complete_task stamps ended_at = int(time.time()), so a
+        # forward clock jump makes the second run's ended_at provably later
+        # than the first while keeping the test instant. Capture the real
+        # clock first — kb.time is the shared stdlib module, so the lambda
+        # must not call the (now patched) time.time or it self-recurses.
+        _real_time = time.time
+        monkeypatch.setattr(kb.time, "time", lambda: int(_real_time()) + 5)
         kb.complete_task(conn, t, summary="second attempt — final")
         assert kb.latest_summary(conn, t) == "second attempt — final"
 
@@ -2963,6 +2968,7 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
     assert argv == [sys.executable, "-m", "hermes_cli.main"]
 
 
+@pytest.mark.slow  # spawns a real `python -m hermes_cli.main` subprocess
 def test_resolve_hermes_argv_module_actually_runs():
     """The fallback module name must be importable + runnable.
 

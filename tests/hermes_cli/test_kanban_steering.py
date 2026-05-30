@@ -436,6 +436,7 @@ def _cli(args: list[str], hermes_home: Path, *, board: str) -> subprocess.Comple
     )
 
 
+@pytest.mark.slow  # spawns real `python -m hermes_cli.main` subprocesses
 def test_cli_steer_open_send_list_show(fresh_home):
     _activate_board("cliboard", _base_contract())
 

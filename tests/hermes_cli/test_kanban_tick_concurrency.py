@@ -36,6 +36,7 @@ _TICK_WORKER = textwrap.dedent(
 )
 
 
+@pytest.mark.slow  # launches real worker subprocesses to exercise cross-process flock
 @pytest.mark.skipif(os.name == "nt", reason="flock-based serialization is POSIX-only")
 def test_two_processes_ticking_one_timer_fire_exactly_once(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"

@@ -91,6 +91,7 @@ def test_pixel_event_evidence_allows_complete(kanban_home: Path) -> None:
         assert kb.get_task(conn, task_id).status == "done"
 
 
+@pytest.mark.slow  # spawns real `python -m hermes_cli.main` subprocesses
 def test_cli_pixel_gate_failure_returns_nonzero_then_allows_completion(
     tmp_path: Path,
 ) -> None:
