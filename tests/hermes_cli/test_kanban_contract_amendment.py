@@ -371,6 +371,76 @@ def test_concurrency_N_amendments_mint_in_parallel_exactly_one_wins(fresh_home):
     assert live_default in {4 + i for i in range(N)}
 
 
+def test_validated_but_unminted_amendment_does_not_pin_the_board(fresh_home):
+    """Crash between validate and mint: an amendment left in `validated` must
+    not pin the board or block future mints. A different amendment still mints,
+    and the orphaned one cleanly supersedes on a later mint attempt (CAS)."""
+    contract = _base_contract()
+    _activate_board("crashy", contract)
+
+    # Amendment A reaches `validated` and then we "crash" (never mint it).
+    aid_a = _drive_to_validated("crashy", contract, default=6)
+    with kb.connect(board="crashy") as conn:
+        assert kb.get_contract_amendment(conn, aid_a, board="crashy")["status"] == (
+            kb.AMENDMENT_STATUS_VALIDATED
+        )
+    # Board is still fully operational despite the dangling validated amendment.
+    assert kb.validate_board_launch_readiness("crashy")["ok"] is True
+    assert kb.read_board_metadata("crashy")["contract_version"] == 1
+
+    # A different amendment proposed/validated/minted advances the board.
+    aid_b = _drive_to_validated("crashy", contract, default=9)
+    with kb.connect(board="crashy") as conn:
+        minted = kb.mint_contract_amendment(conn, aid_b, board="crashy")
+        assert minted["status"] == kb.AMENDMENT_STATUS_ACTIVE
+        assert minted["minted_version"] == 2
+
+        # The orphaned validated amendment (base_version 1) now mints into a
+        # CAS conflict -> superseded, not clobbered, no crash.
+        orphan = kb.mint_contract_amendment(conn, aid_a, board="crashy")
+        assert orphan["status"] == kb.AMENDMENT_STATUS_SUPERSEDED
+
+    meta = kb.read_board_metadata("crashy")
+    assert meta["contract_version"] == 2
+    assert meta["business_contract"]["tunables"]["max_nudges"]["default"] == 9
+
+
+def test_reproposing_after_supersede_can_mint_against_fresh_base(fresh_home):
+    """After an amendment is superseded, the owner can re-propose against the
+    current version and mint cleanly -- no orphaned state blocks the new loop."""
+    contract = _base_contract()
+    _activate_board("rebase", contract)
+
+    # Two amendments validated against v1; mint one, the other is superseded.
+    aid_win = _drive_to_validated("rebase", contract, default=6)
+    aid_lose = _drive_to_validated("rebase", contract, default=9)
+    with kb.connect(board="rebase") as conn:
+        kb.mint_contract_amendment(conn, aid_win, board="rebase")
+        lost = kb.mint_contract_amendment(conn, aid_lose, board="rebase")
+        assert lost["status"] == kb.AMENDMENT_STATUS_SUPERSEDED
+    assert kb.read_board_metadata("rebase")["contract_version"] == 2
+
+    # Re-propose against the FRESH current version (2) and mint -> v3. The
+    # superseded amendment in history does not block the new loop.
+    live_contract = kb.read_board_metadata("rebase")["business_contract"]
+    proposed_fresh = _widen_nudges(live_contract, default=8)
+    with kb.connect(board="rebase") as conn:
+        aid_fresh = kb.propose_contract_amendment(
+            conn, board="rebase", origin="optimizer", rationale="rebased",
+            proposed_contract=proposed_fresh,
+        )["amendment_id"]
+        assert kb.get_contract_amendment(conn, aid_fresh, board="rebase")["base_version"] == 2
+    tok2 = _amendment_token("rebase", aid_fresh)
+    with kb.connect(board="rebase") as conn:
+        kb.approve_contract_amendment(conn, aid_fresh, board="rebase", approver="owner", token=tok2)
+        kb.validate_contract_amendment(conn, aid_fresh, board="rebase")
+        minted = kb.mint_contract_amendment(conn, aid_fresh, board="rebase")
+        assert minted["status"] == kb.AMENDMENT_STATUS_ACTIVE
+        assert minted["minted_version"] == 3
+
+    assert kb.read_board_metadata("rebase")["contract_version"] == 3
+
+
 def test_approve_on_stale_base_version_supersedes(fresh_home):
     contract = _base_contract()
     _activate_board("stale", contract)

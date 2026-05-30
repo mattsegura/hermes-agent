@@ -4505,6 +4505,22 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             f"which has no board.json",
             file=sys.stderr,
         )
+    # Advisory (does NOT fail the exit code): role profiles a board's contract
+    # names that carry no explicit kanban_board binding. A daemon launched for
+    # such a profile with no HERMES_KANBAN_BOARD set would hit the fail-loud
+    # GatewayBoardBindingError at start (it refuses to fall through to
+    # 'default'). Surface it here so the operator can SEE/repair the gap before
+    # it bites, with the exact remediation. This is the doctor-visible twin of
+    # the runtime rail — closing the "can I diagnose an unbound daemon?" gap.
+    for rb in binding.get("role_bindings", []):
+        if not rb.get("bound"):
+            print(
+                f"UNBOUND    profile {rb['profile']!r} (role {rb['role']!r} of "
+                f"board {rb['board']!r}) has no kanban_board binding — its "
+                f"daemon would refuse to start. Fix: `hermes kanban boards "
+                f"bind-roles {rb['board']}`.",
+                file=sys.stderr,
+            )
 
     for r in reports:
         slug = r["board"]

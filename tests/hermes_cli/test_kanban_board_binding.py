@@ -291,6 +291,43 @@ def test_in_root_worker_handoff_db_override_unaffected(fresh_home, monkeypatch):
         conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
 
 
+def test_concurrent_profile_binding_writes_never_corrupt_config(fresh_home):
+    """Many concurrent set_profile_board_binding writes on one profile must
+    leave valid YAML with other keys intact and exactly one kanban_board
+    (last-writer-wins) -- the atomic temp+rename write makes this race-safe."""
+    import threading
+    import yaml
+
+    p = kb._profile_config_path("shared-prof")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("model: gpt-4\nsome_setting: keep-me\n")
+    boards = ["board-a", "board-b", "board-c", "board-d"]
+    for b in boards:
+        kb.create_board(b, contract={"objective": {"statement": "x"},
+                                     "runtime": {"mode": "goal",
+                                                 "dispatcher": {"profile": "d"}}})
+    N = 40
+    barrier = threading.Barrier(N)
+
+    def worker(i):
+        barrier.wait()
+        kb.set_profile_board_binding("shared-prof", boards[i % len(boards)])
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    txt = p.read_text()
+    data = yaml.safe_load(txt)  # must parse (never torn / half-written)
+    assert data["model"] == "gpt-4"
+    assert data["some_setting"] == "keep-me"
+    assert txt.count("kanban_board:") == 1
+    assert data["kanban_board"] in set(boards)
+    assert kb.resolve_daemon_board(profile="shared-prof") == data["kanban_board"]
+
+
 def test_corrupt_board_json_flagged_not_orphaned(fresh_home):
     """A truncated/partial-write board.json must be flagged CORRUPT (fail-loud),
     not silently treated as healthy and not misclassified as an orphan."""
@@ -446,6 +483,32 @@ def test_doctor_cli_exit_code_flags_orphan(fresh_home, monkeypatch):
     # After cleanup, healthy again.
     kb.quarantine_orphan_board("ghost-board")
     assert kbc._cmd_doctor(args) == 0
+
+
+def test_doctor_prints_unbound_role_advisory_without_failing(fresh_home, capsys):
+    """An operator must be able to SEE a would-be-unbound daemon (a board role
+    profile with no kanban_board binding) from `kanban doctor` -- the
+    doctor-visible twin of the runtime GatewayBoardBindingError. It is advisory
+    (exit 0); binding the roles clears it."""
+    from hermes_cli import kanban as kbc
+    kb.create_board("biz", contract={
+        "objective": {"statement": "x"},
+        "runtime": {"mode": "goal", "dispatcher": {"profile": "biz-ceo"},
+                    "agents": [{"role": "negotiator", "profile": "biz-negotiator"}]},
+    })
+    args = SimpleNamespace(
+        json=False, all_boards=True, staleness_seconds=kb.TICK_STALENESS_SECONDS,
+    )
+    rc = kbc._cmd_doctor(args)
+    err = capsys.readouterr().err
+    assert "UNBOUND" in err
+    assert "biz-ceo" in err and "biz-negotiator" in err
+    assert rc == 0  # advisory, never fails the bar
+
+    # Binding the roles clears the advisory.
+    kb.bind_contract_roles_to_board("biz")
+    assert kbc._cmd_doctor(args) == 0
+    assert "UNBOUND" not in capsys.readouterr().err
 
 
 def test_doctor_health_clean_when_all_configured(fresh_home):
