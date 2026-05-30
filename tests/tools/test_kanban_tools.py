@@ -19,6 +19,9 @@ LAUNCH_INTAKE_TOOLS = {
     "kanban_business_launch_review",
     "kanban_contract_amendment_propose",
     "kanban_contract_amendment_apply",
+    # Board discovery / routing surface for the reasoning+router front-end.
+    "kanban_list_boards",
+    "kanban_match_board",
 }
 
 FULL_KANBAN_EXECUTION_TOOLS = {
@@ -232,6 +235,8 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_business_launch_review",
         "kanban_contract_amendment_propose",
         "kanban_contract_amendment_apply",
+        "kanban_list_boards",
+        "kanban_match_board",
         "kanban_trigger",
         "kanban_transition",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_watch", "kanban_heartbeat",
@@ -443,6 +448,148 @@ def test_tool_definition_cache_varies_by_hermes_home_without_invalidation(monkey
         if n and n.startswith("kanban_")
     }
     assert profile_kanban == set()
+
+
+# ---------------------------------------------------------------------------
+# Router front-end: board discovery tools + tool boundary
+# ---------------------------------------------------------------------------
+
+def _owner_default_home(monkeypatch, tmp_path):
+    """Isolated default owner profile (router front-end), no worker task."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE_NAME", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(var, raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    return home
+
+
+def test_board_discovery_tools_available_on_default(monkeypatch, tmp_path):
+    """The router front-end (default owner profile) sees the board-discovery tools."""
+    _owner_default_home(monkeypatch, tmp_path)
+    import tools.kanban_tools  # noqa: F401  ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    assert "kanban_list_boards" in names
+    assert "kanban_match_board" in names
+    # They live in the launch-intake toolset → survive the disabled-kanban
+    # carve-out that the router profile relies on.
+    assert registry.get_toolset_for_tool("kanban_list_boards") == "kanban_launch_intake"
+    assert registry.get_toolset_for_tool("kanban_match_board") == "kanban_launch_intake"
+
+
+def test_list_boards_excludes_phantom_default(monkeypatch, tmp_path):
+    """kanban_list_boards must never surface the synthesized phantom default board."""
+    _owner_default_home(monkeypatch, tmp_path)
+    import tools.kanban_tools as kt
+
+    # No boards created → empty, even though list_boards() synthesizes a default.
+    out = json.loads(kt._handle_list_boards({}))
+    assert out["ok"] is True
+    assert out["count"] == 0
+    assert out["boards"] == []
+
+    # Create a real board → it appears; the phantom default stays excluded.
+    from hermes_cli import kanban_db as kb
+    kb.create_board("widget-ops", name="Widget Ops",
+                    description="run the widget production pipeline")
+    out = json.loads(kt._handle_list_boards({}))
+    slugs = {b["slug"] for b in out["boards"]}
+    assert "widget-ops" in slugs
+    assert kb.DEFAULT_BOARD not in slugs
+    assert out["count"] == 1
+
+
+def test_match_board_ranks_candidates_and_excludes_default(monkeypatch, tmp_path):
+    """kanban_match_board ranks real boards by lexical overlap, never the default."""
+    _owner_default_home(monkeypatch, tmp_path)
+    import tools.kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    kb.create_board("land-wholesaling", name="Land Wholesaling",
+                    description="source qualify and negotiate land deals with sellers")
+    kb.create_board("newsletter", name="Newsletter Ops",
+                    description="weekly email content production")
+
+    out = json.loads(kt._handle_match_board(
+        {"goal": "negotiate a land deal with a seller"}
+    ))
+    assert out["ok"] is True
+    slugs = [c["slug"] for c in out["candidates"]]
+    assert kb.DEFAULT_BOARD not in slugs
+    # Best lexical match ranks first.
+    assert out["candidates"][0]["slug"] == "land-wholesaling"
+    assert out["candidates"][0]["match_score"] >= 1
+
+    # Missing goal → error (the tool requires a free-text goal).
+    err = json.loads(kt._handle_match_board({}))
+    assert "error" in err
+
+
+def test_router_boundary_strips_side_effecting_tools(monkeypatch, tmp_path):
+    """Toolset resolution: the router boundary keeps read/reason + board-ops
+    and drops every side-effecting tool."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    enabled = ["web", "file", "clarify", "session_search", "vision", "todo",
+               "skills", "kanban_launch_intake"]
+    disabled = ["terminal", "code_execution", "delegation", "messaging",
+                "cronjob", "kanban", "image_gen", "computer_use"]
+    names = _tool_definition_names(enabled, disabled)
+
+    # Side-effecting tools are stripped from the schema.
+    for gone in ("terminal", "execute_code", "delegate_task", "send_message", "cronjob"):
+        assert gone not in names, f"{gone} should be stripped from the router schema"
+
+    # Read / reason / board-ops tools survive (web_search check_fn can be
+    # environment-flaky on a cold probe, so assert the deterministic ones).
+    assert "read_file" in names
+    assert "session_search" in names
+    assert "kanban_list_boards" in names
+    assert "kanban_match_board" in names
+    assert "kanban_business_launch_review" in names
+
+
+def test_router_action_gate_blocks_writes_and_browser(monkeypatch, tmp_path):
+    """HARD RAIL: the default profile's action gate denies every side-effecting
+    tool while leaving read / reason / board-ops allowed."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "action_gate:\n"
+        "  mode: yolo\n"
+        "  rules:\n"
+        "    blocked_tools:\n"
+        "    - write_file\n"
+        "    - patch\n"
+        "    - terminal\n"
+        "    - execute_code\n"
+        "    - delegate_task\n"
+        "    - send_message\n"
+        "    - cronjob\n"
+        "    - browser_navigate\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from agent.action_gate import check_action_gate
+    for blocked in ("write_file", "patch", "browser_navigate", "execute_code", "send_message"):
+        msg = check_action_gate(blocked, {})
+        assert msg and "BLOCKED" in msg, f"{blocked} must be hard-denied"
+
+    for allowed in ("read_file", "kanban_business_launch_review", "kanban_list_boards", "clarify"):
+        assert check_action_gate(allowed, {}) is None, f"{allowed} must pass the gate"
 
 
 # ---------------------------------------------------------------------------

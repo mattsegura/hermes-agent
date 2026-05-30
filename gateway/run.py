@@ -14226,6 +14226,192 @@ class GatewayRunner:
 
     _APPROVAL_TIMEOUT_SECONDS = 300  # 5 minutes
 
+    # Tool-approval keywords for /approve. Anything else after /approve is
+    # treated as a board slug for board-launch approval (Decision B(ii)).
+    _APPROVE_TOOL_KEYWORDS = frozenset({
+        "all", "session", "ses", "always", "permanent", "permanently",
+    })
+
+    def _parse_approve_board_arg(self, event: MessageEvent) -> Optional[str]:
+        """Return a board slug iff `/approve` carries a board-launch argument.
+
+        `/approve`, `/approve all`, `/approve session`, `/approve always`
+        (and combinations) are the existing dangerous-tool-approval keywords
+        → return None (not a board). Any other leading token is a board slug
+        for an explicit owner launch approval.
+        """
+        try:
+            tokens = event.get_command_args().strip().split()
+        except Exception:
+            return None
+        if not tokens:
+            return None
+        if all(tok.lower() in self._APPROVE_TOOL_KEYWORDS for tok in tokens):
+            return None
+        for tok in tokens:
+            if tok.lower() not in self._APPROVE_TOOL_KEYWORDS:
+                return tok
+        return None
+
+    def _pending_board_launch_summary(self) -> str:
+        """Best-effort list of drafted-but-unlaunched boards awaiting /approve.
+
+        Read-only and never raises — it only enriches the no-pending message
+        so the owner can see what is waiting for `/approve <board>`.
+        """
+        try:
+            from hermes_cli import kanban_db as kb
+            pending: list[str] = []
+            for meta in kb.list_boards(include_archived=False):
+                slug = meta.get("slug")
+                if not slug or slug == kb.DEFAULT_BOARD:
+                    continue
+                phase = str(meta.get("launch_phase") or "").strip().lower()
+                if phase and phase != "active":
+                    pending.append(slug)
+            if not pending:
+                return ""
+            listing = ", ".join(f"`{s}`" for s in sorted(pending))
+            return (
+                "\n\nBoards drafted and awaiting launch — approve with "
+                f"`/approve <board>`: {listing}"
+            )
+        except Exception:
+            return ""
+
+    async def _handle_board_launch_approval(
+        self, board_arg: str, event: MessageEvent
+    ) -> str:
+        """Mint a launch token via explicit owner authority and activate a board.
+
+        HARD RAIL: the one-time launch token is minted ONLY by this
+        human-issued command. ``kanban_db.issue_board_launch_approval_token``
+        refuses to mint unless ``owner_authority_confirmed=True``, which only
+        trusted code (this command path and the interactive CLI) ever sets —
+        it is never reachable from a model tool. The agent can draft, propose,
+        and review a launch, but it can never self-approve. Platform
+        admin-gating on `/approve` (see ``_check_slash_access``) is the trust
+        boundary for "who is the owner".
+        """
+        import time as _time
+        from hermes_cli import kanban_db as kb
+
+        slug = kb._normalize_board_slug(board_arg)
+        if not slug:
+            return f"⛔ `/approve {board_arg}` — not a valid board name."
+        if slug == kb.DEFAULT_BOARD:
+            return (
+                "⛔ The `default` board is not a launchable board. "
+                "Draft a real board via launch intake first."
+            )
+        if not kb.board_exists(slug):
+            return (
+                f"⛔ No board named `{slug}` exists yet — nothing to approve.\n"
+                "The agent must draft one first (it proposes a contract via "
+                f"launch intake), then `/approve {slug}` launches it."
+            )
+
+        try:
+            meta = kb.read_board_metadata(slug)
+            phase = str(meta.get("launch_phase") or "").strip().lower()
+            if phase == "active":
+                return f"✅ Board `{slug}` is already active — nothing to approve."
+            contract = kb._metadata_as_business_contract(meta)
+        except Exception as exc:
+            return f"⛔ Could not read board `{slug}`: {exc}"
+
+        source = event.source
+        platform = (
+            source.platform.value if source and source.platform else "?"
+        )
+        approved_by = (os.environ.get("HERMES_PROFILE") or "owner").strip() or "owner"
+        evidence = {
+            "source": "gateway_owner_approve_command",
+            "platform": platform,
+            "chat_id": getattr(source, "chat_id", None),
+            "user_id": getattr(source, "user_id", None),
+            "command": "/approve",
+            "board": slug,
+            "approved_at": int(_time.time()),
+        }
+
+        # 1) Mint the one-time launch token. owner_authority_confirmed=True is
+        #    the human authority boundary; owner_acknowledged_coverage=True
+        #    because the owner is explicitly approving the drafted contract the
+        #    agent already surfaced to them in chat.
+        try:
+            token = kb.issue_board_launch_approval_token(
+                slug,
+                contract=contract,
+                approved_by=approved_by,
+                approval_evidence=evidence,
+                approval_reason="owner /approve in admin-gated chat",
+                owner_authority_confirmed=True,
+                owner_acknowledged_coverage=True,
+            )["token"]
+        except ValueError as exc:
+            return (
+                f"⛔ Can't approve `{slug}` yet: {exc}\n"
+                "Resolve the missing pieces (ask the agent for the board's "
+                f"launch status), then `/approve {slug}` again."
+            )
+        except Exception as exc:
+            logger.exception("board launch token mint failed for %s", slug)
+            return f"⛔ Approval failed for `{slug}`: {exc}"
+
+        # 2) Activate with the freshly minted token. Activation compiles the
+        #    contract runtime and binds the contract-role profiles to this
+        #    board (both happen server-side inside review_business_launch_contract).
+        try:
+            result = kb.review_business_launch_contract(
+                slug,
+                contract=contract,
+                approve=True,
+                author=approved_by,
+                approved_by=approved_by,
+                approval_evidence=evidence,
+                approval_token=token,
+            )
+        except ValueError as exc:
+            return f"⛔ `{slug}` launch rejected on activation: {exc}"
+        except Exception as exc:
+            logger.exception("board activation failed for %s", slug)
+            return f"⛔ Activation failed for `{slug}`: {exc}"
+
+        result_phase = str(result.get("launch_phase") or "").strip().lower()
+        if result_phase != "active":
+            readiness = result.get("readiness") or {}
+            questions = readiness.get("questions") or []
+            tail = ("\n- " + "\n- ".join(questions)) if questions else ""
+            return (
+                f"⚠️ `{slug}` did not reach active (phase={result_phase}). "
+                f"Readiness: {readiness.get('status')}.{tail}"
+            )
+
+        try:
+            roles = kb.board_role_profiles(slug)
+        except Exception:
+            roles = {}
+        bound = sorted({p for p in roles.values() if p})
+        bound_line = (
+            "\nBound profiles: " + ", ".join(f"`{p}`" for p in bound)
+            if bound else ""
+        )
+        owner_summary = ""
+        summary = result.get("owner_summary")
+        if isinstance(summary, dict):
+            owner_summary = str(summary.get("summary") or "").strip()
+        elif isinstance(summary, str):
+            owner_summary = summary.strip()
+        summary_line = f"\n{owner_summary}" if owner_summary else ""
+
+        logger.info("Owner approved + launched board %s via /approve", slug)
+        return (
+            f"✅ Board `{slug}` launched — phase: **active**. "
+            "Runtime compiled and profiles bound."
+            f"{bound_line}{summary_line}"
+        )
+
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).
 
@@ -14249,6 +14435,18 @@ class GatewayRunner:
         source = event.source
         session_key = self._session_key_for_source(source)
 
+        # ── Board launch approval (Decision B(ii)) — HARD RAIL ─────────────
+        # `/approve <board>` is the OWNER's explicit, human-only authority to
+        # launch a drafted board. The launch token is minted HERE, in the
+        # trusted command path (admin-gated by _check_slash_access), and is
+        # NEVER exposed as a model tool: the agent can draft/propose a launch
+        # but can never self-approve it. A bare `/approve` (no board arg)
+        # keeps its original meaning — resolve a pending dangerous-tool
+        # approval — so the two flows never collide.
+        board_arg = self._parse_approve_board_arg(event)
+        if board_arg is not None:
+            return await self._handle_board_launch_approval(board_arg, event)
+
         from tools.approval import (
             resolve_gateway_approval, has_blocking_approval,
         )
@@ -14257,7 +14455,8 @@ class GatewayRunner:
             if session_key in self._pending_approvals:
                 self._pending_approvals.pop(session_key)
                 return t("gateway.approval_expired")
-            return t("gateway.approve.no_pending")
+            pending = self._pending_board_launch_summary()
+            return t("gateway.approve.no_pending") + (pending or "")
 
         # Parse args: support "all", "all session", "all always", "session", "always"
         args = event.get_command_args().strip().lower().split()
