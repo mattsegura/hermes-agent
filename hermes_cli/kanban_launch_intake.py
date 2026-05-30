@@ -263,6 +263,15 @@ must include every one of these top-level keys:
   knob MUST declare a range or an allowed set. Do NOT expose policy/approval
   boundaries as knobs.}
 - "owner_summary": {"summary","pending_confirmation": true}
+- "needed_capability_types": [ ... ]  OPTIONAL but STRONGLY preferred. A flat
+  list of ABSTRACT capability verbs this goal needs Hermes to be able to do,
+  expressed as "<read|write>:<thing>" strings (e.g. "read:subscription_revenue",
+  "read:install_attribution", "read:product_analytics", "write:ad_spend",
+  "write:store_listing", "write:lifecycle_message", "write:push_message",
+  "read:support_inbox", "write:support_reply"). Describe the CAPABILITY, never a
+  specific vendor/tool -- Hermes maps verbs to concrete integrations downstream.
+  Emit only the verbs the owner's goal actually requires. Omit the key entirely
+  if the goal needs no external systems.
 
 Ground every field in the owner's actual answers. Name the real systems,
 channels, roles, metrics, and stop conditions the owner described. Keep all
