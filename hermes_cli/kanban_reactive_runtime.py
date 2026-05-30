@@ -53,12 +53,24 @@ _INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"<\s*/?\s*(?:system|assistant|user|tool)\s*>", re.I),
     re.compile(r"\[\s*/?\s*(?:system|assistant|user|inst)\s*\]", re.I),
     re.compile(r"```+\s*(?:system|assistant)\b", re.I),
+    # Fake conversational turn boundaries at the START of a line: an attacker
+    # pretending the inbound data is a new chat turn (``Assistant:``, ``Human:``)
+    # or a markdown-header role (``### System:``, ``### Instruction:``). Anchored
+    # to line-start (MULTILINE) so an in-prose ``user: jsmith`` mid-sentence is
+    # left alone; only a leading role label that an LLM might read as a turn
+    # boundary is defanged.
+    re.compile(r"^[ \t>]{0,8}(?:system|assistant|user|human)\s*:", re.I | re.M),
+    re.compile(
+        r"^[ \t>]{0,8}#{1,6}\s*(?:system|assistant|user|instruction|developer)\b[^\n]*",
+        re.I | re.M,
+    ),
 )
 
 # Chat-template / control tokens that must never survive into a prompt verbatim.
 _CONTROL_TOKEN_RE = re.compile(
     r"<\|[^>]{0,64}?\|>"          # <|im_start|>, <|endoftext|>, ...
-    r"|<\s*/?\s*(?:system|assistant|user|tool|s|inst)\s*>",
+    r"|<\s*/?\s*(?:system|assistant|user|tool|s|inst)\s*>"
+    r"|<<\s*/?\s*sys\s*>>",       # Llama-2 system delimiters <<SYS>> / <</SYS>>
     re.I,
 )
 
