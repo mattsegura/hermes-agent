@@ -239,6 +239,31 @@ def test_bind_contract_roles_binds_many_profiles_to_one_board(fresh_home):
     assert res["conflicts"] == []
 
 
+def test_corrupt_board_json_flagged_not_orphaned(fresh_home):
+    """A truncated/partial-write board.json must be flagged CORRUPT (fail-loud),
+    not silently treated as healthy and not misclassified as an orphan."""
+    kb.create_board(
+        "realbiz",
+        contract={"objective": {"statement": "x"},
+                  "runtime": {"mode": "goal", "dispatcher": {"profile": "p-ceo"}}},
+    )
+    meta_path = kb.board_metadata_path("realbiz")
+    assert meta_path.exists()
+    meta_path.write_text('{ "slug": "realbiz", "runtime": {  TRUNCATED')
+
+    # Still "configured" (file present) so it is NOT an orphan ...
+    assert kb.board_is_configured("realbiz") is True
+    assert [o["slug"] for o in kb.scan_orphan_boards()] == []
+    # ... but it IS detected as corrupt.
+    corrupt = kb.scan_corrupt_boards()
+    assert [c["slug"] for c in corrupt] == ["realbiz"]
+    assert corrupt[0]["error"]
+
+    health = kb.board_binding_health()
+    assert health["ok"] is False
+    assert [c["slug"] for c in health["corrupt"]] == ["realbiz"]
+
+
 def test_board_role_profiles_harvests_agents_list(fresh_home):
     """Extra named agents (negotiator/operator) declared under runtime.agents
     must be harvested so every contract-named profile binds to the one board."""

@@ -5595,9 +5595,21 @@ class GatewayRunner:
                 orphan_slugs = {o["slug"] for o in _kb.scan_orphan_boards()}
             except Exception:
                 orphan_slugs = set()
+            try:
+                corrupt_slugs = {c["slug"] for c in _kb.scan_corrupt_boards()}
+            except Exception:
+                corrupt_slugs = set()
             selected: list[dict] = []
             for board_meta in boards:
                 slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                if slug in corrupt_slugs:
+                    logger.warning(
+                        "kanban dispatcher: refusing to dispatch board %s — its "
+                        "board.json won't parse (lost its contract). Restore it "
+                        "from a backup; see `hermes kanban doctor`.",
+                        slug,
+                    )
+                    continue
                 if slug in orphan_slugs:
                     logger.warning(
                         "kanban dispatcher: refusing to dispatch orphan board %s "

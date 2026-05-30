@@ -6404,6 +6404,48 @@ def scan_orphan_boards() -> list[dict]:
     return orphans
 
 
+def scan_corrupt_boards() -> list[dict]:
+    """Return configured boards whose ``board.json`` exists but won't parse.
+
+    A partial write / truncated / hand-corrupted ``board.json`` is the
+    dangerous opposite of an orphan: the board still *looks* configured
+    (:func:`board_is_configured` is True because the file exists) but
+    :func:`read_board_metadata` can only return a stub with ``runtime=None``
+    and a ``metadata_error``. Such a board silently loses its whole
+    contract/runtime — it can't be dispatched correctly and binding can't find
+    its roles — yet nothing else flags it. This is the fail-loud detector so
+    ``kanban doctor`` surfaces it instead of treating the board as healthy.
+
+    Each entry: ``{"slug", "path", "metadata_path", "error"}``.
+    """
+    corrupt: list[dict] = []
+    root = boards_root()
+    if not root.is_dir():
+        return corrupt
+    for child in sorted(root.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir() or child.name in _NON_BOARD_DIRS:
+            continue
+        try:
+            normed = _normalize_board_slug(child.name)
+        except ValueError:
+            continue
+        if not normed or normed == DEFAULT_BOARD:
+            continue
+        meta_path = child / "board.json"
+        if not meta_path.exists():
+            continue
+        meta = read_board_metadata(normed)
+        err = meta.get("metadata_error")
+        if err:
+            corrupt.append({
+                "slug": normed,
+                "path": str(child),
+                "metadata_path": str(meta_path),
+                "error": str(err),
+            })
+    return corrupt
+
+
 def quarantine_orphan_board(slug: str) -> dict:
     """Move an orphan board's directory aside to ``boards/_quarantine/``.
 
@@ -6663,6 +6705,8 @@ def board_binding_health() -> dict:
     Returns ``{"ok", "orphans", "bad_profile_bindings", "role_bindings"}``:
 
     * ``orphans`` — boards with a kanban.db but no board.json. (Fails ``ok``.)
+    * ``corrupt`` — configured boards whose board.json won't parse (partial
+      write / truncation). The board silently lost its contract. (Fails ``ok``.)
     * ``bad_profile_bindings`` — profiles whose ``kanban_board`` points at a
       board that isn't configured. (Fails ``ok``.)
     * ``role_bindings`` — advisory: for each non-default board, the role
@@ -6673,6 +6717,7 @@ def board_binding_health() -> dict:
       operator can SEE which profiles still rely on implicit resolution.
     """
     orphans = scan_orphan_boards()
+    corrupt = scan_corrupt_boards()
     bad_bindings: list[dict] = []
     try:
         from hermes_cli.profiles import list_profiles
@@ -6701,8 +6746,9 @@ def board_binding_health() -> dict:
                 "bound": profile_board_binding(prof) == slug,
             })
     return {
-        "ok": not orphans and not bad_bindings,
+        "ok": not orphans and not corrupt and not bad_bindings,
         "orphans": orphans,
+        "corrupt": corrupt,
         "bad_profile_bindings": bad_bindings,
         "role_bindings": role_bindings,
     }

@@ -4487,6 +4487,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             f"quarantine-orphans` or adopt it",
             file=sys.stderr,
         )
+    for c in binding.get("corrupt", []):
+        print(
+            f"CORRUPT    {c['slug']} (board.json won't parse: {c['error']}) — "
+            f"the board lost its contract; restore board.json from a backup",
+            file=sys.stderr,
+        )
     for bad in binding.get("bad_profile_bindings", []):
         print(
             f"BAD-BIND   profile {bad['profile']!r} -> board {bad['board']!r} "
@@ -4515,11 +4521,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         )
     if binding_unhealthy:
         n_orph = len(binding.get("orphans", []))
+        n_corrupt = len(binding.get("corrupt", []))
         n_bad = len(binding.get("bad_profile_bindings", []))
         print(
             f"\nkanban doctor: board↔profile binding issues — "
-            f"{n_orph} orphan board(s), {n_bad} bad binding(s). "
-            f"See messages above.",
+            f"{n_orph} orphan board(s), {n_corrupt} corrupt board.json, "
+            f"{n_bad} bad binding(s). See messages above.",
             file=sys.stderr,
         )
     if stale or binding_unhealthy:
