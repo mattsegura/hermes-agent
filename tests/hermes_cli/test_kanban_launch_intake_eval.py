@@ -63,9 +63,12 @@ def _universal_contract(fixture: dict) -> dict:
 
 def test_fixtures_present():
     assert FIXTURES, "expected launch-intake fixtures to be discovered"
+    # All four marquee golden domains must be present and exercised by the
+    # parametrized invariant + simulation + coverage ratchet below.
     assert "land_wholesaling" in FIXTURE_IDS
     assert "research_team" in FIXTURE_IDS
     assert "insurance_recruiting" in FIXTURE_IDS
+    assert "grow_app_one_week" in FIXTURE_IDS
 
 
 @pytest.mark.parametrize("fixture", FIXTURES, ids=FIXTURE_IDS)

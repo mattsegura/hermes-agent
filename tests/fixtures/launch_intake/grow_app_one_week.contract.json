@@ -315,153 +315,138 @@
     "stages": [
       {
         "key": "day_0_baseline_and_instrumentation_check",
+        "label": "Day 0: baseline and instrumentation",
+        "allowed_lifecycle_states": ["todo", "ready", "running"],
         "actions": [
-          "Capture baseline active paying subscribers from Stripe: current target baseline is 200.",
-          "Capture baseline MRR from Stripe: current target baseline is $4,000.",
-          "Capture baseline funnel in Mixpanel: installs, activation rate around 30%, paid trial start rate around 4%, and trial-to-paid conversion around 50%.",
-          "Create or verify daily Mixpanel dashboard for installs, activation, trial starts, paid conversions, active paid subscribers, MRR proxy, and source/platform cohorts.",
-          "Create hard-stop tracker for $2,000/month ad cap, $50/day approval threshold, 30% discount limit, no health claims, and no under-18 targeting."
+          {"key": "capture_subscriber_baseline", "label": "Capture baseline active paying subscribers from Stripe (baseline 200).", "side_effect_class": "none"},
+          {"key": "capture_mrr_baseline", "label": "Capture baseline MRR from Stripe (baseline $4,000).", "side_effect_class": "none"},
+          {"key": "capture_funnel_baseline", "label": "Capture baseline Mixpanel funnel: installs, ~30% activation, ~4% trial start, ~50% trial-to-paid.", "side_effect_class": "none"},
+          {"key": "build_daily_dashboard", "label": "Create or verify the daily Mixpanel dashboard for installs, activation, trials, conversions, subscribers, MRR proxy, and cohorts.", "side_effect_class": "internal"},
+          {"key": "build_hard_stop_tracker", "label": "Create the hard-stop tracker for the $2,000/month cap, $50/day threshold, 30% discount limit, no health claims, and no under-18 targeting.", "side_effect_class": "internal"}
         ],
-        "exit_criteria": {
-          "criteria": [
-            "Baseline subscriber, MRR, and funnel metrics are recorded.",
-            "Daily dashboard is available for owner review.",
-            "Approval gates and hard stops are visible to all workers."
-          ],
-          "evidence_required": [
-            "Stripe snapshot showing active paying subscribers and MRR",
-            "Mixpanel dashboard link or screenshot",
-            "baseline funnel table",
-            "hard-stop checklist"
-          ]
-        }
+        "exit_criteria": [
+          {
+            "transition": "day_1_prioritize_growth_bets",
+            "evidence_required": [
+              "stripe_revenue_snapshot",
+              "mixpanel_dashboard_evidence",
+              "baseline_funnel_table",
+              "hard_stop_checklist"
+            ]
+          }
+        ]
       },
       {
         "key": "day_1_prioritize_growth_bets",
+        "label": "Day 1: prioritize growth bets",
+        "allowed_lifecycle_states": ["ready", "running"],
         "actions": [
-          "Analyze Mixpanel activation drop-off by platform, source, first session behavior, and exposure to streaks, smart nudges, and weekly AI coaching.",
-          "Analyze trial-start drop-off and trial-to-paid cohorts by source and platform.",
-          "Identify the top 3 fastest opportunities likely to move activation, trial starts, or MRR within 7 days.",
-          "Draft a ranked sprint plan covering ASO copy, lifecycle emails, paid ads, and pricing or offer experiments.",
-          "Prepare owner approval requests for any mass email, direct user messaging, paid spend above $50/day, or live pricing change."
+          {"key": "analyze_activation_dropoff", "label": "Analyze Mixpanel activation drop-off by platform, source, first session, and feature exposure.", "side_effect_class": "none"},
+          {"key": "analyze_trial_cohorts", "label": "Analyze trial-start drop-off and trial-to-paid cohorts by source and platform.", "side_effect_class": "none"},
+          {"key": "identify_top_opportunities", "label": "Identify the top 3 fastest opportunities likely to move activation, trial starts, or MRR within 7 days.", "side_effect_class": "internal"},
+          {"key": "draft_sprint_plan", "label": "Draft a ranked sprint plan across ASO, lifecycle email, paid ads, and pricing/offer experiments.", "side_effect_class": "internal"},
+          {"key": "prepare_approval_requests", "label": "Prepare owner approval requests for any mass email, direct messaging, spend above $50/day, or live pricing change.", "side_effect_class": "internal"}
         ],
-        "exit_criteria": {
-          "criteria": [
-            "Top growth bets are ranked by expected speed, impact, effort, and approval need.",
-            "No live external side effect is scheduled without approval.",
-            "Each recommended bet has a metric target and stop condition."
-          ],
-          "evidence_required": [
-            "prioritized growth bet table",
-            "Mixpanel segment analysis",
-            "Stripe cohort analysis where relevant",
-            "approval request packet for gated actions"
-          ]
-        }
+        "exit_criteria": [
+          {
+            "transition": "days_1_to_2_asset_drafting_and_approval_queue",
+            "evidence_required": [
+              "prioritized_growth_bet_table",
+              "mixpanel_dashboard_evidence",
+              "stripe_revenue_snapshot",
+              "approval_audit_log"
+            ]
+          }
+        ]
       },
       {
         "key": "days_1_to_2_asset_drafting_and_approval_queue",
+        "label": "Days 1-2: draft assets and queue approvals",
+        "allowed_lifecycle_states": ["ready", "running", "review"],
         "actions": [
-          "Draft App Store and Play Store ASO copy emphasizing habit streaks, smart nudges, weekly AI coaching, and busy professional use cases without health claims.",
-          "Draft Customer.io activation emails for users who installed but did not activate.",
-          "Draft Customer.io trial-start nudges for activated users who have not started paid trial.",
-          "Draft trial-to-paid conversion emails emphasizing consistency, streak protection, smart reminders, and weekly AI coaching value.",
-          "Draft Meta and Google Ads campaign copy and audiences excluding under-18s.",
-          "Draft pricing or discount experiment proposals with discounts at or below 30%.",
-          "Submit approval packets for mass email, direct messaging, ad spend above $50/day, live pricing changes, and store listing publication."
+          {"key": "draft_aso_copy", "label": "Draft App Store and Play Store ASO copy with no health claims.", "side_effect_class": "internal"},
+          {"key": "draft_activation_emails", "label": "Draft Customer.io activation emails for installed-but-not-activated users.", "side_effect_class": "internal"},
+          {"key": "draft_trial_start_nudges", "label": "Draft Customer.io trial-start nudges for activated users who have not started a trial.", "side_effect_class": "internal"},
+          {"key": "draft_conversion_emails", "label": "Draft trial-to-paid conversion emails emphasizing streaks, reminders, and weekly AI coaching value.", "side_effect_class": "internal"},
+          {"key": "draft_paid_campaigns", "label": "Draft Meta and Google Ads campaign copy and audiences excluding under-18s.", "side_effect_class": "internal"},
+          {"key": "draft_pricing_experiments", "label": "Draft pricing or discount experiment proposals with discounts at or below 30%.", "side_effect_class": "internal"},
+          {"key": "submit_approval_packets", "label": "Submit approval packets for mass email, direct messaging, spend above $50/day, live pricing changes, and store listing publication.", "side_effect_class": "internal"}
         ],
-        "exit_criteria": {
-          "criteria": [
-            "All draft assets are complete and compliance-checked.",
-            "Every side-effecting action is either held as draft or has explicit owner approval.",
-            "No draft contains health claims, under-18 targeting, or a discount over 30%."
-          ],
-          "evidence_required": [
-            "ASO draft packet",
-            "Customer.io email drafts",
-            "Intercom or in-app message drafts if proposed",
-            "Meta and Google Ads draft campaign briefs",
-            "pricing experiment brief",
-            "compliance checklist",
-            "owner approval log"
-          ]
-        }
+        "exit_criteria": [
+          {
+            "transition": "days_2_to_5_launch_approved_experiments",
+            "evidence_required": [
+              "aso_draft_packet",
+              "lifecycle_message_log",
+              "campaign_log",
+              "experiment_scorecard",
+              "compliance_checklist",
+              "approval_audit_log"
+            ]
+          }
+        ]
       },
       {
         "key": "days_2_to_5_launch_approved_experiments",
+        "label": "Days 2-5: launch approved experiments",
+        "allowed_lifecycle_states": ["running", "blocked", "review"],
         "actions": [
-          "Launch only owner-approved Customer.io mass emails, Intercom messages, store listing changes, pricing changes, or paid campaigns.",
-          "For paid campaigns, enforce daily spend at or below approved levels and never above the $2,000/month hard cap.",
-          "Monitor Mixpanel activation, trial starts, and trial-to-paid movement by campaign, source, platform, and cohort.",
-          "Monitor Stripe active paying subscribers and MRR at least daily.",
-          "Adjust safe tunables within declared bounds, including follow-up timing, nudge count, trial-start score threshold, budget pacing within approved caps, and experiment sample allocation.",
-          "Stop or escalate any experiment that approaches a hard stop or produces materially negative conversion signals."
+          {"key": "launch_approved_experiments", "label": "Launch only owner-approved Customer.io emails, Intercom messages, store changes, pricing changes, or paid campaigns.", "side_effect_class": "external_reversible"},
+          {"key": "enforce_spend_caps", "label": "Enforce daily spend at or below approved levels and never above the $2,000/month hard cap.", "side_effect_class": "none"},
+          {"key": "monitor_funnel_movement", "label": "Monitor Mixpanel activation, trial starts, and trial-to-paid movement by campaign, source, platform, and cohort.", "side_effect_class": "none"},
+          {"key": "monitor_revenue", "label": "Monitor Stripe active paying subscribers and MRR at least daily.", "side_effect_class": "none"},
+          {"key": "adjust_safe_tunables", "label": "Adjust safe tunables within declared bounds: follow-up timing, nudge count, score threshold, budget pacing, and sample allocation.", "side_effect_class": "internal"},
+          {"key": "stop_or_escalate", "label": "Stop or escalate any experiment that approaches a hard stop or produces materially negative signals.", "side_effect_class": "internal"}
         ],
-        "exit_criteria": {
-          "criteria": [
-            "Approved experiments are live or documented as blocked pending approval.",
-            "Daily metrics show whether each experiment is improving, neutral, or harmful.",
-            "Spend, discounting, claims, and targeting remain within owner boundaries."
-          ],
-          "evidence_required": [
-            "launch log with timestamps",
-            "approval records for each live action",
-            "campaign spend log",
-            "Customer.io send log if emails are approved and sent",
-            "Mixpanel before/after dashboard",
-            "Stripe daily subscriber and MRR snapshot",
-            "stop/escalation log"
-          ]
-        }
+        "exit_criteria": [
+          {
+            "transition": "days_5_to_6_double_down_or_cut",
+            "evidence_required": [
+              "campaign_log",
+              "approval_audit_log",
+              "lifecycle_message_log",
+              "mixpanel_dashboard_evidence",
+              "stripe_revenue_snapshot"
+            ]
+          }
+        ]
       },
       {
         "key": "days_5_to_6_double_down_or_cut",
+        "label": "Days 5-6: double down or cut",
+        "allowed_lifecycle_states": ["running", "blocked", "review"],
         "actions": [
-          "Compare each live experiment against baseline and its primary metric: activation rate, trial-start rate, trial-to-paid conversion, paid subscribers, MRR, CAC, or revenue per user.",
-          "Scale winning paid acquisition only within owner-approved daily spend and the $2,000/month cap.",
-          "Prepare urgent owner approval request if scaling requires more than $50/day ad spend.",
-          "Cut or pause underperforming campaigns, messages, or offers where allowed as a risk-reducing action.",
-          "Draft final 48-hour push assets for the highest-performing lifecycle, ASO, paid, or pricing angle."
+          {"key": "score_experiments", "label": "Compare each live experiment against baseline on its primary metric.", "side_effect_class": "none"},
+          {"key": "scale_winning_campaigns", "label": "Scale winning paid acquisition only within owner-approved daily spend and the $2,000/month cap.", "side_effect_class": "external_reversible"},
+          {"key": "prepare_scale_approval", "label": "Prepare an urgent owner approval request if scaling requires more than $50/day ad spend.", "side_effect_class": "internal"},
+          {"key": "cut_underperformers", "label": "Cut or pause underperforming campaigns, messages, or offers as a risk-reducing action.", "side_effect_class": "external_reversible"},
+          {"key": "draft_final_push", "label": "Draft final 48-hour push assets for the highest-performing angle.", "side_effect_class": "internal"}
         ],
-        "exit_criteria": {
-          "criteria": [
-            "Winners and losers are identified with evidence.",
-            "Recommended scale-up actions stay inside approval gates.",
-            "Final 48-hour plan is ready and approval requests are submitted where needed."
-          ],
-          "evidence_required": [
-            "experiment scorecard",
-            "before/after metric comparison",
-            "CAC and spend analysis",
-            "Stripe MRR and subscriber trend",
-            "owner approval request for any gated scale-up"
-          ]
-        }
+        "exit_criteria": [
+          {
+            "transition": "day_7_final_push_and_closeout",
+            "evidence_required": [
+              "experiment_scorecard",
+              "campaign_log",
+              "stripe_revenue_snapshot",
+              "approval_audit_log"
+            ]
+          }
+        ]
       },
       {
         "key": "day_7_final_push_and_closeout",
+        "label": "Day 7: final push and closeout",
+        "allowed_lifecycle_states": ["review", "done", "archived"],
         "actions": [
-          "Execute only approved final-day actions designed to maximize paid subscriber and MRR lift.",
-          "Verify active paying subscribers and MRR in Stripe.",
-          "Verify final activation, trial-start, and trial-to-paid metrics in Mixpanel.",
-          "Compile final proof packet with before/after metrics, campaign logs, lifecycle send logs, approval logs, and results.",
-          "Deliver final owner summary with target attainment, failed bets, winning bets, and recommended next steps."
+          {"key": "execute_final_actions", "label": "Execute only approved final-day actions to maximize paid subscriber and MRR lift.", "side_effect_class": "external_reversible"},
+          {"key": "verify_revenue", "label": "Verify active paying subscribers and MRR in Stripe.", "side_effect_class": "none"},
+          {"key": "verify_funnel", "label": "Verify final activation, trial-start, and trial-to-paid metrics in Mixpanel.", "side_effect_class": "none"},
+          {"key": "compile_proof_packet", "label": "Compile the final proof packet with before/after metrics, logs, approvals, and results.", "side_effect_class": "internal"},
+          {"key": "deliver_owner_summary", "label": "Deliver the final owner summary with target attainment, failed bets, winning bets, and next steps.", "side_effect_class": "internal"}
         ],
-        "exit_criteria": {
-          "criteria": [
-            "Final subscriber and MRR outcomes are verified.",
-            "All proof artifacts are complete.",
-            "Any missed target is explained by metric bottleneck and experiment outcome."
-          ],
-          "evidence_required": [
-            "final Stripe snapshot",
-            "final Mixpanel dashboard",
-            "before/after funnel table",
-            "campaign and lifecycle logs",
-            "approval log",
-            "final 7-day summary"
-          ]
-        }
+        "terminal": true,
+        "exit_criteria": []
       }
     ]
   },
@@ -851,6 +836,10 @@
   ],
   "side_effect_policy": {
     "allowed": [
+      "none",
+      "internal",
+      "read_only",
+      "draft_only",
       "Analyze Mixpanel funnel, cohort, source, and platform data.",
       "Analyze Stripe active paid subscribers, MRR, trials, conversions, and pricing state in read-only mode.",
       "Draft ASO copy for App Store and Play Store.",
@@ -872,6 +861,8 @@
       "Post, comment, or DM on Instagram or TikTok without owner approval."
     ],
     "approval_required": [
+      "external_reversible",
+      "owner_approved_external_write",
       "Ad spend above $50/day.",
       "Any action that risks approaching the $2,000/month ad spend cap.",
       "Mass email through Customer.io.",
@@ -1018,8 +1009,49 @@
         "best_converting_platform"
       ],
       "controls": "Which platform receives priority in analysis, ASO drafting, lifecycle segmentation, and approved campaign focus based on Mixpanel and Stripe performance."
-    }
+    },
+    "heartbeat_interval_seconds": {"default": 300, "range": [30, 3600]},
+    "stall_timeout_seconds": {"default": 1800, "range": [60, 86400]},
+    "circuit_failure_rate_threshold": {"default": 0.5, "range": [0.1, 1.0]},
+    "circuit_window_seconds": {"default": 3600, "range": [60, 86400]},
+    "circuit_cooldown_seconds": {"default": 600, "range": [30, 86400]},
+    "circuit_min_samples": {"default": 5, "range": [1, 100]},
+    "ad_budget_cap_units": {"default": 2000, "range": [1, 100000]},
+    "ad_rate_limit_per_window": {"default": 50, "range": [1, 10000]},
+    "ad_budget_warn_fraction": {"default": 0.8, "range": [0.1, 1.0]},
+    "ad_budget_window_seconds": {"default": 2592000, "range": [60, 7776000]}
   },
+  "sensors": [
+    {
+      "kind": "heartbeat",
+      "key": "sprint_worker_liveness",
+      "knobs": {
+        "heartbeat_interval": "heartbeat_interval_seconds",
+        "stall_timeout": "stall_timeout_seconds"
+      }
+    },
+    {
+      "kind": "circuit_breaker",
+      "key": "external_launch_dispatch",
+      "gates_side_effect_class": "external_reversible",
+      "knobs": {
+        "failure_rate_threshold": "circuit_failure_rate_threshold",
+        "window": "circuit_window_seconds",
+        "cooldown": "circuit_cooldown_seconds",
+        "min_samples": "circuit_min_samples"
+      }
+    },
+    {
+      "kind": "budget",
+      "key": "paid_ad_spend",
+      "knobs": {
+        "budget_cap": "ad_budget_cap_units",
+        "rate_limit": "ad_rate_limit_per_window",
+        "warn_fraction": "ad_budget_warn_fraction",
+        "window": "ad_budget_window_seconds"
+      }
+    }
+  ],
   "owner_summary": {
     "summary": "This contract runs a 7-day high-speed growth sprint for the habit-tracking mobile app to move from 200 to 600 active paying subscribers and from $4,000 to $12,000 MRR. The board may analyze Mixpanel and Stripe, draft ASO, lifecycle, ad, social, Intercom, and pricing experiments, and optimize safe tunables. All major external side effects remain gated: ad spend above $50/day, any mass email, direct user messaging, live pricing changes, store listing publication, discounts, and social posting require owner approval. Hard stops are no health claims, never target under-18s, no discounts over 30%, and no ad spend above $2,000/month. Daily proof must include a summary, Mixpanel dashboard evidence, before/after metrics, campaign logs, and results.",
     "pending_confirmation": true

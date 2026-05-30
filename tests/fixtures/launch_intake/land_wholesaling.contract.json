@@ -62,6 +62,17 @@
       }
     },
     "require_worker_envelopes": true,
+    "require_provider_policy": true,
+    "provider_policy": {
+      "context_sources": {
+        "allowed": ["county_parcel_records", "gis_portals", "skip_trace_provider", "comps_data", "land_crm"],
+        "requires_owner_approval_for_new_sources": true
+      },
+      "external_side_effects": {
+        "allowed_after": "explicit owner approval",
+        "forbidden_without_approval": ["outbound_sms", "outbound_email", "phone_call", "payment_or_spend", "contract_or_offer_commitment"]
+      }
+    },
     "tool_policy": {
       "outbound_sms": {
         "allowed": false,
@@ -223,15 +234,18 @@
         "actions": [
           {
             "key": "lead_research",
-            "label": "Find candidate vacant-land sellers"
+            "label": "Find candidate vacant-land sellers",
+            "side_effect_class": "none"
           },
           {
             "key": "list_build",
-            "label": "Build lead batch artifact"
+            "label": "Build lead batch artifact",
+            "side_effect_class": "none"
           },
           {
             "key": "source_leads",
-            "label": "Source lead batches"
+            "label": "Source lead batches",
+            "side_effect_class": "none"
           }
         ],
         "exit_criteria": [
@@ -259,31 +273,38 @@
         "actions": [
           {
             "key": "skip_trace",
-            "label": "Find owner contact paths"
+            "label": "Find owner contact paths",
+            "side_effect_class": "none"
           },
           {
             "key": "parcel_verify",
-            "label": "Verify parcel facts and constraints"
+            "label": "Verify parcel facts and constraints",
+            "side_effect_class": "none"
           },
           {
             "key": "comp_search",
-            "label": "Estimate value and offer range"
+            "label": "Estimate value and offer range",
+            "side_effect_class": "none"
           },
           {
             "key": "find_contact_info",
-            "label": "Find contact info / skip trace"
+            "label": "Find contact info / skip trace",
+            "side_effect_class": "none"
           },
           {
             "key": "research_and_score",
-            "label": "Research and score parcel opportunity"
+            "label": "Research and score parcel opportunity",
+            "side_effect_class": "none"
           },
           {
             "key": "enrich_due_diligence",
-            "label": "Enrich due-diligence facts"
+            "label": "Enrich due-diligence facts",
+            "side_effect_class": "none"
           },
           {
             "key": "resolve_skip_trace",
-            "label": "Resolve missing skip-trace data"
+            "label": "Resolve missing skip-trace data",
+            "side_effect_class": "none"
           }
         ],
         "exit_criteria": [
@@ -313,25 +334,26 @@
         "actions": [
           {
             "key": "outreach_prep",
-            "label": "Prepare message and offer posture"
+            "label": "Prepare message and offer posture",
+            "side_effect_class": "internal"
           },
           {
             "key": "initial_outreach",
-            "label": "Send first business-channel touch"
+            "label": "Send first business-channel touch",
+            "side_effect_class": "external_reversible"
           },
           {
             "key": "channel_readiness",
-            "label": "Verify business-channel readiness"
+            "label": "Verify business-channel readiness",
+            "side_effect_class": "none"
           }
         ],
         "triggers": [
           {
-            "type": "outbound_sms",
-            "channel": "infobip"
-          },
-          {
-            "type": "inbound_sms",
-            "channel": "infobip"
+            "kind": "state_change",
+            "detail": "lead becomes ready for first owner-approved outreach",
+            "type": "state_change",
+            "reason": "ready_for_contact"
           }
         ],
         "exit_criteria": [
@@ -381,15 +403,18 @@
         "actions": [
           {
             "key": "seller_reply",
-            "label": "Handle inbound seller reply"
+            "label": "Handle inbound seller reply",
+            "side_effect_class": "internal"
           },
           {
             "key": "follow_up_drip",
-            "label": "Continue approved follow-up sequence"
+            "label": "Continue approved follow-up sequence",
+            "side_effect_class": "external_reversible"
           },
           {
             "key": "offer",
-            "label": "Make or revise offer"
+            "label": "Make or revise offer",
+            "side_effect_class": "external_reversible"
           }
         ],
         "triggers": [
@@ -443,19 +468,23 @@
         "actions": [
           {
             "key": "contract_prep",
-            "label": "Prepare purchase agreement"
+            "label": "Prepare purchase agreement",
+            "side_effect_class": "internal"
           },
           {
             "key": "seller_signature",
-            "label": "Get seller signature"
+            "label": "Get seller signature",
+            "side_effect_class": "external_reversible"
           },
           {
             "key": "title_due_diligence",
-            "label": "Verify closing constraints"
+            "label": "Verify closing constraints",
+            "side_effect_class": "none"
           },
           {
             "key": "title_search",
-            "label": "Search title and ownership constraints"
+            "label": "Search title and ownership constraints",
+            "side_effect_class": "none"
           }
         ],
         "exit_criteria": [
@@ -485,17 +514,21 @@
         "actions": [
           {
             "key": "buyer_assignment",
-            "label": "Find/assign buyer"
+            "label": "Find/assign buyer",
+            "side_effect_class": "internal"
           },
           {
             "key": "title_close",
-            "label": "Coordinate closing"
+            "label": "Coordinate closing",
+            "side_effect_class": "external_reversible"
           },
           {
             "key": "payout",
-            "label": "Record closed deal outcome"
+            "label": "Record closed deal outcome",
+            "side_effect_class": "none"
           }
         ],
+        "terminal": true,
         "exit_criteria": [],
         "substates": [],
         "triggers": []
@@ -533,27 +566,33 @@
         "actions": [
           {
             "key": "metrics_refresh",
-            "label": "Refresh live board metrics and health"
+            "label": "Refresh live board metrics and health",
+            "side_effect_class": "none"
           },
           {
             "key": "repair_worker",
-            "label": "Repair worker/runtime capability"
+            "label": "Repair worker/runtime capability",
+            "side_effect_class": "internal"
           },
           {
             "key": "dispatcher_clean_restart",
-            "label": "Cleanly restart dispatcher/runtime"
+            "label": "Cleanly restart dispatcher/runtime",
+            "side_effect_class": "internal"
           },
           {
             "key": "wait_for_dependency",
-            "label": "Wait/wake on dependency readiness"
+            "label": "Wait/wake on dependency readiness",
+            "side_effect_class": "none"
           }
         ],
         "triggers": [
           {
+            "kind": "state_change",
             "type": "system_event",
             "reason": "health_or_recovery"
           },
           {
+            "kind": "timer",
             "type": "timer",
             "reason": "dependency_check"
           }
@@ -561,5 +600,108 @@
         "exit_criteria": []
       }
     ]
+  },
+  "entities": [
+    {
+      "key": "prospect",
+      "type": "land_seller_lead",
+      "states": ["new", "sourced", "qualified", "contacted", "negotiating", "under_contract", "closed", "dead", "recycled"],
+      "terminal_states": ["closed", "dead", "recycled"]
+    }
+  ],
+  "event_loops": [
+    {
+      "type": "seller_negotiation_loop",
+      "entity": "prospect",
+      "triggers": ["seller_reply", "follow_up_timer", "owner_check_in"],
+      "terminal_states": ["under_contract", "dead", "recycled"],
+      "stop_conditions": [
+        "seller accepts the offer and a purchase contract is signed",
+        "seller hard-declines or the parcel is not viable so the lead is marked dead",
+        "seller stops responding after the maximum follow-up nudges so the lead is recycled",
+        "owner kills or pauses the lead"
+      ]
+    }
+  ],
+  "tunables": {
+    "follow_up_interval_hours": {"default": 72, "range": [12, 240]},
+    "max_nudges": {"default": 4, "range": [0, 10]},
+    "ghost_timeout_days": {"default": 21, "range": [7, 60]},
+    "offer_to_arv_ratio_pct": {"default": 55, "range": [20, 90]},
+    "monthly_contract_target": {"default": 4, "min": 1, "max": 100},
+    "heartbeat_interval_seconds": {"default": 300, "range": [30, 3600]},
+    "stall_timeout_seconds": {"default": 1800, "range": [60, 86400]},
+    "circuit_failure_rate_threshold": {"default": 0.5, "range": [0.1, 1.0]},
+    "circuit_window_seconds": {"default": 3600, "range": [60, 86400]},
+    "circuit_cooldown_seconds": {"default": 600, "range": [30, 86400]},
+    "circuit_min_samples": {"default": 5, "range": [1, 100]},
+    "budget_cap_units": {"default": 100, "range": [1, 100000]},
+    "rate_limit_per_window": {"default": 30, "range": [1, 10000]},
+    "budget_warn_fraction": {"default": 0.8, "range": [0.1, 1.0]},
+    "budget_window_seconds": {"default": 3600, "range": [60, 86400]}
+  },
+  "sensors": [
+    {
+      "kind": "heartbeat",
+      "key": "negotiation_worker_liveness",
+      "knobs": {
+        "heartbeat_interval": "heartbeat_interval_seconds",
+        "stall_timeout": "stall_timeout_seconds"
+      }
+    },
+    {
+      "kind": "circuit_breaker",
+      "key": "outbound_dispatch",
+      "gates_side_effect_class": "external_reversible",
+      "knobs": {
+        "failure_rate_threshold": "circuit_failure_rate_threshold",
+        "window": "circuit_window_seconds",
+        "cooldown": "circuit_cooldown_seconds",
+        "min_samples": "circuit_min_samples"
+      }
+    },
+    {
+      "kind": "budget",
+      "key": "outbound_spend",
+      "knobs": {
+        "budget_cap": "budget_cap_units",
+        "rate_limit": "rate_limit_per_window",
+        "warn_fraction": "budget_warn_fraction",
+        "window": "budget_window_seconds"
+      }
+    }
+  ],
+  "approval_gates": [
+    {"key": "owner_outbound_approval", "required_before": ["initial_outreach", "follow_up_drip", "offer", "seller_signature"]},
+    {"key": "owner_spend_approval", "required_before": ["title_close", "payout"]}
+  ],
+  "proof_requirements": [
+    "lead_batch_artifact",
+    "qualified_leads",
+    "contact_paths",
+    "outreach_sent",
+    "accepted_offer",
+    "signed_contract",
+    "closing_path",
+    "decision_record"
+  ],
+  "side_effect_policy": {
+    "allowed": ["none", "internal", "read_only", "draft_only"],
+    "forbidden": ["external_irreversible", "financial", "personal_channel_outreach", "unapproved_spend", "unapproved_contract_offer"],
+    "approval_required": ["external_reversible", "owner_approved_external_write", "outbound_sms", "outbound_email", "phone_call", "payment_or_spend", "contract_or_offer_commitment"],
+    "owner_boundaries": [
+      "all outbound (SMS, email, calls, spend, contracts/offers) is owner-approval-gated until Matthew explicitly enables it",
+      "only the approved Infobip business channel is used for outbound; personal channels are forbidden"
+    ]
+  },
+  "escalation_paths": [
+    {"condition": "seller asks about price, commitments, or contract terms not yet owner-approved", "to": "owner"},
+    {"condition": "an outbound send, dialer, or spend is needed before explicit owner approval", "to": "owner"},
+    {"condition": "parcel or title due diligence reveals a blocking constraint", "to": "owner"},
+    {"condition": "a worker hits a capability or credential gap", "to": "owner"}
+  ],
+  "owner_summary": {
+    "summary": "A Florida vacant-land wholesaling pipeline that sources and qualifies parcels, makes owner-approved first contact on the Infobip business line, negotiates with sellers through a watched follow-up loop with substages, and moves accepted offers through contract and close. Every outbound action and any spend stays owner-approval-gated, only the approved business channel is used, worker roles stay separated by envelope, and structured proof is required before any card is marked done.",
+    "pending_confirmation": true
   }
 }
