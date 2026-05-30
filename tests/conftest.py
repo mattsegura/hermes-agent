@@ -377,6 +377,15 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # tests opt back in by patching the security config directly.
     monkeypatch.setenv("TIRITH_ENABLED", "false")
 
+    # 4c. Fail-fast kanban board lock contention. Production keeps the
+    #     historical 30s acquire timeout, but under test a single contended
+    #     lock/concurrency case would otherwise hang the suite for the full
+    #     30s. Lower it to 2s: the SAME contention behavior is asserted (the
+    #     acquire still times out and raises), only the idle wait shrinks.
+    #     Tests that need a specific timeout re-set it explicitly. See
+    #     hermes_cli/kanban_db.py::_resolve_lock_timeout_seconds.
+    monkeypatch.setenv("HERMES_KANBAN_LOCK_TIMEOUT_SECONDS", "2")
+
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
     #    singleton might still be cached from a previous test).

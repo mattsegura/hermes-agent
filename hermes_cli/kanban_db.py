@@ -7175,6 +7175,32 @@ _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 30000
+# How long the cross-process board flock poll loop waits before giving up,
+# and the fallback SQLite busy_timeout when no explicit ms knob is set.
+# Production keeps the historical 30s; the test harness lowers it via
+# HERMES_KANBAN_LOCK_TIMEOUT_SECONDS so contention tests fail fast instead
+# of hanging for the full 30s.
+DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
+
+
+def _resolve_lock_timeout_seconds() -> float:
+    """Resolve the cross-process board-lock acquire timeout (seconds).
+
+    Reads ``HERMES_KANBAN_LOCK_TIMEOUT_SECONDS`` (float seconds). Defaults to
+    the historical 30s in production. Used by ``_acquire_db_lock``'s poll
+    loop and, when no explicit ``HERMES_KANBAN_BUSY_TIMEOUT_MS`` is set, to
+    derive the SQLite ``busy_timeout``. This only shrinks the *idle wait*
+    under contention — the single-owner guarantee is unchanged.
+    """
+    raw = os.environ.get("HERMES_KANBAN_LOCK_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            parsed = 0.0
+        if parsed > 0:
+            return parsed
+    return DEFAULT_LOCK_TIMEOUT_SECONDS
 
 
 def _resolve_busy_timeout_ms() -> int:
@@ -7186,7 +7212,12 @@ def _resolve_busy_timeout_ms() -> int:
             parsed = 0
         if parsed > 0:
             return parsed
-    return DEFAULT_BUSY_TIMEOUT_MS
+    # No explicit ms knob: derive from the lock timeout so the test harness
+    # (which lowers HERMES_KANBAN_LOCK_TIMEOUT_SECONDS) shrinks both the
+    # flock poll wait and the SQLite busy_timeout together. Production, which
+    # sets neither, still gets the historical 30000ms default.
+    derived = int(_resolve_lock_timeout_seconds() * 1000)
+    return derived if derived > 0 else DEFAULT_BUSY_TIMEOUT_MS
 
 
 def _sqlite_connect(path: Path) -> sqlite3.Connection:
@@ -7244,7 +7275,8 @@ def _acquire_db_lock(db_path: Path) -> int:
     """Acquire an exclusive cross-process lock for a kanban DB directory.
 
     Returns the file descriptor (kept open to hold the lock). The lock is
-    non-blocking for the first 30s via retry, then raises if still contended.
+    non-blocking for the first ``HERMES_KANBAN_LOCK_TIMEOUT_SECONDS`` (default
+    30s) via retry, then raises if still contended.
     """
     if fcntl is None:
         raise sqlite3.OperationalError("kanban DB file locking requires fcntl on this platform")
@@ -7266,7 +7298,8 @@ def _acquire_db_lock(db_path: Path) -> int:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (OSError, BlockingIOError):
             # Another process holds it — block with timeout via polling
-            deadline = time.monotonic() + 30
+            timeout_s = _resolve_lock_timeout_seconds()
+            deadline = time.monotonic() + timeout_s
             acquired = False
             while time.monotonic() < deadline:
                 time.sleep(0.1)
@@ -7279,7 +7312,7 @@ def _acquire_db_lock(db_path: Path) -> int:
             if not acquired:
                 os.close(fd)
                 raise sqlite3.OperationalError(
-                    f"kanban DB lock timeout after 30s: {db_path} — "
+                    f"kanban DB lock timeout after {timeout_s:g}s: {db_path} — "
                     f"another process is holding .kanban.lock"
                 )
     except Exception:
