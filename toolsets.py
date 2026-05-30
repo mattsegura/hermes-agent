@@ -31,6 +31,11 @@ _KANBAN_LAUNCH_INTAKE_TOOLS = [
     "kanban_business_launch_review",
     "kanban_contract_amendment_propose",
     "kanban_contract_amendment_apply",
+    # Board discovery / routing for the reasoning+router front-end. Read-only;
+    # they enumerate and match existing boards so the router can answer
+    # "do we already have a board for this?" before proposing a new one.
+    "kanban_list_boards",
+    "kanban_match_board",
 ]
 
 

@@ -993,6 +993,165 @@ def _handle_funnel(args: dict, **kw) -> str:
         return tool_error(f"kanban_funnel: {e}")
 
 
+def _board_listing_summary(meta: dict) -> dict[str, Any]:
+    """Compact, model-facing board shape for discovery/routing tools.
+
+    Deliberately metadata-only (no DB connection) so enumerating boards
+    can never initialise a board's sqlite file as a side effect.
+    """
+    objective = meta.get("objective")
+    objective_statement = None
+    if isinstance(objective, dict):
+        objective_statement = objective.get("statement")
+    elif isinstance(objective, str):
+        objective_statement = objective
+    runtime = meta.get("runtime")
+    runtime_mode = runtime.get("mode") if isinstance(runtime, dict) else runtime
+    return {
+        "slug": meta.get("slug"),
+        "name": meta.get("name"),
+        "description": meta.get("description") or "",
+        "objective": objective_statement,
+        "launch_phase": meta.get("launch_phase"),
+        "runtime": runtime_mode,
+        "archived": bool(meta.get("archived")),
+    }
+
+
+def _real_boards(kb, *, include_archived: bool) -> list[dict]:
+    """Enumerate boards that genuinely exist on disk.
+
+    ``kanban_db.list_boards`` always synthesises a ``default`` entry even
+    when ``boards/default/board.json`` was never written (the historical
+    top-level DB special-case). The router contract is "no standing
+    personal board; nothing auto-created", so a ``default`` board that has
+    no ``board.json`` metadata of its own is the phantom entry and must be
+    excluded. Every other board returned by ``list_boards`` already passed
+    the has-db-or-has-metadata filter, so it is real and kept.
+    """
+    boards = kb.list_boards(include_archived=include_archived)
+    out: list[dict] = []
+    for meta in boards:
+        slug = meta.get("slug")
+        if slug == kb.DEFAULT_BOARD:
+            try:
+                has_meta = kb.board_metadata_path(slug).exists()
+            except Exception:
+                has_meta = False
+            if not has_meta:
+                # Phantom unconfigured default board — drop it.
+                continue
+        out.append(meta)
+    return out
+
+
+def _handle_list_boards(args: dict, **kw) -> str:
+    """Enumerate real boards (metadata only) for the reasoning+router front-end."""
+    guard = _require_orchestrator_tool(
+        "kanban_list_boards",
+        allow_launch_intake=True,
+    )
+    if guard:
+        return guard
+    include_archived, bool_error = _parse_bool_arg(
+        args, "include_archived", default=False
+    )
+    if bool_error:
+        return tool_error(bool_error)
+    try:
+        from hermes_cli import kanban_db as kb
+        boards = [
+            _board_listing_summary(meta)
+            for meta in _real_boards(kb, include_archived=include_archived)
+        ]
+        return json.dumps({
+            "ok": True,
+            "count": len(boards),
+            "boards": boards,
+        }, ensure_ascii=False)
+    except Exception as e:
+        logger.exception("kanban_list_boards failed")
+        return tool_error(f"kanban_list_boards: {e}")
+
+
+_BOARD_MATCH_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "for", "to", "of", "in", "on", "with",
+    "my", "our", "your", "i", "we", "want", "need", "get", "more", "new",
+    "set", "up", "start", "launch", "build", "make", "do", "run", "help",
+    "business", "board", "system", "project", "work", "workflow", "this",
+    "that", "it", "is", "are", "be", "can", "will", "would", "should",
+})
+
+
+def _board_match_tokens(text: str) -> set[str]:
+    import re
+
+    tokens = re.findall(r"[a-z0-9]+", str(text or "").lower())
+    return {tok for tok in tokens if len(tok) > 2 and tok not in _BOARD_MATCH_STOPWORDS}
+
+
+def _handle_match_board(args: dict, **kw) -> str:
+    """Surface candidate boards for a free-text goal.
+
+    This tool does NOT decide the match — it enumerates real boards and
+    attaches a coarse lexical overlap score so the agent can do the actual
+    semantic matching in-model. The full candidate list is always returned
+    (ranked best-first) so the model can reason over every option, not just
+    the top lexical hit.
+    """
+    guard = _require_orchestrator_tool(
+        "kanban_match_board",
+        allow_launch_intake=True,
+    )
+    if guard:
+        return guard
+    goal = str(args.get("goal") or args.get("rough_goal") or "").strip()
+    if not goal:
+        return tool_error("goal is required (free-text description of the work)")
+    include_archived, bool_error = _parse_bool_arg(
+        args, "include_archived", default=False
+    )
+    if bool_error:
+        return tool_error(bool_error)
+    goal_tokens = _board_match_tokens(goal)
+    try:
+        from hermes_cli import kanban_db as kb
+        candidates: list[dict] = []
+        for meta in _real_boards(kb, include_archived=include_archived):
+            summary = _board_listing_summary(meta)
+            haystack = " ".join(
+                str(part) for part in (
+                    summary["slug"], summary["name"],
+                    summary["description"], summary["objective"],
+                ) if part
+            )
+            board_tokens = _board_match_tokens(haystack)
+            overlap = sorted(goal_tokens & board_tokens)
+            summary["match_score"] = len(overlap)
+            summary["match_terms"] = overlap
+            candidates.append(summary)
+        candidates.sort(
+            key=lambda c: (c["match_score"], c["slug"] or ""),
+            reverse=True,
+        )
+        return json.dumps({
+            "ok": True,
+            "goal": goal,
+            "count": len(candidates),
+            "candidates": candidates,
+            "guidance": (
+                "match_score is a coarse lexical hint only. Decide the actual "
+                "match by reasoning over each board's name/description/objective. "
+                "If a board clearly covers this goal, work in it. If none fit, "
+                "clarify with the owner, then propose a new board via "
+                "kanban_business_launch_review(create_if_missing=true)."
+            ),
+        }, ensure_ascii=False)
+    except Exception as e:
+        logger.exception("kanban_match_board failed")
+        return tool_error(f"kanban_match_board: {e}")
+
+
 def _handle_board_launch_status(args: dict, **kw) -> str:
     """Read board launch phase, contract readiness, and clarity questions."""
     guard = _require_orchestrator_tool(
@@ -1819,6 +1978,53 @@ KANBAN_FUNNEL_SCHEMA = {
     },
 }
 
+KANBAN_LIST_BOARDS_SCHEMA = {
+    "name": "kanban_list_boards",
+    "description": (
+        "Enumerate the durable kanban boards that already exist (metadata "
+        "only — slug, name, description, objective, launch phase, runtime, "
+        "archived). Use this to answer 'do we already have a board for this?' "
+        "before proposing a new one. The phantom unconfigured 'default' board "
+        "is excluded, so an empty list means no standing board exists yet."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "include_archived": {
+                "type": "boolean",
+                "description": "Include archived boards. Defaults to false.",
+            },
+        },
+        "required": [],
+    },
+}
+
+KANBAN_MATCH_BOARD_SCHEMA = {
+    "name": "kanban_match_board",
+    "description": (
+        "Given a free-text description of work, return the existing boards as "
+        "ranked candidates (with a coarse lexical match_score) so you can pick "
+        "the right board to route to. This tool only supplies enumerated board "
+        "metadata — YOU decide the semantic match. If a board clearly fits, "
+        "work in it; if none fit, clarify with the owner then propose a new "
+        "board via kanban_business_launch_review(create_if_missing=true)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "goal": {
+                "type": "string",
+                "description": "Free-text description of the work to route.",
+            },
+            "include_archived": {
+                "type": "boolean",
+                "description": "Include archived boards as candidates. Defaults to false.",
+            },
+        },
+        "required": ["goal"],
+    },
+}
+
 KANBAN_BOARD_LAUNCH_STATUS_SCHEMA = {
     "name": "kanban_board_launch_status",
     "description": (
@@ -2473,6 +2679,24 @@ registry.register(
     schema=KANBAN_FUNNEL_SCHEMA,
     handler=_handle_funnel,
     check_fn=_check_kanban_orchestrator_mode,
+    emoji="🧭",
+)
+
+registry.register(
+    name="kanban_list_boards",
+    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    schema=KANBAN_LIST_BOARDS_SCHEMA,
+    handler=_handle_list_boards,
+    check_fn=_check_kanban_launch_intake_mode,
+    emoji="🗂",
+)
+
+registry.register(
+    name="kanban_match_board",
+    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    schema=KANBAN_MATCH_BOARD_SCHEMA,
+    handler=_handle_match_board,
+    check_fn=_check_kanban_launch_intake_mode,
     emoji="🧭",
 )
 
