@@ -394,6 +394,16 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
        back-compat and for the dispatcher→worker handoff (defense in
        depth: dispatcher injects this into worker env so workers are
        immune to any path-resolution disagreement).
+
+       Override semantics (see :func:`connect`): an *in-root* override
+       (``<root>/kanban/boards/<slug>/kanban.db`` or the default
+       ``<root>/kanban.db``) is subject to the normal ghost-board rail. An
+       *out-of-root* override is a power-user/test affordance: it works when
+       it points at a DB that already exists, but :func:`connect` refuses to
+       *create* a brand-new out-of-root DB unless creation is explicitly
+       opted into (``create=True`` / ``create_board`` / ``init_db`` /
+       ``HERMES_KANBAN_ALLOW_IMPLICIT_BOARD``) — so a daemon that merely
+       inherited a bogus ``HERMES_KANBAN_DB`` can't fabricate a ghost DB.
     2. When ``board`` arg is None, the active board from
        :func:`get_current_board` is used.
     3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
@@ -8246,6 +8256,39 @@ class BoardNotFoundError(ValueError):
         )
 
 
+class UnconfiguredKanbanDbError(ValueError):
+    """Raised when an out-of-root ``HERMES_KANBAN_DB`` override would fabricate a DB.
+
+    An explicit out-of-root DB path override is a legitimate power-user/test
+    affordance — but only when it points at a DB that already exists. The
+    slug-based ghost-board rail in :func:`connect` can't fire for an
+    out-of-root path (it maps to no board slug), so without this a daemon
+    that merely *inherited* a bogus ``HERMES_KANBAN_DB`` could resurrect the
+    silent-auto-create footgun out-of-tree. We therefore refuse to create a
+    brand-new DB at an out-of-root override path unless creation was
+    explicitly opted into (``create=True`` / ``create_board`` / ``init_db`` /
+    ``HERMES_KANBAN_ALLOW_IMPLICIT_BOARD``).
+
+    Subclasses :class:`ValueError` for back-compat with ``except ValueError``
+    callers while remaining a distinct, catchable type.
+    """
+
+    def __init__(self, path: object, *, message: Optional[str] = None) -> None:
+        self.path = str(path)
+        super().__init__(
+            message
+            or (
+                f"HERMES_KANBAN_DB={self.path!r} points at a database that does "
+                f"not exist and is outside the kanban boards root, so the runtime "
+                f"refuses to create it implicitly (a daemon could otherwise "
+                f"fabricate a ghost DB out-of-tree). Point HERMES_KANBAN_DB at an "
+                f"existing kanban.db, create the board explicitly with "
+                f"`hermes kanban boards create <slug>`, or set "
+                f"HERMES_KANBAN_ALLOW_IMPLICIT_BOARD=1 to opt into creation."
+            )
+        )
+
+
 def _implicit_board_create_allowed() -> bool:
     """True when :func:`connect` may auto-materialize a brand-new board.
 
@@ -8315,6 +8358,24 @@ def connect(
         allow_create = create if create is not None else _implicit_board_create_allowed()
         if not allow_create:
             raise BoardNotFoundError(_gate_slug)
+    elif (
+        _gate_slug is None
+        and db_path is None
+        and os.environ.get("HERMES_KANBAN_DB", "").strip()
+        and not path.exists()
+    ):
+        # Out-of-root HERMES_KANBAN_DB override pointing at a not-yet-existing
+        # DB. The slug gate above can't fire (the path maps to no board slug),
+        # so without this a daemon that merely INHERITED a bogus
+        # HERMES_KANBAN_DB would resurrect the ghost-DB footgun out-of-tree.
+        # Same allow_create gate as the slug rail: explicit create=True
+        # (create_board / init_db pass db_path so they bypass this branch
+        # anyway) or an opted-in session (tests) may create; a plain daemon
+        # may not. An override pointing at an EXISTING db (path.exists()) is a
+        # legitimate power-user affordance and is never gated.
+        allow_create = create if create is not None else _implicit_board_create_allowed()
+        if not allow_create:
+            raise UnconfiguredKanbanDbError(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Acquire cross-process lock BEFORE any DB I/O. On Windows, skip
     # (fcntl is Unix-only) and fall back to SQLite's built-in locking.

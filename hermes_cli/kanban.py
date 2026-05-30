@@ -1349,6 +1349,12 @@ def _operator_error_message(action: Optional[str], exc: BaseException) -> str:
             f"explicitly with `hermes kanban boards create {exc.slug}`, or check "
             "HERMES_KANBAN_BOARD / --board for a typo (`hermes kanban boards list`)."
         )
+    elif isinstance(exc, kb.UnconfiguredKanbanDbError):
+        lines.append(
+            f"  hint: HERMES_KANBAN_DB={exc.path!r} is out-of-root and the file "
+            f"doesn't exist. Point it at an existing kanban.db, create the board "
+            f"explicitly, or set HERMES_KANBAN_ALLOW_IMPLICIT_BOARD=1 to opt in."
+        )
     elif isinstance(exc, _sqlite3.OperationalError) and "locked" in low:
         lines.append(
             "  hint: the board database is locked by another process. "

@@ -239,6 +239,58 @@ def test_bind_contract_roles_binds_many_profiles_to_one_board(fresh_home):
     assert res["conflicts"] == []
 
 
+def test_out_of_root_db_override_refuses_to_fabricate(fresh_home, tmp_path, monkeypatch):
+    """A daemon-inherited out-of-root HERMES_KANBAN_DB at a non-existent path
+    must fail loud, not silently fabricate a ghost DB out-of-tree."""
+    ghost = tmp_path / "elsewhere" / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(ghost))
+    assert not ghost.exists()
+    with pytest.raises(kb.UnconfiguredKanbanDbError):
+        kb.connect()
+    # No ghost DB left behind.
+    assert not ghost.exists()
+
+
+def test_out_of_root_db_override_works_when_db_exists(fresh_home, tmp_path, monkeypatch):
+    """A legitimate power-user override that points at an EXISTING out-of-root
+    DB is honoured (not gated)."""
+    real = tmp_path / "elsewhere" / "kanban.db"
+    real.parent.mkdir(parents=True)
+    # Explicit creation is allowed (the documented opt-in act).
+    kb.init_db(real)
+    assert real.exists()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(real))
+    import contextlib
+    with contextlib.closing(kb.connect()) as conn:
+        # Usable connection on the existing override DB.
+        conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
+
+
+def test_out_of_root_db_override_create_true_bypasses_gate(fresh_home, tmp_path, monkeypatch):
+    """Explicit create=True (create_board / init_db semantics) may create even
+    an out-of-root override DB."""
+    fresh = tmp_path / "elsewhere" / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(fresh))
+    import contextlib
+    with contextlib.closing(kb.connect(create=True)) as conn:
+        conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
+    assert fresh.exists()
+
+
+def test_in_root_worker_handoff_db_override_unaffected(fresh_home, monkeypatch):
+    """The dispatcher→worker handoff injects an IN-root HERMES_KANBAN_DB for a
+    configured board; that must keep working (the out-of-root gate must not
+    touch it)."""
+    kb.create_board("realbiz", contract={"objective": {"statement": "x"},
+                                         "runtime": {"mode": "goal",
+                                                     "dispatcher": {"profile": "p"}}})
+    db = kb.kanban_db_path(board="realbiz")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+    import contextlib
+    with contextlib.closing(kb.connect()) as conn:
+        conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
+
+
 def test_corrupt_board_json_flagged_not_orphaned(fresh_home):
     """A truncated/partial-write board.json must be flagged CORRUPT (fail-loud),
     not silently treated as healthy and not misclassified as an orphan."""
