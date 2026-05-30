@@ -106,6 +106,21 @@ CROSS_PRIOR_STRENGTH: float = 8.0
 #: stream can always out-vote at most this much borrowed evidence per arm.
 MAX_POOLED_PSEUDO: float = 20.0
 
+#: Cold-start poisoning guard (per-sibling bounded influence). When pooling many
+#: sibling boards' outcomes, NO single sibling may contribute more than this many
+#: effective observations PER ARM -- an adversarial / degenerate sibling with a
+#: huge outcome count is clamped to the same weight as an honest one, so the
+#: pooled rate reflects the majority of well-behaved siblings rather than the
+#: loudest one. Equal to the global per-arm cap so a lone honest sibling is
+#: unaffected; the protection bites when one sibling dwarfs the others.
+MAX_SIBLING_ARM_PSEUDO: float = MAX_POOLED_PSEUDO
+
+#: Cold-start poisoning guard (minimum evidence floor per sibling). A sibling
+#: must have at least this many relevant outcomes (across arms) before it may
+#: contribute to the pooled prior at all -- a board with one or two flukey
+#: outcomes is too thin to warm-start anyone and is excluded entirely.
+MIN_SIBLING_EVIDENCE: int = 3
+
 _BINARY = "binary"
 _CONTINUOUS = "continuous"
 
@@ -360,6 +375,72 @@ def aggregate_arm_evidence(
 
 def _arm_key(value: Any) -> Any:
     return float(value) if _is_number(value) else value
+
+
+def _capped_arm_evidence(ev: ArmEvidence, cap: float) -> ArmEvidence:
+    """Return ``ev`` scaled down so its ``n`` never exceeds ``cap``.
+
+    Bounded-influence guard: when a single sibling has more than ``cap``
+    outcomes at an arm, scale its sufficient statistics by ``cap / n`` so its
+    success *rate* / mean utility is preserved but its *weight* is clamped. A
+    sibling at or below the cap is returned unchanged.
+    """
+    if cap <= 0 or ev.n <= cap:
+        return ev
+    scale = cap / float(ev.n)
+    capped = ArmEvidence(value=ev.value, family=ev.family, n=int(round(cap)))
+    capped.success = ev.success * scale
+    capped.util_sum = ev.util_sum * scale
+    capped.util_sq_sum = ev.util_sq_sum * scale
+    return capped
+
+
+def pool_sibling_evidence(
+    sibling_observations: Sequence[Iterable[tuple[Any, Optional[str], Any]]],
+    candidates: Sequence[Any],
+    *,
+    family: Optional[str] = None,
+    min_sibling_evidence: int = MIN_SIBLING_EVIDENCE,
+    max_sibling_arm_pseudo: float = MAX_SIBLING_ARM_PSEUDO,
+) -> tuple[Optional[str], dict[Any, ArmEvidence]]:
+    """Pool many siblings' outcomes into per-arm evidence with poisoning guards.
+
+    Unlike flattening every sibling's rows into one stream (where one
+    high-volume sibling dominates), this aggregates EACH sibling independently
+    and then:
+
+    * drops any sibling with fewer than ``min_sibling_evidence`` relevant
+      outcomes (too thin to warm-start anyone), and
+    * caps each sibling's PER-ARM contribution at ``max_sibling_arm_pseudo``
+      (an adversarial / degenerate sibling with a huge count is clamped to the
+      same weight as an honest one) before merging.
+
+    Returns ``(family, pooled_by_arm)``. Pure: feed it per-sibling observation
+    lists in tests, no DB required.
+    """
+    sibling_lists = [list(obs) for obs in sibling_observations]
+    if family is None:
+        flat = [row for lst in sibling_lists for row in lst]
+        family = choose_reward_family(flat)
+    if family is None:
+        return None, {}
+    pooled: dict[Any, ArmEvidence] = {}
+    for obs in sibling_lists:
+        _fam, by_arm = aggregate_arm_evidence(obs, candidates, family=family)
+        sibling_total = sum(ev.n for ev in by_arm.values())
+        if sibling_total < min_sibling_evidence:
+            continue
+        for key, ev in by_arm.items():
+            capped = _capped_arm_evidence(ev, max_sibling_arm_pseudo)
+            agg = pooled.get(key)
+            if agg is None:
+                agg = ArmEvidence(value=capped.value, family=family)
+                pooled[key] = agg
+            agg.n += capped.n
+            agg.success += capped.success
+            agg.util_sum += capped.util_sum
+            agg.util_sq_sum += capped.util_sq_sum
+    return family, pooled
 
 
 # ---------------------------------------------------------------------------
@@ -819,14 +900,24 @@ def read_knob_outcome_evidence(
     import json as _json
 
     rows = conn.execute(
-        "SELECT knob_snapshot, reward_kind, reward_value FROM board_signals "
+        "SELECT knob_snapshot, reward_kind, reward_value, dedupe_key FROM board_signals "
         "WHERE board = ? AND primitive_kind = 'outcome' "
         "AND reward_value IS NOT NULL AND reward_kind IS NOT NULL "
         "ORDER BY ts ASC, id ASC",
         (board,),
     ).fetchall()
     observations: list[tuple[Any, Optional[str], Any]] = []
+    # Exactly-once read guard: collapse any rows that share a stable
+    # ``dedupe_key`` (belt-and-suspenders alongside the write-time UNIQUE index,
+    # and a safety net for any legacy double-counted rows). Rows with a NULL
+    # dedupe_key are uncontrolled telemetry and each still count.
+    seen_keys: set[str] = set()
     for row in rows:
+        dedupe_key = row[3]
+        if dedupe_key:
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
         snapshot_raw = row[0]
         if not snapshot_raw:
             continue
@@ -838,7 +929,58 @@ def read_knob_outcome_evidence(
             continue
         observations.append((snapshot.get(knob), row[1], row[2]))
     candidates = candidate_arm_values(spec, include=knob_default(spec))
-    return aggregate_arm_evidence(observations, candidates, family=family)
+
+    # Fold in any rolled-up sufficient stats from retention-pruned outcome rows
+    # so the posterior is identical whether or not old rows have been pruned
+    # (the rollup preserves n / success / utility sums additively). Best-effort:
+    # a missing rollup table (legacy DB) simply contributes nothing.
+    rollups: dict[Any, dict[str, float]] = {}
+    try:
+        from hermes_cli import kanban_db as _kb  # local import avoids cycle
+
+        rollups = _kb._read_outcome_rollups(conn, board=board, knob=knob)
+    except Exception:  # pragma: no cover - rollup read is best-effort
+        rollups = {}
+
+    resolved_family = family
+    if resolved_family is None:
+        resolved_family = choose_reward_family(observations)
+    if resolved_family is None and rollups:
+        # No live rows: derive the family from the rollups (prefer binary).
+        fams = {entry["family"] for entry in rollups.values()}
+        resolved_family = _BINARY if _BINARY in fams else (_CONTINUOUS if _CONTINUOUS in fams else None)
+    if resolved_family is None:
+        return None, {}
+
+    _fam, by_arm = aggregate_arm_evidence(observations, candidates, family=resolved_family)
+    _merge_rollups_into_evidence(by_arm, rollups, candidates, resolved_family)
+    return resolved_family, by_arm
+
+
+def _merge_rollups_into_evidence(
+    by_arm: dict[Any, ArmEvidence],
+    rollups: dict[Any, dict[str, float]],
+    candidates: Sequence[Any],
+    family: str,
+) -> None:
+    """Add rolled-up sufficient stats into per-arm evidence (in place)."""
+    for arm_key, entry in rollups.items():
+        if entry.get("family") != family:
+            continue
+        arm = _snap_to_candidate(arm_key, candidates)
+        if arm is None:
+            continue
+        key = _arm_key(arm)
+        ev = by_arm.get(key)
+        if ev is None:
+            ev = ArmEvidence(value=arm, family=family)
+            by_arm[key] = ev
+        ev.n += int(entry.get("n", 0))
+        if family == _BINARY:
+            ev.success += float(entry.get("success", 0.0))
+        else:
+            ev.util_sum += float(entry.get("util_sum", 0.0))
+            ev.util_sq_sum += float(entry.get("util_sq_sum", 0.0))
 
 
 def propose_knob_value(

@@ -493,6 +493,117 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Do not set launch_phase=active after apply")
     bc_apply.add_argument("--json", action="store_true")
 
+    # --- P5 contract-amendment loop (structural, owner-gated, versioned) ---
+    bc_amend = b_contract_sub.add_parser(
+        "amendment",
+        help="P5 structural contract-amendment loop (propose/approve/validate/mint)",
+    )
+    bc_amend_sub = bc_amend.add_subparsers(dest="amendment_action")
+
+    am_status = bc_amend_sub.add_parser("status", help="Summarize a board's amendments")
+    am_status.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    am_status.add_argument("--json", action="store_true")
+
+    am_list = bc_amend_sub.add_parser("list", help="List contract amendments")
+    am_list.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    am_list.add_argument("--status", default=None, help="Filter by amendment status")
+    am_list.add_argument("--json", action="store_true")
+
+    am_show = bc_amend_sub.add_parser("show", help="Show one amendment")
+    am_show.add_argument("amendment_id", help="Amendment id")
+    am_show.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    am_show.add_argument("--json", action="store_true")
+
+    am_propose = bc_amend_sub.add_parser("propose", help="Draft a structural amendment")
+    am_propose.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    am_propose.add_argument("--origin", default="owner",
+                            choices=["optimizer", "sensor", "ceo", "owner"])
+    am_propose.add_argument("--rationale", required=True, help="Why the contract must change")
+    am_propose.add_argument("--contract", default=None,
+                            help="Full proposed contract JSON or @file")
+    am_propose.add_argument("--diff", default=None,
+                            help="Structured diff/patch JSON or @file over the current contract")
+    am_propose.add_argument("--required-inputs", default=None,
+                            help="JSON list of owner-input field specs or @file")
+    am_propose.add_argument("--json", action="store_true")
+
+    am_inputs = bc_amend_sub.add_parser("submit-inputs", help="Supply required owner inputs")
+    am_inputs.add_argument("amendment_id", help="Amendment id")
+    am_inputs.add_argument("inputs", help="JSON object of field->value or @file")
+    am_inputs.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    am_inputs.add_argument("--json", action="store_true")
+
+    am_approve = bc_amend_sub.add_parser("approve", help="Owner-approve with a launch token")
+    am_approve.add_argument("amendment_id", help="Amendment id")
+    am_approve.add_argument("--token", required=True,
+                            help="One-time owner approval token (contract approval-token --amendment-id)")
+    am_approve.add_argument("--approved-by", default=None, help="Approver identity")
+    am_approve.add_argument("--approval-evidence", default=None,
+                            help="Owner approval evidence string/JSON/@file")
+    am_approve.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    am_approve.add_argument("--json", action="store_true")
+
+    am_validate = bc_amend_sub.add_parser("validate", help="Auto-validate an approved amendment")
+    am_validate.add_argument("amendment_id", help="Amendment id")
+    am_validate.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    am_validate.add_argument("--json", action="store_true")
+
+    am_mint = bc_amend_sub.add_parser("mint", help="Mint+activate a validated amendment (CAS)")
+    am_mint.add_argument("amendment_id", help="Amendment id")
+    am_mint.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    am_mint.add_argument("--json", action="store_true")
+
+    am_reject = bc_amend_sub.add_parser("reject", help="Reject an in-flight amendment")
+    am_reject.add_argument("amendment_id", help="Amendment id")
+    am_reject.add_argument("--reason", default=None, help="Why it is rejected")
+    am_reject.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    am_reject.add_argument("--json", action="store_true")
+
+    # --- P6 conversational CEO steering channel ---
+    p_steer = sub.add_parser(
+        "steer",
+        help="Converse with the CEO to deepen (launch) or evolve (runtime) a board contract",
+    )
+    steer_sub = p_steer.add_subparsers(dest="steer_action")
+
+    st_open = steer_sub.add_parser("open", help="Open a steering session")
+    st_open.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    st_open.add_argument("--mode", default="runtime_evolution",
+                         choices=["launch_buildout", "runtime_evolution"])
+    st_open.add_argument("--title", default=None, help="Optional session title")
+    st_open.add_argument("--amendment-id", default=None,
+                         help="Thread the session onto an existing P5 amendment to discuss it")
+    st_open.add_argument("--json", action="store_true")
+
+    st_send = steer_sub.add_parser("send", help="Send an owner message and print the CEO reply")
+    st_send.add_argument("session_id", help="Steering session id")
+    st_send.add_argument("message", help="Your message to the CEO")
+    st_send.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    st_send.add_argument("--json", action="store_true")
+
+    st_list = steer_sub.add_parser("list", help="List steering sessions")
+    st_list.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    st_list.add_argument("--status", default=None, help="Filter by status (open|closed)")
+    st_list.add_argument("--json", action="store_true")
+
+    st_show = steer_sub.add_parser("show", help="Show a session with its full message log")
+    st_show.add_argument("session_id", help="Steering session id")
+    st_show.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    st_show.add_argument("--json", action="store_true")
+
+    st_close = steer_sub.add_parser("close", help="Close a steering session")
+    st_close.add_argument("session_id", help="Steering session id")
+    st_close.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    st_close.add_argument("--json", action="store_true")
+
+    st_reflect = steer_sub.add_parser(
+        "reflect", help="Append a system message reflecting a P5 amendment's current state",
+    )
+    st_reflect.add_argument("session_id", help="Steering session id")
+    st_reflect.add_argument("amendment_id", help="Amendment id to reflect")
+    st_reflect.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    st_reflect.add_argument("--json", action="store_true")
+
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
@@ -1303,6 +1414,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "notify-list":        _cmd_notify_list,
         "notify-unsubscribe": _cmd_notify_unsubscribe,
         "context":  _cmd_context,
+        "steer":    _cmd_steer,
         "specify":  _cmd_specify,
         "decompose":  _cmd_decompose,
         "doctor":   _cmd_doctor,
@@ -1932,7 +2044,314 @@ def _cmd_boards_contract(args: argparse.Namespace) -> int:
             )
         return 0
 
+    if sub == "amendment":
+        return _cmd_boards_contract_amendment(args, normed)
+
     print(f"kanban boards contract: unknown action {sub!r}", file=sys.stderr)
+    return 2
+
+
+def _cmd_boards_contract_amendment(args: argparse.Namespace, board: str) -> int:
+    action = getattr(args, "amendment_action", None) or "status"
+    board = kb._normalize_board_slug(getattr(args, "board", None) or board)
+    as_json = bool(getattr(args, "json", False))
+    if not kb.board_exists(board):
+        print(f"kanban boards contract amendment: board {board!r} does not exist", file=sys.stderr)
+        return 1
+
+    def _emit(payload: Any) -> int:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        return 0
+
+    try:
+        with kb.connect(board=board) as conn:
+            if action == "status":
+                model = kb.build_contract_amendments_read_model(conn, board=board)
+                if as_json:
+                    return _emit(model)
+                print(f"Board {board!r}: {model['pending']} amendment(s) in flight")
+                for item in model["amendments"]:
+                    print(
+                        f"  {item['amendment_id']}  {item['status']:<18} "
+                        f"origin={item['origin']} base=v{item['base_version']}"
+                        + (f" minted=v{item['minted_version']}" if item.get("minted_version") else "")
+                    )
+                return 0
+
+            if action == "list":
+                items = kb.list_contract_amendments(
+                    conn, board=board, status=getattr(args, "status", None)
+                )
+                if as_json:
+                    return _emit(items)
+                if not items:
+                    print("No contract amendments.")
+                for item in items:
+                    print(
+                        f"{item['amendment_id']}  {item['status']:<18} "
+                        f"origin={item['origin']}  base=v{item['base_version']}  "
+                        f"{item.get('rationale') or ''}"
+                    )
+                return 0
+
+            if action == "show":
+                amendment = kb.get_contract_amendment(
+                    conn, getattr(args, "amendment_id", ""), board=board
+                )
+                if amendment is None:
+                    print("kanban boards contract amendment show: not found", file=sys.stderr)
+                    return 1
+                return _emit(amendment)
+
+            if action == "propose":
+                contract, error = _parse_json_object_flag(getattr(args, "contract", None), "--contract")
+                if error:
+                    print(f"kanban boards contract amendment propose: {error}", file=sys.stderr)
+                    return 2
+                diff, error = _parse_json_object_flag(getattr(args, "diff", None), "--diff")
+                if error:
+                    print(f"kanban boards contract amendment propose: {error}", file=sys.stderr)
+                    return 2
+                required_inputs = None
+                raw_inputs = getattr(args, "required_inputs", None)
+                if raw_inputs:
+                    text, error = _parse_text_or_file_flag(raw_inputs, "--required-inputs")
+                    if error:
+                        print(f"kanban boards contract amendment propose: {error}", file=sys.stderr)
+                        return 2
+                    required_inputs = json.loads(text) if isinstance(text, str) else text
+                amendment = kb.propose_contract_amendment(
+                    conn, board=board, origin=getattr(args, "origin", "owner"),
+                    rationale=getattr(args, "rationale", ""),
+                    proposed_contract=contract, diff=diff, required_inputs=required_inputs,
+                )
+                if as_json:
+                    return _emit(amendment)
+                print(f"Drafted amendment {amendment['amendment_id']} ({amendment['status']}).")
+                return 0
+
+            if action == "submit-inputs":
+                inputs, error = _parse_json_object_flag(getattr(args, "inputs", None), "inputs")
+                if error:
+                    print(f"kanban boards contract amendment submit-inputs: {error}", file=sys.stderr)
+                    return 2
+                result = kb.submit_amendment_inputs(
+                    conn, getattr(args, "amendment_id", ""), inputs, board=board
+                )
+                if as_json:
+                    return _emit(result)
+                print(
+                    f"Inputs recorded; satisfied={result.get('inputs_satisfied')} "
+                    f"missing={result.get('missing_inputs')} status={result['status']}"
+                )
+                return 0
+
+            if action == "approve":
+                approval_evidence, error = _parse_text_or_file_flag(
+                    getattr(args, "approval_evidence", None), "--approval-evidence"
+                )
+                if error:
+                    print(f"kanban boards contract amendment approve: {error}", file=sys.stderr)
+                    return 2
+                result = kb.approve_contract_amendment(
+                    conn, getattr(args, "amendment_id", ""), board=board,
+                    approver=getattr(args, "approved_by", None) or _current_user_label(),
+                    token=getattr(args, "token", ""),
+                    approval_evidence=approval_evidence,
+                )
+                if as_json:
+                    return _emit(result)
+                print(f"Amendment {result['amendment_id']} status: {result['status']}")
+                return 0
+
+            if action == "validate":
+                result = kb.validate_contract_amendment(
+                    conn, getattr(args, "amendment_id", ""), board=board
+                )
+                if as_json:
+                    return _emit(result)
+                report = result.get("validation_report") or {}
+                print(f"Amendment {result['amendment_id']} status: {result['status']}")
+                for err in report.get("errors") or []:
+                    print(f"  - {err}")
+                return 0
+
+            if action == "mint":
+                result = kb.mint_contract_amendment(
+                    conn, getattr(args, "amendment_id", ""), board=board
+                )
+                if as_json:
+                    return _emit(result)
+                print(
+                    f"Amendment {result['amendment_id']} status: {result['status']}"
+                    + (f" (contract_version={result.get('minted_version')})"
+                       if result.get("minted_version") else "")
+                )
+                return 0
+
+            if action == "reject":
+                result = kb.reject_contract_amendment(
+                    conn, getattr(args, "amendment_id", ""), board=board,
+                    reason=getattr(args, "reason", None),
+                )
+                if as_json:
+                    return _emit(result)
+                print(f"Amendment {result['amendment_id']} status: {result['status']}")
+                return 0
+    except kb.ContractVersionConflict as exc:
+        print(f"kanban boards contract amendment: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"kanban boards contract amendment: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"kanban boards contract amendment: unknown action {action!r}", file=sys.stderr)
+    return 2
+
+
+# ---------------------------------------------------------------------------
+# P6 conversational CEO steering channel
+# ---------------------------------------------------------------------------
+
+
+def _print_steering_message(msg: dict) -> None:
+    role = (msg.get("role") or "").upper()
+    print(f"[{role}] {msg.get('content') or ''}")
+    att = msg.get("attachments") or {}
+    if isinstance(att, dict):
+        aid = att.get("amendment_id")
+        if aid:
+            status = att.get("amendment_status") or ""
+            print(f"       (amendment {aid} {status})")
+        missing = att.get("missing_inputs")
+        if missing:
+            print(f"       (required inputs still needed: {', '.join(missing)})")
+        errs = att.get("validation_errors")
+        if errs:
+            for err in errs:
+                print(f"       ! {err}")
+
+
+def _cmd_steer(args: argparse.Namespace) -> int:
+    action = getattr(args, "steer_action", None)
+    if not action:
+        print(
+            "usage: hermes kanban steer <open|send|list|show|close|reflect> [options]",
+            file=sys.stderr,
+        )
+        return 2
+    board = getattr(args, "board", None) or kb.get_current_board()
+    try:
+        board = kb._normalize_board_slug(board)
+    except ValueError as exc:
+        print(f"kanban steer: {exc}", file=sys.stderr)
+        return 2
+    if not board or not kb.board_exists(board):
+        print(f"kanban steer: board {board!r} does not exist", file=sys.stderr)
+        return 1
+    as_json = bool(getattr(args, "json", False))
+
+    def _emit(payload: Any) -> int:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        return 0
+
+    try:
+        with kb.connect(board=board) as conn:
+            if action == "open":
+                session = kb.open_steering_session(
+                    conn, board=board, mode=getattr(args, "mode", "runtime_evolution"),
+                    title=getattr(args, "title", None),
+                    amendment_id=getattr(args, "amendment_id", None),
+                )
+                if as_json:
+                    return _emit(session)
+                print(
+                    f"Opened steering session {session['session_id']} "
+                    f"(mode={session['mode']}) on board {board!r}."
+                )
+                return 0
+
+            if action == "send":
+                result = kb.steer_send_message(
+                    conn, board=board, session_id=getattr(args, "session_id", ""),
+                    owner_message=getattr(args, "message", ""),
+                )
+                if as_json:
+                    return _emit(result)
+                _print_steering_message(result["ceo_message"])
+                amendment = result.get("amendment")
+                if amendment is not None:
+                    print(
+                        f"\nDrafted P5 amendment {amendment['amendment_id']} "
+                        f"({amendment['status']}). Approve it with: "
+                        f"hermes kanban boards contract amendment approve "
+                        f"{amendment['amendment_id']} --token <token>"
+                    )
+                elif result.get("degraded"):
+                    print("\n(CEO model not configured — degraded mode.)")
+                return 0
+
+            if action == "list":
+                sessions = kb.list_steering_sessions(
+                    conn, board=board, status=getattr(args, "status", None)
+                )
+                if as_json:
+                    return _emit(sessions)
+                if not sessions:
+                    print("No steering sessions.")
+                for s in sessions:
+                    print(
+                        f"{s['session_id']}  {s['status']:<7} mode={s['mode']}"
+                        + (f"  amendment={s['amendment_id']}" if s.get("amendment_id") else "")
+                    )
+                return 0
+
+            if action == "show":
+                session = kb.get_steering_session(
+                    conn, getattr(args, "session_id", ""), board=board
+                )
+                if session is None:
+                    print("kanban steer show: session not found", file=sys.stderr)
+                    return 1
+                messages = kb.get_steering_messages(
+                    conn, getattr(args, "session_id", ""), board=board
+                )
+                if as_json:
+                    return _emit({"session": session, "messages": messages})
+                print(
+                    f"Session {session['session_id']} (mode={session['mode']} "
+                    f"status={session['status']})"
+                )
+                for msg in messages:
+                    _print_steering_message(msg)
+                return 0
+
+            if action == "close":
+                session = kb.close_steering_session(
+                    conn, getattr(args, "session_id", ""), board=board
+                )
+                if as_json:
+                    return _emit(session)
+                print(f"Closed steering session {session['session_id']}.")
+                return 0
+
+            if action == "reflect":
+                msg = kb.steer_reflect_amendment_state(
+                    conn, session_id=getattr(args, "session_id", ""),
+                    amendment_id=getattr(args, "amendment_id", ""), board=board,
+                )
+                if as_json:
+                    return _emit(msg)
+                _print_steering_message(msg)
+                return 0
+    except kb.ContractVersionConflict as exc:
+        print(f"kanban steer: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"kanban steer: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"kanban steer: unknown action {action!r}", file=sys.stderr)
     return 2
 
 

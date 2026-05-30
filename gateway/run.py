@@ -5713,6 +5713,16 @@ class GatewayRunner:
                         logger.warning(
                             "kanban optimizer_tick failed on board %s", slug, exc_info=True
                         )
+                # Tier-1 sensor primitives: evaluate heartbeat/circuit/budget
+                # sensors once per board per tick at the same tick site. Wrapped
+                # best-effort (like retention) so a sensor hiccup can never stop
+                # the dispatcher from spawning workers.
+                try:
+                    _kb.sensors_tick(conn, board=slug)
+                except Exception:
+                    logger.warning(
+                        "kanban sensors_tick failed on board %s", slug, exc_info=True
+                    )
                 if tick_ok:
                     try:
                         _kb.record_tick_health_success(conn, board=slug)

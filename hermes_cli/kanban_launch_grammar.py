@@ -75,6 +75,140 @@ EXTERNAL_SIDE_EFFECT_CLASSES: frozenset[str] = frozenset(
 )
 
 
+# --------------------------------------------------------------------------
+# Closed vocabulary -- the single source of truth for SENSOR kinds.
+#
+# DECLARE, DON'T INFER (mirrors the trigger ``kind`` and ``side_effect_class``
+# patterns). A Tier-1 *sensor primitive* is a first-class, contract-declarable
+# detector with a typed ``kind`` the runtime reads directly, bounded-knob
+# thresholds (so the optimizer can tune them and a P5 amendment can move them),
+# and a structured signal it emits each tick. The closed vocabulary is::
+#
+#     heartbeat | circuit_breaker | budget
+#
+#   heartbeat       -- task/worker/loop liveness + stall detection (no progress
+#                      within a window). Complementary to board_tick_health
+#                      (which is gateway-tick liveness, not entity-level).
+#   circuit_breaker -- error/failure-rate anomaly detection over a rolling
+#                      window; trips (opens) and auto-pauses the affected
+#                      dispatch path, half-opens after a cooldown, recovers.
+#   budget          -- spend / request-rate metering against a cap; warns as
+#                      usage approaches the cap and trips/throttles when over.
+#
+# A declared sensor looks like::
+#
+#     {"kind": "heartbeat", "key": "worker_liveness",
+#      "knobs": {"heartbeat_interval": "heartbeat_interval_seconds",
+#                "stall_timeout": "stall_timeout_seconds"}}
+#     {"kind": "circuit_breaker", "key": "external_send",
+#      "gates_side_effect_class": "external_reversible",
+#      "knobs": {"failure_rate_threshold": "...", "window": "...",
+#                "cooldown": "...", "min_samples": "..."}}
+#     {"kind": "budget", "key": "spend",
+#      "knobs": {"budget_cap": "...", "rate_limit": "...",
+#                "warn_fraction": "...", "window": "..."}}
+#
+# The ``knobs`` map binds each *logical* knob name to a board ``tunables`` knob
+# (validated by the R6-style sensor invariant), so a threshold is never an
+# inline magic number -- it is always a bounded, tunable, amendable knob.
+# --------------------------------------------------------------------------
+SENSOR_KINDS: frozenset[str] = frozenset({"heartbeat", "circuit_breaker", "budget"})
+
+#: The logical knob names each sensor kind MUST bind to a bounded tunable. These
+#: are the thresholds/windows the invariant checker requires resolve to a
+#: bounded knob (DECLARE, DON'T INFER: no inline magic thresholds).
+SENSOR_REQUIRED_KNOBS: dict[str, tuple[str, ...]] = {
+    "heartbeat": ("heartbeat_interval", "stall_timeout"),
+    "circuit_breaker": ("failure_rate_threshold", "window", "cooldown", "min_samples"),
+    "budget": ("budget_cap", "rate_limit", "warn_fraction", "window"),
+}
+
+#: Logical knobs a sensor kind MAY additionally bind (also bounded if present).
+SENSOR_OPTIONAL_KNOBS: dict[str, tuple[str, ...]] = {
+    "heartbeat": ("max_missed_beats",),
+    "circuit_breaker": (),
+    "budget": (),
+}
+
+
+def is_known_sensor_kind(value: Any) -> bool:
+    """True iff ``value`` is a member of the closed sensor vocabulary."""
+    return isinstance(value, str) and value.strip().lower() in SENSOR_KINDS
+
+
+def normalize_sensor_kind(value: Any) -> Optional[str]:
+    """Return the canonical (lower, stripped) sensor kind, or None if unknown."""
+    if not isinstance(value, str):
+        return None
+    canon = value.strip().lower()
+    return canon if canon in SENSOR_KINDS else None
+
+
+def sensor_kind(sensor: Any) -> Optional[str]:
+    """Return the declared ``kind`` of a sensor, or None if it carries none.
+
+    Only a value inside the closed vocabulary is accepted; an unknown ``kind``
+    returns None here (and is rejected at normalization time).
+    """
+    if isinstance(sensor, dict):
+        return normalize_sensor_kind(sensor.get("kind"))
+    return None
+
+
+def normalize_sensor(sensor: Any) -> dict[str, Any]:
+    """Return a typed sensor object carrying a validated closed ``kind``.
+
+    * The ``kind`` is validated against the closed vocabulary -- an unknown or
+      missing kind is REJECTED (a sensor with no typed kind cannot be wired).
+    * ``key`` is back-filled from the kind when absent (a stable identifier the
+      runtime keys sensor state by).
+    * ``knobs`` is normalized to a ``dict[str, str]`` mapping each logical knob
+      name to the board ``tunables`` knob it binds to. Non-string bindings are
+      dropped (the invariant checker then flags the missing required knob).
+
+    Other fields (e.g. ``gates_side_effect_class``, ``detail``) are preserved.
+    """
+    if not isinstance(sensor, dict):
+        raise ValueError(f"sensor must be an object, got {type(sensor).__name__}")
+    out = dict(sensor)
+    raw_kind = out.get("kind")
+    kind = normalize_sensor_kind(raw_kind)
+    if kind is None:
+        raise ValueError(
+            f"sensor declares unknown/missing kind {raw_kind!r}; "
+            f"valid kinds: {sorted(SENSOR_KINDS)}"
+        )
+    out["kind"] = kind
+    key = out.get("key")
+    if not isinstance(key, str) or not key.strip():
+        key = kind
+    out["key"] = str(key).strip()
+    knobs_raw = out.get("knobs")
+    knobs: dict[str, str] = {}
+    if isinstance(knobs_raw, dict):
+        for logical, tunable in knobs_raw.items():
+            if isinstance(tunable, str) and tunable.strip():
+                knobs[str(logical).strip()] = tunable.strip()
+    out["knobs"] = knobs
+    gate = out.get("gates_side_effect_class")
+    if gate is not None:
+        out["gates_side_effect_class"] = normalize_side_effect_class(gate) or str(gate)
+    return out
+
+
+def normalize_sensors(sensors: Any) -> list[dict[str, Any]]:
+    """Normalize a contract ``sensors`` block to a list of typed sensors.
+
+    Accepts either a list of sensor objects or a single sensor object. Raises
+    ``ValueError`` (via :func:`normalize_sensor`) on any unknown/missing kind so
+    a malformed sensor can never reach the runtime untyped.
+    """
+    if sensors is None:
+        return []
+    items = sensors if isinstance(sensors, (list, tuple)) else [sensors]
+    return [normalize_sensor(item) for item in items]
+
+
 def is_known_side_effect_class(value: Any) -> bool:
     """True iff ``value`` is a member of the closed side-effect vocabulary."""
     return isinstance(value, str) and value.strip().lower() in SIDE_EFFECT_CLASSES

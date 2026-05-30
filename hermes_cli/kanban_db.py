@@ -99,6 +99,7 @@ from hermes_cli.kanban_launch_coverage import (
     evaluate_launch_intake_coverage,
 )
 from hermes_cli.kanban_launch_invariants import check_contract_invariants
+from hermes_cli.kanban_launch_simulation import run_default_simulation
 from hermes_cli.kanban_launch_grammar import normalize_trigger
 from hermes_cli import kanban_reactive_runtime as _reactive
 
@@ -533,12 +534,70 @@ def normalize_board_launch_phase(phase: Optional[str], *, default: str = "active
     return normalized
 
 
+class ContractVersionConflict(RuntimeError):
+    """Raised when a versioned contract write loses a compare-and-swap.
+
+    The on-disk ``contract_version`` did not match the version the writer
+    expected, so another writer amended the contract between this writer's
+    read and its write. Rejecting (instead of clobbering) is the concurrency
+    guard for the contract-amendment loop: a stale candidate must be rebased
+    onto the current version rather than silently overwriting it.
+    """
+
+    def __init__(self, board: str, expected: int, actual: int) -> None:
+        self.board = board
+        self.expected = int(expected)
+        self.actual = int(actual)
+        super().__init__(
+            f"contract write for board {board!r} expected version {expected} "
+            f"but on-disk version is {actual} (concurrent amendment); write rejected"
+        )
+
+
 def _normalize_contract_version(value: Any) -> int:
     try:
         version = int(value)
     except (TypeError, ValueError):
         return 1
     return version if version >= 1 else 1
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically and durably.
+
+    Writes to a uniquely-named temp file in the SAME directory (so the final
+    ``os.replace`` is a same-filesystem atomic rename), ``fsync``s the temp
+    file's contents, then renames it over the destination. A crash at any
+    point leaves either the original file fully intact (rename never happened)
+    or the new file fully written (rename completed) -- never a half-written
+    ``board.json``. The temp file is cleaned up on any failure.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Unique temp name in the same dir keeps the rename atomic and avoids two
+    # concurrent writers colliding on a fixed temp path.
+    tmp = path.parent / f".{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:  # pragma: no cover - best-effort cleanup
+            pass
+        raise
+    # Best-effort durability of the rename itself by fsync-ing the directory.
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except (OSError, AttributeError):  # pragma: no cover - not all platforms
+        pass
 
 
 def _canonical_json_hash(value: Any) -> str:
@@ -828,6 +887,49 @@ def _find_contract_amendment(meta: dict[str, Any], amendment_id: str) -> Optiona
     return None
 
 
+def _p5_amendment_token_target(
+    board: str, amendment_id: str, current_version: int
+) -> Optional[dict[str, Any]]:
+    """Resolve a P5 ``board_contract_amendments`` row as a launch-token target.
+
+    Returns ``None`` when no such amendment exists (so the caller can fall back
+    to the not-found error for a genuinely unknown id). Raises ``ValueError``
+    when the amendment exists but is not eligible for an owner token (wrong
+    status, unmet required inputs, or stale base version).
+    """
+    with contextlib.closing(connect(board=board)) as conn:
+        amendment = get_contract_amendment(conn, amendment_id, board=board)
+    if amendment is None:
+        return None
+    if amendment["status"] not in (AMENDMENT_STATUS_DRAFTED, AMENDMENT_STATUS_PENDING_INPUT):
+        raise ValueError(
+            f"contract amendment {amendment_id!r} is not awaiting approval "
+            f"(status={amendment['status']!r})"
+        )
+    satisfied, missing = _amendment_inputs_status(
+        amendment["required_inputs"], amendment.get("provided_inputs") or {}
+    )
+    if not satisfied:
+        raise ValueError(
+            "contract amendment requires owner inputs before a token: " + ", ".join(missing)
+        )
+    if amendment["base_version"] != current_version:
+        raise ValueError(
+            f"contract amendment {amendment_id!r} is stale: "
+            f"base_version={amendment['base_version']}, current_version={current_version}"
+        )
+    candidate = normalize_board_operating_contract(amendment["proposed_contract"])
+    return {
+        "kind": "contract_amendment",
+        "contract": candidate,
+        "contract_hash": _business_contract_hash(candidate),
+        "contract_version": current_version + 1,
+        "from_version": current_version,
+        "amendment_id": amendment_id,
+        "readiness": validate_business_runtime_contract(candidate),
+    }
+
+
 def _token_target_for_contract(
     board: str,
     *,
@@ -845,6 +947,13 @@ def _token_target_for_contract(
     if amendment_id:
         amendment = _find_contract_amendment(meta, amendment_id)
         if amendment is None:
+            # P5: the amendment may live in the board_contract_amendments state
+            # machine rather than the legacy board.json pending list. Resolve it
+            # there so the launch approval-token rail issues tokens for the
+            # owner-gated structural-amendment flow too.
+            p5 = _p5_amendment_token_target(normed, amendment_id, current_version)
+            if p5 is not None:
+                return p5
             raise ValueError(f"contract amendment {amendment_id!r} not found")
         if amendment.get("status") not in {None, "pending"}:
             raise ValueError(f"contract amendment {amendment_id!r} is not pending")
@@ -1177,13 +1286,18 @@ def normalize_board_operating_contract(contract: Optional[Any]) -> dict:
     # Preserve future contract sections that the runtime does not enforce at
     # task-claim time but that are needed for launch review and amendments.
     for key, value in parsed.items():
-        if key in {"objective", "runtime", "workflow", "event_loops"}:
+        if key in {"objective", "runtime", "workflow", "event_loops", "sensors"}:
             continue
         out[key] = value
     # Upcast the watcher's event-loop triggers to the typed grammar so the
     # reactive control plane reads a closed ``kind`` instead of guessing prose.
     if parsed.get("event_loops") is not None:
         out["event_loops"] = normalize_event_loops(parsed.get("event_loops"))
+    # Normalize the Tier-1 sensor primitives block to the typed grammar (a
+    # validated closed ``kind`` + a ``knobs`` binding map) so the sensors tick
+    # and dispatch gate read typed sensors, never free text.
+    if parsed.get("sensors") is not None:
+        out["sensors"] = normalize_board_sensors(parsed.get("sensors"))
     return out
 
 
@@ -3402,6 +3516,53 @@ def normalize_event_loops(event_loops: Optional[Any]) -> Optional[list[dict]]:
     return normalized
 
 
+def normalize_board_sensors(sensors: Optional[Any]) -> Optional[list[dict]]:
+    """Normalize the Tier-1 ``sensors`` block to typed sensor primitives.
+
+    Every sensor is upcast to the typed grammar (a validated closed ``kind``
+    from :data:`hermes_cli.kanban_launch_grammar.SENSOR_KINDS` plus a ``knobs``
+    binding map) via
+    :func:`hermes_cli.kanban_launch_grammar.normalize_sensor`. A sensor with an
+    unknown/missing kind is REJECTED here (mirroring the trigger/event-loop
+    rejection), so a malformed sensor can never reach the runtime untyped.
+    """
+    if sensors is None:
+        return None
+    from hermes_cli.kanban_launch_grammar import normalize_sensor as _normalize_sensor
+
+    items = sensors if isinstance(sensors, list) else [sensors]
+    normalized: list[dict] = []
+    for idx, sensor in enumerate(items):
+        try:
+            normalized.append(_normalize_sensor(sensor))
+        except ValueError as exc:
+            raise ValueError(f"sensors[{idx}] is invalid: {exc}") from exc
+    return normalized
+
+
+def board_sensors(contract: Optional[Any]) -> list[dict]:
+    """Return the normalized list of declared sensors for a contract/metadata.
+
+    Tolerant of both a raw operating contract and the board-metadata business
+    contract shape. Returns ``[]`` when no sensors are declared. Best-effort:
+    a malformed block degrades to ``[]`` rather than raising (the dispatch gate
+    and tick both call this on the hot path).
+    """
+    obj = contract if isinstance(contract, dict) else {}
+    raw = obj.get("sensors")
+    if raw is None:
+        runtime = obj.get("runtime")
+        if isinstance(runtime, dict):
+            raw = runtime.get("sensors")
+    if raw is None:
+        return []
+    try:
+        normalized = normalize_board_sensors(raw)
+    except Exception:
+        return []
+    return normalized or []
+
+
 def _workflow_stage_map(workflow: Optional[dict]) -> dict[str, dict]:
     if not isinstance(workflow, dict):
         return {}
@@ -3535,14 +3696,30 @@ def write_board_metadata(
     launch_review_id: Any = _UNSET,
     launch_approval: Any = _UNSET,
     launch_approval_tokens: Any = _UNSET,
+    expected_version: Any = _UNSET,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
     Preserves any existing fields not mentioned in the call. Sets
     ``created_at`` on first write. Returns the resulting metadata dict.
+
+    The on-disk write is **atomic** (temp file + fsync + ``os.replace``) so a
+    crash can never leave a half-written ``board.json``.
+
+    Compare-and-swap: when ``expected_version`` is supplied the on-disk
+    ``contract_version`` is read fresh and must equal it, otherwise a
+    :class:`ContractVersionConflict` is raised and nothing is written. This is
+    the concurrency guard for the contract-amendment loop -- a stale candidate
+    cannot silently clobber a contract another writer already advanced.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
+    if expected_version is not _UNSET and expected_version is not None:
+        on_disk_version = _normalize_contract_version(meta.get("contract_version"))
+        if on_disk_version != _normalize_contract_version(expected_version):
+            raise ContractVersionConflict(
+                slug, _normalize_contract_version(expected_version), on_disk_version
+            )
     # Preserve existing DB-derived/runtime-error fields — they get re-computed
     # each read but shouldn't be written into board.json.
     meta.pop("db_path", None)
@@ -3643,10 +3820,9 @@ def write_board_metadata(
         if meta.get(optional_key) is None:
             meta.pop(optional_key, None)
     path = board_metadata_path(slug)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    _atomic_write_text(
+        path,
         json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
     )
     for optional_key in ("objective", "runtime", "workflow", "business_contract", "context", "contract_readiness", "launch_review_id", "launch_approval"):
         meta.setdefault(optional_key, None)
@@ -4275,6 +4451,9 @@ def apply_board_contract_amendment(
         launch_phase=phase,
         launch_review_id=launch_review_id if launch_review_id else None,
         launch_approval=launch_approval if launch_approval else None,
+        # CAS: reject if another writer advanced the contract between our read
+        # of ``current_version`` above and this write (concurrent amendment).
+        expected_version=current_version,
     )
     if launch_review_id:
         try:
@@ -4316,6 +4495,1558 @@ def _safe_compile_contract_reactive_runtime(
         compile_contract_reactive_runtime(board, contract=contract)
     except Exception:  # pragma: no cover - defensive activation guard
         _log.warning("reactive runtime compile failed for board %s", board, exc_info=True)
+
+
+# ===========================================================================
+# P5 -- the contract-amendment loop (self-evolution state machine).
+#
+# A STRUCTURAL change to a board's operating contract (new stages/loops/sensors/
+# side-effect classes, or a knob-range change) can be PROPOSED by the optimizer/
+# CEO, a tripped sensor, or the owner. Unlike the in-range knob tuning that
+# ``apply_knob_update`` applies autonomously, a structural change ALWAYS needs
+# the owner approval gate and must clear the EXACT launch validation bar
+# (invariants + simulation) before it is minted via the atomic compare-and-swap
+# contract write. The lifecycle is:
+#
+#   drafted ─▶ pending_owner_input ─▶ approved ─▶ validating
+#       │              (optional)        │           │
+#       └──────────────────────────────▶│      ┌─────┴─────┐
+#                                        │   validated   validation_failed
+#                                        │      │
+#                                        │    minted/active │ superseded
+#                                        ▼
+#                                     rejected
+#
+# The CANONICAL internal representation is the full ``proposed_contract``. A
+# caller may instead supply a structured ``diff`` over the current contract; it
+# is materialized into the full proposed contract at propose time (the source
+# diff is retained only as provenance). A full contract is canonical because
+# both the validation bar and the CAS mint need a complete, self-contained,
+# rebase-detectable artifact -- a bare diff is ambiguous once the base moves.
+# ===========================================================================
+
+AMENDMENT_STATUS_DRAFTED = "drafted"
+AMENDMENT_STATUS_PENDING_INPUT = "pending_owner_input"
+AMENDMENT_STATUS_APPROVED = "approved"
+AMENDMENT_STATUS_VALIDATING = "validating"
+AMENDMENT_STATUS_VALIDATED = "validated"
+AMENDMENT_STATUS_VALIDATION_FAILED = "validation_failed"
+AMENDMENT_STATUS_ACTIVE = "active"
+AMENDMENT_STATUS_REJECTED = "rejected"
+AMENDMENT_STATUS_SUPERSEDED = "superseded"
+
+#: States from which the amendment is still in flight (not terminal).
+AMENDMENT_OPEN_STATUSES: frozenset[str] = frozenset({
+    AMENDMENT_STATUS_DRAFTED,
+    AMENDMENT_STATUS_PENDING_INPUT,
+    AMENDMENT_STATUS_APPROVED,
+    AMENDMENT_STATUS_VALIDATING,
+    AMENDMENT_STATUS_VALIDATED,
+})
+
+AMENDMENT_ORIGINS: frozenset[str] = frozenset({"optimizer", "sensor", "ceo", "owner"})
+
+
+def _amendment_json(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _amendment_json_load(text: Any, default: Any = None) -> Any:
+    if text is None or text == "":
+        return default
+    if isinstance(text, (dict, list)):
+        return text
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_amendment_required_inputs(value: Optional[Any]) -> list[dict[str, Any]]:
+    """Normalize a required-inputs spec list.
+
+    Each entry declares a field the owner must supply before approval (e.g. an
+    API key or a budget cap). A bare string is shorthand for a required string
+    field. An optional ``inject_path`` (dot path) merges a NON-secret value into
+    the proposed contract at submit time so the structural change is fully
+    materialized for validation; secret-typed inputs are recorded as
+    provisioning evidence but never written into ``board.json``.
+    """
+    out: list[dict[str, Any]] = []
+    for item in _as_list_generic(value):
+        if isinstance(item, str):
+            key = item.strip()
+            if not key:
+                continue
+            out.append({
+                "key": key, "label": key, "type": "string",
+                "required": True, "inject_path": None,
+            })
+        elif isinstance(item, dict) and str(item.get("key") or "").strip():
+            key = str(item["key"]).strip()
+            inject = item.get("inject_path")
+            out.append({
+                "key": key,
+                "label": str(item.get("label") or key),
+                "type": str(item.get("type") or "string").strip().lower() or "string",
+                "required": bool(item.get("required", True)),
+                "inject_path": str(inject).strip() if inject else None,
+            })
+    return out
+
+
+def _as_list_generic(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, (tuple, set)):
+        return list(value)
+    return []
+
+
+def _coerce_amendment_input(value: Any, typ: str) -> Any:
+    """Coerce/validate one owner-supplied input value against its declared type."""
+    typ = (typ or "string").strip().lower()
+    if value is None:
+        raise ValueError("value is required")
+    if typ in ("number", "float"):
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"expected a number, got {value!r}") from exc
+    if typ in ("int", "integer"):
+        try:
+            return int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"expected an integer, got {value!r}") from exc
+    if typ in ("bool", "boolean"):
+        return _coerce_bool(value)
+    # string / secret / text and anything else -> stringified, non-empty.
+    text = str(value)
+    if not text.strip():
+        raise ValueError("value must be non-empty")
+    return text
+
+
+def _amendment_inputs_status(
+    required: list[dict[str, Any]], provided: dict[str, Any]
+) -> tuple[bool, list[str]]:
+    """Return ``(satisfied, missing_keys)`` for a required-inputs spec."""
+    missing: list[str] = []
+    for spec in required:
+        if not spec.get("required", True):
+            continue
+        key = spec["key"]
+        val = provided.get(key)
+        if val is None or (isinstance(val, str) and not val.strip()):
+            missing.append(key)
+    return (not missing, missing)
+
+
+def _set_contract_path(contract: dict[str, Any], dotted: str, value: Any) -> dict[str, Any]:
+    """Return a copy of ``contract`` with ``value`` deep-set at ``dotted`` path."""
+    import copy as _copy
+
+    out = _copy.deepcopy(contract) if isinstance(contract, dict) else {}
+    parts = [p for p in str(dotted).split(".") if p]
+    if not parts:
+        return out
+    node = out
+    for part in parts[:-1]:
+        nxt = node.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[part] = nxt
+        node = nxt
+    node[parts[-1]] = value
+    return out
+
+
+def _amendment_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "amendment_id": row["amendment_id"],
+        "board": row["board"],
+        "base_version": _normalize_contract_version(row["base_version"]),
+        "status": row["status"],
+        "origin": row["origin"],
+        "rationale": row["rationale"],
+        "proposed_contract": _amendment_json_load(row["proposed_contract"], {}),
+        "diff": _amendment_json_load(row["diff"], None),
+        "required_inputs": _amendment_json_load(row["required_inputs"], []),
+        "provided_inputs": _amendment_json_load(row["provided_inputs"], {}),
+        "validation_report": _amendment_json_load(row["validation_report"], None),
+        "approval": _amendment_json_load(row["approval"], None),
+        "minted_version": (
+            _normalize_contract_version(row["minted_version"])
+            if row["minted_version"] is not None else None
+        ),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_contract_amendment(
+    conn: sqlite3.Connection, amendment_id: str, *, board: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    """Return one P5 amendment by id (or ``None``)."""
+    board_slug = _connection_board(conn, board)
+    row = conn.execute(
+        "SELECT * FROM board_contract_amendments WHERE board = ? AND amendment_id = ?",
+        (board_slug, amendment_id),
+    ).fetchone()
+    return _amendment_row_to_dict(row) if row is not None else None
+
+
+def list_contract_amendments(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    status: Optional[str] = None,
+    open_only: bool = False,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """List P5 amendments for a board (newest first)."""
+    board_slug = _connection_board(conn, board)
+    sql = "SELECT * FROM board_contract_amendments WHERE board = ?"
+    params: list[Any] = [board_slug]
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    elif open_only:
+        placeholders = ",".join("?" for _ in AMENDMENT_OPEN_STATUSES)
+        sql += f" AND status IN ({placeholders})"
+        params.extend(sorted(AMENDMENT_OPEN_STATUSES))
+    sql += " ORDER BY created_at DESC, amendment_id DESC LIMIT ?"
+    params.append(int(limit))
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    return [_amendment_row_to_dict(row) for row in rows]
+
+
+def _set_amendment_status(
+    conn: sqlite3.Connection,
+    board: str,
+    amendment_id: str,
+    status: str,
+    *,
+    now: Optional[int] = None,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    when = int(time.time()) if now is None else int(now)
+    sets = ["status = ?", "updated_at = ?"]
+    params: list[Any] = [status, when]
+    for key, value in (extra or {}).items():
+        sets.append(f"{key} = ?")
+        params.append(value)
+    params.extend([board, amendment_id])
+    with write_txn(conn):
+        conn.execute(
+            f"UPDATE board_contract_amendments SET {', '.join(sets)} "
+            "WHERE board = ? AND amendment_id = ?",
+            tuple(params),
+        )
+
+
+def propose_contract_amendment(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    origin: str,
+    rationale: str,
+    proposed_contract: Optional[Any] = None,
+    diff: Optional[Any] = None,
+    required_inputs: Optional[Any] = None,
+    base_version: Optional[int] = None,
+    amendment_id: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Draft a structural contract amendment. Does NOT touch the live contract.
+
+    Supply EITHER a full ``proposed_contract`` OR a structured ``diff`` over the
+    current contract (materialized into the canonical full proposed contract).
+    The draft is stamped with the current ``contract_version`` as
+    ``base_version`` and emits an ``amendment`` signal. When ``required_inputs``
+    declares fields the owner must supply, the draft starts in
+    ``pending_owner_input``.
+    """
+    board_slug = _connection_board(conn, board)
+    origin = str(origin or "").strip().lower()
+    if origin not in AMENDMENT_ORIGINS:
+        raise ValueError(f"origin must be one of {sorted(AMENDMENT_ORIGINS)}, got {origin!r}")
+    if proposed_contract is not None and diff is not None:
+        raise ValueError("provide either proposed_contract or diff, not both")
+    meta = read_board_metadata(board_slug)
+    current_version = _normalize_contract_version(meta.get("contract_version"))
+    base = _normalize_contract_version(base_version) if base_version is not None else current_version
+    current = _metadata_as_business_contract(meta)
+    stored_diff: Optional[dict[str, Any]] = None
+    if diff is not None:
+        diff_obj = _json_object(diff, field="diff") or {}
+        materialized = normalize_board_operating_contract(_deep_merge_contract(current, diff_obj))
+        stored_diff = diff_obj
+    elif proposed_contract is not None:
+        materialized = normalize_board_operating_contract(proposed_contract)
+    else:
+        raise ValueError("a proposed_contract or diff is required")
+    required = _normalize_amendment_required_inputs(required_inputs)
+    status = (
+        AMENDMENT_STATUS_PENDING_INPUT
+        if any(spec["required"] for spec in required)
+        else AMENDMENT_STATUS_DRAFTED
+    )
+    aid = str(amendment_id or f"cam_{secrets.token_hex(6)}")
+    when = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO board_contract_amendments ("
+            "amendment_id, board, base_version, status, origin, rationale, "
+            "proposed_contract, diff, required_inputs, provided_inputs, "
+            "validation_report, approval, minted_version, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                aid, board_slug, base, status, origin,
+                str(rationale or "").strip() or None,
+                _amendment_json(materialized), _amendment_json(stored_diff),
+                _amendment_json(required), _amendment_json({}),
+                None, None, None, when, when,
+            ),
+        )
+        _safe_record_board_signal(
+            conn, board=board_slug, primitive_kind="amendment", primitive_key=aid,
+            action={"kind": "proposed", "params": {
+                "origin": origin, "base_version": base, "status": status,
+            }}, ts=when,
+        )
+    return get_contract_amendment(conn, aid, board=board_slug)
+
+
+def submit_amendment_inputs(
+    conn: sqlite3.Connection,
+    amendment_id: str,
+    inputs: Any,
+    *,
+    board: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Fill the owner-supplied ``required_inputs`` for a drafted amendment.
+
+    Type-validates every declared field present in ``inputs`` and rejects bad
+    coercions. Non-secret inputs carrying an ``inject_path`` are merged into the
+    proposed contract so the structural change is fully materialized for
+    validation. When all required inputs are satisfied the amendment moves from
+    ``pending_owner_input`` to ``drafted`` (ready for approval).
+    """
+    board_slug = _connection_board(conn, board)
+    amendment = get_contract_amendment(conn, amendment_id, board=board_slug)
+    if amendment is None:
+        raise ValueError(f"contract amendment {amendment_id!r} not found")
+    if amendment["status"] not in (AMENDMENT_STATUS_DRAFTED, AMENDMENT_STATUS_PENDING_INPUT):
+        raise ValueError(
+            f"cannot submit inputs to amendment in status {amendment['status']!r}"
+        )
+    inputs_obj = _json_object(inputs, field="inputs") or {}
+    required = amendment["required_inputs"]
+    spec_by_key = {spec["key"]: spec for spec in required}
+    provided = dict(amendment.get("provided_inputs") or {})
+    errors: list[str] = []
+    coerced: dict[str, Any] = {}
+    for key, value in inputs_obj.items():
+        spec = spec_by_key.get(key)
+        if spec is None:
+            # Ignore undeclared keys rather than guessing a type.
+            continue
+        try:
+            coerced[key] = _coerce_amendment_input(value, spec["type"])
+        except ValueError as exc:
+            errors.append(f"{key}: {exc}")
+    if errors:
+        raise ValueError("invalid amendment inputs: " + "; ".join(errors))
+    provided.update(coerced)
+    satisfied, missing = _amendment_inputs_status(required, provided)
+    # Materialize non-secret inputs into the proposed contract (provisioning).
+    proposed = amendment["proposed_contract"]
+    for spec in required:
+        path = spec.get("inject_path")
+        if path and spec["type"] != "secret" and spec["key"] in provided:
+            proposed = _set_contract_path(proposed, path, provided[spec["key"]])
+    proposed = normalize_board_operating_contract(proposed)
+    new_status = amendment["status"]
+    if new_status == AMENDMENT_STATUS_PENDING_INPUT and satisfied:
+        new_status = AMENDMENT_STATUS_DRAFTED
+    when = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE board_contract_amendments SET provided_inputs = ?, "
+            "proposed_contract = ?, status = ?, updated_at = ? "
+            "WHERE board = ? AND amendment_id = ?",
+            (
+                _amendment_json(provided), _amendment_json(proposed),
+                new_status, when, board_slug, amendment_id,
+            ),
+        )
+    result = get_contract_amendment(conn, amendment_id, board=board_slug)
+    result["inputs_satisfied"] = satisfied
+    result["missing_inputs"] = missing
+    return result
+
+
+def approve_contract_amendment(
+    conn: sqlite3.Connection,
+    amendment_id: str,
+    *,
+    approver: str,
+    token: str,
+    approval_evidence: Optional[Any] = None,
+    board: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Owner-approve a drafted amendment with a one-time launch approval token.
+
+    Mirrors the launch approval rail: the owner must present a token issued for
+    THIS amendment + the exact resulting contract version/hash (see
+    :func:`issue_board_launch_approval_token` with ``amendment_id=``). Approval
+    is blocked until every required input is satisfied. The token is validated +
+    consumed here (the owner-authority moment), recording an approved launch
+    review for the resulting version so the minted board stays dispatch-enabled.
+    """
+    board_slug = _connection_board(conn, board)
+    amendment = get_contract_amendment(conn, amendment_id, board=board_slug)
+    if amendment is None:
+        raise ValueError(f"contract amendment {amendment_id!r} not found")
+    if amendment["status"] not in (AMENDMENT_STATUS_DRAFTED, AMENDMENT_STATUS_PENDING_INPUT):
+        raise ValueError(
+            f"contract amendment {amendment_id!r} is not awaiting approval "
+            f"(status={amendment['status']!r})"
+        )
+    satisfied, missing = _amendment_inputs_status(
+        amendment["required_inputs"], amendment.get("provided_inputs") or {}
+    )
+    if not satisfied:
+        raise ValueError(
+            "contract amendment requires owner inputs before approval: "
+            + ", ".join(missing)
+        )
+    meta = read_board_metadata(board_slug)
+    current_version = _normalize_contract_version(meta.get("contract_version"))
+    if amendment["base_version"] != current_version:
+        # The contract advanced since this proposal was drafted: it is stale and
+        # must be re-based. Surface as superseded rather than approving a stale
+        # candidate.
+        _set_amendment_status(conn, board_slug, amendment_id, AMENDMENT_STATUS_SUPERSEDED, now=now)
+        raise ContractVersionConflict(board_slug, amendment["base_version"], current_version)
+    proposed = normalize_board_operating_contract(amendment["proposed_contract"])
+    new_version = current_version + 1
+    contract_hash = _business_contract_hash(proposed)
+    review_id = f"lr_{secrets.token_hex(6)}"
+    token_record = _load_board_launch_approval_token(
+        board_slug, token, kind="contract_amendment",
+        contract_hash=contract_hash, contract_version=new_version,
+        amendment_id=amendment_id,
+    )
+    approval = _build_launch_approval_record(
+        review_id=review_id,
+        contract_version=new_version,
+        readiness=validate_business_runtime_contract(proposed),
+        approved_by=token_record.get("approved_by") or approver,
+        approval_evidence=token_record.get("evidence") or approval_evidence,
+        approval_token_id=token_record.get("id"),
+        contract_hash=contract_hash,
+        approval_reason=token_record.get("reason") or f"approved contract amendment {amendment_id}",
+        amendment_id=amendment_id,
+    )
+    # Consume the one-time token + record the approved launch review for the
+    # resulting version (so the minted board passes the launch-review gate).
+    _commit_board_launch_approval(
+        board_slug, token, approval, kind="contract_amendment",
+        contract_hash=contract_hash, contract_version=new_version,
+        amendment_id=amendment_id,
+    )
+    when = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE board_contract_amendments SET status = ?, approval = ?, updated_at = ? "
+            "WHERE board = ? AND amendment_id = ?",
+            (
+                AMENDMENT_STATUS_APPROVED, _amendment_json(approval), when,
+                board_slug, amendment_id,
+            ),
+        )
+        _safe_record_board_signal(
+            conn, board=board_slug, primitive_kind="amendment", primitive_key=amendment_id,
+            action={"kind": "approved", "params": {
+                "approved_by": approval["approved_by"], "contract_version": new_version,
+            }}, ts=when,
+        )
+    return get_contract_amendment(conn, amendment_id, board=board_slug)
+
+
+def _run_amendment_validation(contract: dict[str, Any]) -> dict[str, Any]:
+    """Run the EXACT launch validation bar on a proposed contract (no mutation).
+
+    Holds an amendment to the same bar as a launch: structural invariants
+    (R1-R6 + sensor S1-S3) AND the behavioural simulation harness AND the
+    business-runtime launch-readiness check. Returns the full report.
+    """
+    inv = check_contract_invariants(contract)
+    sim = run_default_simulation(contract)
+    sim_scenarios = {
+        name: {
+            "resolved": res.resolved, "outcome": res.outcome,
+            "category": res.category, "nudges_fired": res.nudges_fired,
+        }
+        for name, res in sim.items()
+    }
+    sim_ok = all(res.resolved for res in sim.values()) if sim else True
+    readiness = validate_business_runtime_contract(contract)
+    errors: list[str] = []
+    if not inv.ok:
+        errors.extend(f"invariant: {err}" for err in inv.errors)
+    if not sim_ok:
+        errors.extend(
+            f"simulation: scenario {name!r} did not resolve"
+            for name, res in sim.items() if not res.resolved
+        )
+    if not readiness.get("ok"):
+        errors.extend(
+            f"readiness: {miss}"
+            for miss in (readiness.get("missing") or readiness.get("errors") or ["unknown"])
+        )
+    ok = bool(inv.ok and sim_ok and readiness.get("ok"))
+    return {
+        "ok": ok,
+        "invariants": inv.as_dict(),
+        "simulation": {"ok": sim_ok, "scenarios": sim_scenarios},
+        "readiness": readiness,
+        "errors": errors,
+    }
+
+
+def validate_contract_amendment(
+    conn: sqlite3.Connection,
+    amendment_id: str,
+    *,
+    board: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Auto-validate an approved amendment against the launch bar (no mutation).
+
+    Runs invariants + simulation + readiness on the materialized proposed
+    contract IN ISOLATION (the live contract is never touched) and stores the
+    full ``validation_report``. Transitions ``approved -> validated`` on a pass
+    or ``approved -> validation_failed`` (with the specific errors) on a fail,
+    so a future self-repair pass / the CEO can fix and re-propose.
+    """
+    board_slug = _connection_board(conn, board)
+    amendment = get_contract_amendment(conn, amendment_id, board=board_slug)
+    if amendment is None:
+        raise ValueError(f"contract amendment {amendment_id!r} not found")
+    if amendment["status"] != AMENDMENT_STATUS_APPROVED:
+        raise ValueError(
+            f"contract amendment {amendment_id!r} must be approved before validation "
+            f"(status={amendment['status']!r})"
+        )
+    when = int(time.time()) if now is None else int(now)
+    # Transient validating state (observable while a long validation runs).
+    _set_amendment_status(conn, board_slug, amendment_id, AMENDMENT_STATUS_VALIDATING, now=when)
+    proposed = normalize_board_operating_contract(amendment["proposed_contract"])
+    report = _run_amendment_validation(proposed)
+    new_status = (
+        AMENDMENT_STATUS_VALIDATED if report["ok"] else AMENDMENT_STATUS_VALIDATION_FAILED
+    )
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE board_contract_amendments SET status = ?, validation_report = ?, "
+            "updated_at = ? WHERE board = ? AND amendment_id = ?",
+            (new_status, _amendment_json(report), when, board_slug, amendment_id),
+        )
+        _safe_record_board_signal(
+            conn, board=board_slug, primitive_kind="amendment", primitive_key=amendment_id,
+            action={"kind": new_status, "params": {"errors": report["errors"][:5]}},
+            ts=when,
+        )
+    return get_contract_amendment(conn, amendment_id, board=board_slug)
+
+
+def _rearm_timer_schedules_for_contract(
+    conn: sqlite3.Connection,
+    board: str,
+    contract: dict[str, Any],
+    *,
+    now: int,
+) -> int:
+    """Re-arm active reactive timer schedules onto the contract's managed cadence.
+
+    The recompile (:func:`compile_contract_reactive_runtime`) is INSERT-OR-IGNORE
+    on existing loops, so it adds NEW schedules but never moves an in-flight
+    one. When a minted contract changes the managed timer-cadence knob, the live
+    schedules must be re-armed (mirrors the cadence re-arm in
+    :func:`apply_knob_update`) so the new contract takes immediate behavioural
+    effect. Returns the number of schedules re-armed.
+    """
+    from hermes_cli import kanban_optimizer as _opt
+
+    cadence_hours = _opt.managed_cadence_default(contract)
+    if cadence_hours is None:
+        return 0
+    try:
+        cadence_seconds = max(1, int(round(float(cadence_hours) * 3600.0)))
+    except (TypeError, ValueError):
+        return 0
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE reactive_timer_schedules SET cadence_seconds = ?, "
+            "next_fire_at = COALESCE(last_fired_at, created_at) + ?, updated_at = ? "
+            "WHERE board = ? AND active = 1",
+            (cadence_seconds, cadence_seconds, now, board),
+        )
+        return int(cur.rowcount or 0)
+
+
+def mint_contract_amendment(
+    conn: sqlite3.Connection,
+    amendment_id: str,
+    *,
+    board: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Mint + activate a validated amendment via the atomic CAS contract write.
+
+    Only from ``validated``. Performs the compare-and-swap
+    ``write_board_metadata(expected_version=base_version)`` -- the SAME (and
+    ONLY) mint primitive used everywhere -- to bump ``contract_version``. If the
+    on-disk version moved since the draft (``ContractVersionConflict``), the
+    amendment is marked ``superseded`` and NOT clobbered (the owner must re-base
+    and re-propose). On success the new contract is activated, the reactive
+    runtime is recompiled and timers/watchers are re-armed, an ``amendment``
+    activation signal is emitted, and the resulting version is recorded.
+    """
+    board_slug = _connection_board(conn, board)
+    amendment = get_contract_amendment(conn, amendment_id, board=board_slug)
+    if amendment is None:
+        raise ValueError(f"contract amendment {amendment_id!r} not found")
+    if amendment["status"] != AMENDMENT_STATUS_VALIDATED:
+        raise ValueError(
+            f"contract amendment {amendment_id!r} must be validated before minting "
+            f"(status={amendment['status']!r})"
+        )
+    approval = amendment.get("approval")
+    if not isinstance(approval, dict):
+        raise ValueError(f"contract amendment {amendment_id!r} has no recorded owner approval")
+    when = int(time.time()) if now is None else int(now)
+    meta = read_board_metadata(board_slug)
+    current_version = _normalize_contract_version(meta.get("contract_version"))
+    base_version = amendment["base_version"]
+    proposed = normalize_board_operating_contract(amendment["proposed_contract"])
+    new_version = base_version + 1
+    history = list(meta.get("contract_history") or [])
+    history.append({
+        "version": current_version,
+        "superseded_at": when,
+        "amendment_id": amendment_id,
+        "contract": _metadata_as_business_contract(meta),
+    })
+    try:
+        updated = write_board_metadata(
+            board_slug,
+            objective=proposed.get("objective"),
+            runtime=proposed.get("runtime"),
+            workflow=proposed.get("workflow"),
+            business_contract=proposed,
+            contract_version=new_version,
+            contract_history=history[-50:],
+            contract_readiness=validate_business_runtime_contract(proposed),
+            launch_phase="active",
+            launch_review_id=approval.get("id"),
+            launch_approval=approval,
+            # CAS guard: reject (do not clobber) if a concurrent writer advanced
+            # the contract since this amendment was drafted.
+            expected_version=base_version,
+        )
+    except ContractVersionConflict as conflict:
+        _set_amendment_status(
+            conn, board_slug, amendment_id, AMENDMENT_STATUS_SUPERSEDED, now=when
+        )
+        with write_txn(conn):
+            _safe_record_board_signal(
+                conn, board=board_slug, primitive_kind="amendment",
+                primitive_key=amendment_id,
+                action={"kind": "superseded", "params": {
+                    "base_version": base_version, "on_disk_version": conflict.actual,
+                }}, ts=when,
+            )
+        result = get_contract_amendment(conn, amendment_id, board=board_slug)
+        result["superseded_reason"] = str(conflict)
+        return result
+    # Activation: recompile watchers (adds any new loops) + re-arm live timers so
+    # in-flight runtime reflects the new contract. Reuses the shared recompile.
+    _safe_compile_contract_reactive_runtime(board_slug, proposed)
+    try:
+        rearmed = _rearm_timer_schedules_for_contract(conn, board_slug, proposed, now=when)
+    except Exception:  # pragma: no cover - re-arm must never break activation
+        _log.warning("timer re-arm failed for board %s", board_slug, exc_info=True)
+        rearmed = 0
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE board_contract_amendments SET status = ?, minted_version = ?, "
+            "updated_at = ? WHERE board = ? AND amendment_id = ?",
+            (AMENDMENT_STATUS_ACTIVE, new_version, when, board_slug, amendment_id),
+        )
+        _safe_record_board_signal(
+            conn, board=board_slug, primitive_kind="amendment", primitive_key=amendment_id,
+            action={"kind": "minted", "params": {
+                "contract_version": new_version, "origin": amendment["origin"],
+                "rearmed_schedules": rearmed,
+            }}, ts=when,
+        )
+    result = get_contract_amendment(conn, amendment_id, board=board_slug)
+    result["contract_version"] = new_version
+    result["board"] = board_slug
+    result["rearmed_schedules"] = rearmed
+    return result
+
+
+def reject_contract_amendment(
+    conn: sqlite3.Connection,
+    amendment_id: str,
+    *,
+    board: Optional[str] = None,
+    reason: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Reject an in-flight amendment (terminal). The live contract is untouched."""
+    board_slug = _connection_board(conn, board)
+    amendment = get_contract_amendment(conn, amendment_id, board=board_slug)
+    if amendment is None:
+        raise ValueError(f"contract amendment {amendment_id!r} not found")
+    if amendment["status"] not in AMENDMENT_OPEN_STATUSES:
+        raise ValueError(
+            f"contract amendment {amendment_id!r} is not in flight "
+            f"(status={amendment['status']!r})"
+        )
+    when = int(time.time()) if now is None else int(now)
+    _set_amendment_status(conn, board_slug, amendment_id, AMENDMENT_STATUS_REJECTED, now=when)
+    with write_txn(conn):
+        _safe_record_board_signal(
+            conn, board=board_slug, primitive_kind="amendment", primitive_key=amendment_id,
+            action={"kind": "rejected", "params": {"reason": str(reason or "").strip() or None}},
+            ts=when,
+        )
+    return get_contract_amendment(conn, amendment_id, board=board_slug)
+
+
+def _existing_open_amendment_for_dedupe(
+    conn: sqlite3.Connection, board: str, dedupe_tag: str
+) -> Optional[dict[str, Any]]:
+    """Return an in-flight amendment carrying ``dedupe_tag`` in its rationale.
+
+    Trigger hooks (sensor/optimizer) reuse this so a flapping circuit breaker or
+    a repeatedly-refused knob proposal does not spawn a pile of duplicate
+    drafts.
+    """
+    for amendment in list_contract_amendments(conn, board=board, open_only=True, limit=50):
+        rationale = str(amendment.get("rationale") or "")
+        if dedupe_tag and dedupe_tag in rationale:
+            return amendment
+    return None
+
+
+def propose_amendment_from_trigger(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    trigger_kind: str,
+    sensor_key: Optional[str] = None,
+    detail: Optional[dict[str, Any]] = None,
+    now: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Closed-loop hook: turn a tripped sensor into a structural amendment draft.
+
+    This is the THIN wiring that closes the self-evolution loop
+    (sensor/optimizer -> proposal -> owner gate -> validate -> mint). The
+    proposal CONTENT is intentionally minimal/structural here -- a rich
+    CEO-authored body is P6. Currently wired:
+
+    * ``circuit_open`` on a side-effect-gating breaker -> drafts an amendment
+      (origin ``sensor``) that requires an owner-supplied API key input for a
+      paid/fallback capability on the breaker's gated side-effect class.
+
+    Returns the drafted amendment, or ``None`` if a matching in-flight draft
+    already exists (dedupe) or the trigger is not wired.
+    """
+    board_slug = _connection_board(conn, board)
+    detail = detail or {}
+    if trigger_kind != "circuit_open":
+        return None
+    gated = str(detail.get("gates_side_effect_class") or "external_irreversible")
+    dedupe_tag = f"[trigger:circuit_open:{sensor_key or 'circuit'}]"
+    if _existing_open_amendment_for_dedupe(conn, board_slug, dedupe_tag):
+        return None
+    meta = read_board_metadata(board_slug)
+    current = _metadata_as_business_contract(meta)
+    # Minimal structural change: declare a paid/fallback capability for the
+    # gated side-effect class. The owner must supply the API key before this
+    # can be approved (structural + new external_irreversible capability => the
+    # P5 owner gate, never auto-applied).
+    capability = {
+        "key": f"paid_fallback_{sensor_key or 'capability'}",
+        "side_effect_class": gated,
+        "reason": "circuit breaker opened on the primary path",
+        "requires_owner_approval": True,
+    }
+    diff = {"capabilities": (current.get("capabilities") or []) + [capability]}
+    rationale = (
+        f"{dedupe_tag} circuit breaker {sensor_key!r} opened on side-effect class "
+        f"{gated!r}; proposing a paid fallback capability requiring an owner API key"
+    )
+    required_inputs = [{
+        "key": "api_key",
+        "label": f"API key for paid fallback ({gated})",
+        "type": "secret",
+        "required": True,
+    }]
+    return propose_contract_amendment(
+        conn, board=board_slug, origin="sensor", rationale=rationale,
+        diff=diff, required_inputs=required_inputs, now=now,
+    )
+
+
+def _propose_knob_range_amendment(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    contract: dict[str, Any],
+    knob: str,
+    new_value: Any,
+    reason: Optional[str] = None,
+    now: Optional[int] = None,
+) -> Optional[str]:
+    """Draft a P5 amendment widening ``knob``'s range to include ``new_value``.
+
+    The structural analog of the optimizer's refused out-of-bounds proposal: a
+    knob-range change ALWAYS needs the owner gate, so it becomes an owner-gated
+    P5 amendment rather than a dead-end ``approval_required`` record. Returns the
+    drafted amendment id, or ``None`` when the value is non-numeric, the knob
+    has no declared range, or a matching draft already exists (dedupe).
+    """
+    import copy as _copy
+
+    dedupe_tag = f"[trigger:knob_range:{knob}]"
+    if _existing_open_amendment_for_dedupe(conn, board, dedupe_tag):
+        return None
+    try:
+        numeric = float(new_value)
+    except (TypeError, ValueError):
+        return None
+    proposed = _copy.deepcopy(contract)
+    tunables = proposed.get("tunables")
+    if not isinstance(tunables, dict):
+        runtime = proposed.get("runtime")
+        tunables = runtime.get("tunables") if isinstance(runtime, dict) else None
+    if not isinstance(tunables, dict) or not isinstance(tunables.get(knob), dict):
+        return None
+    spec = tunables[knob]
+    rng = spec.get("range")
+    if isinstance(rng, (list, tuple)) and len(rng) == 2:
+        lo, hi = float(rng[0]), float(rng[1])
+        spec["range"] = [min(lo, numeric), max(hi, numeric)]
+    elif "min" in spec or "max" in spec:
+        lo = float(spec.get("min", numeric))
+        hi = float(spec.get("max", numeric))
+        spec["min"] = min(lo, numeric)
+        spec["max"] = max(hi, numeric)
+    else:
+        # No declared bounds to widen -> not a range change we can auto-draft.
+        return None
+    # Keep ints integral so the contract reads cleanly.
+    if isinstance(new_value, int) and not isinstance(new_value, bool):
+        spec["default"] = int(new_value)
+        if isinstance(spec.get("range"), list):
+            spec["range"] = [
+                int(v) if float(v).is_integer() else v for v in spec["range"]
+            ]
+    else:
+        spec["default"] = new_value
+    rationale = (
+        f"{dedupe_tag} optimizer proposed {knob}={new_value} outside declared bounds"
+        + (f" ({reason})" if reason else "")
+        + "; proposing a knob-range widening (owner approval required)"
+    )
+    drafted = propose_contract_amendment(
+        conn, board=board, origin="optimizer", rationale=rationale,
+        proposed_contract=proposed, now=now,
+    )
+    return drafted["amendment_id"]
+
+
+def build_contract_amendments_read_model(
+    conn: sqlite3.Connection, *, board: Optional[str] = None, limit: int = 25
+) -> dict[str, Any]:
+    """Low-cost read-model of a board's P5 amendments for the dashboard.
+
+    Surfaces id/status/origin/base & minted versions + a compact validation
+    summary, without the full proposed-contract payloads.
+    """
+    board_slug = _connection_board(conn, board)
+    items: list[dict[str, Any]] = []
+    pending = 0
+    for amendment in list_contract_amendments(conn, board=board_slug, limit=limit):
+        report = amendment.get("validation_report") or {}
+        if amendment["status"] in AMENDMENT_OPEN_STATUSES:
+            pending += 1
+        satisfied, missing = _amendment_inputs_status(
+            amendment.get("required_inputs") or [],
+            amendment.get("provided_inputs") or {},
+        )
+        items.append({
+            "amendment_id": amendment["amendment_id"],
+            "status": amendment["status"],
+            "origin": amendment["origin"],
+            "rationale": amendment["rationale"],
+            "base_version": amendment["base_version"],
+            "minted_version": amendment.get("minted_version"),
+            "inputs_satisfied": satisfied,
+            "missing_inputs": missing,
+            "validation_ok": report.get("ok") if report else None,
+            "validation_errors": (report.get("errors") or [])[:5] if report else [],
+            "created_at": amendment["created_at"],
+            "updated_at": amendment["updated_at"],
+        })
+    return {"board": board_slug, "pending": pending, "amendments": items}
+
+
+# ---------------------------------------------------------------------------
+# P6 -- the conversational CEO steering channel
+# ---------------------------------------------------------------------------
+# A durable, owner-facing conversation with the system's top-level reasoning
+# ("CEO agent"). It is a THIN layer on top of the P5 amendment loop: a chat
+# turn can DEEPEN the contract (launch_buildout) or EVOLVE it at runtime
+# (runtime_evolution), but the ONLY structural change it can produce is a P5
+# amendment (origin 'ceo'/'owner') -- proposed here, then held to the full
+# launch bar and minted through the exact same approve -> validate -> mint
+# rail. The conversation never mutates the live contract directly.
+
+STEERING_MODE_LAUNCH = "launch_buildout"
+STEERING_MODE_RUNTIME = "runtime_evolution"
+STEERING_MODES: frozenset[str] = frozenset({STEERING_MODE_LAUNCH, STEERING_MODE_RUNTIME})
+
+STEERING_STATUS_OPEN = "open"
+STEERING_STATUS_CLOSED = "closed"
+
+STEERING_ROLES: frozenset[str] = frozenset({"owner", "ceo", "system"})
+
+
+def _steering_session_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "session_id": row["session_id"],
+        "board": row["board"],
+        "mode": row["mode"],
+        "status": row["status"],
+        "title": row["title"],
+        "amendment_id": row["amendment_id"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "closed_at": row["closed_at"],
+    }
+
+
+def _steering_message_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "board": row["board"],
+        "seq": row["seq"],
+        "role": row["role"],
+        "content": row["content"],
+        "attachments": _amendment_json_load(row["attachments"], None),
+        "created_at": row["created_at"],
+    }
+
+
+def open_steering_session(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    mode: str,
+    title: Optional[str] = None,
+    amendment_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Open a durable steering session for a board.
+
+    ``mode`` is ``launch_buildout`` (deepen a mid-intake / freshly-synthesized
+    board by talking) or ``runtime_evolution`` (discuss/evolve a live board).
+    A session may be threaded onto an existing P5 ``amendment_id`` (e.g. when a
+    sensor/optimizer trigger drafted a change and the owner wants to discuss it
+    before approving).
+    """
+    board_slug = _connection_board(conn, board)
+    mode = str(mode or "").strip().lower()
+    if mode not in STEERING_MODES:
+        raise ValueError(f"mode must be one of {sorted(STEERING_MODES)}, got {mode!r}")
+    sid = str(session_id or f"steer_{secrets.token_hex(6)}")
+    when = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO board_steering_sessions ("
+            "session_id, board, mode, status, title, amendment_id, "
+            "created_at, updated_at, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                sid, board_slug, mode, STEERING_STATUS_OPEN,
+                str(title or "").strip() or None,
+                str(amendment_id or "").strip() or None,
+                when, when, None,
+            ),
+        )
+        _safe_record_board_signal(
+            conn, board=board_slug, primitive_kind="steering", primitive_key=sid,
+            action={"kind": "opened", "params": {"mode": mode, "amendment_id": amendment_id}},
+            ts=when,
+        )
+    return get_steering_session(conn, sid, board=board_slug)
+
+
+def get_steering_session(
+    conn: sqlite3.Connection, session_id: str, *, board: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    """Return one steering session by id (or ``None``)."""
+    board_slug = _connection_board(conn, board)
+    row = conn.execute(
+        "SELECT * FROM board_steering_sessions WHERE board = ? AND session_id = ?",
+        (board_slug, session_id),
+    ).fetchone()
+    return _steering_session_row_to_dict(row) if row is not None else None
+
+
+def list_steering_sessions(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    status: Optional[str] = None,
+    open_only: bool = False,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """List steering sessions for a board (newest first)."""
+    board_slug = _connection_board(conn, board)
+    sql = "SELECT * FROM board_steering_sessions WHERE board = ?"
+    params: list[Any] = [board_slug]
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    elif open_only:
+        sql += " AND status = ?"
+        params.append(STEERING_STATUS_OPEN)
+    sql += " ORDER BY created_at DESC, session_id DESC LIMIT ?"
+    params.append(int(limit))
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    return [_steering_session_row_to_dict(row) for row in rows]
+
+
+def get_steering_messages(
+    conn: sqlite3.Connection, session_id: str, *, board: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """Return the ordered message log for a steering session."""
+    board_slug = _connection_board(conn, board)
+    rows = conn.execute(
+        "SELECT * FROM board_steering_messages WHERE board = ? AND session_id = ? "
+        "ORDER BY seq ASC, id ASC",
+        (board_slug, session_id),
+    ).fetchall()
+    return [_steering_message_row_to_dict(row) for row in rows]
+
+
+def append_steering_message(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    role: str,
+    content: str,
+    attachments: Optional[dict[str, Any]] = None,
+    board: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Append one message to a steering session's ordered log.
+
+    Computes the next 1-based ``seq`` and bumps the session ``updated_at`` in
+    the same transaction so the log stays totally ordered and durable.
+    """
+    board_slug = _connection_board(conn, board)
+    role = str(role or "").strip().lower()
+    if role not in STEERING_ROLES:
+        raise ValueError(f"role must be one of {sorted(STEERING_ROLES)}, got {role!r}")
+    session = get_steering_session(conn, session_id, board=board_slug)
+    if session is None:
+        raise ValueError(f"steering session {session_id!r} not found")
+    when = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS m FROM board_steering_messages "
+            "WHERE board = ? AND session_id = ?",
+            (board_slug, session_id),
+        ).fetchone()
+        next_seq = int(row["m"]) + 1
+        conn.execute(
+            "INSERT INTO board_steering_messages ("
+            "session_id, board, seq, role, content, attachments, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id, board_slug, next_seq, role,
+                str(content or ""), _amendment_json(attachments), when,
+            ),
+        )
+        conn.execute(
+            "UPDATE board_steering_sessions SET updated_at = ? "
+            "WHERE board = ? AND session_id = ?",
+            (when, board_slug, session_id),
+        )
+    rows = conn.execute(
+        "SELECT * FROM board_steering_messages WHERE board = ? AND session_id = ? "
+        "AND seq = ? ORDER BY id DESC LIMIT 1",
+        (board_slug, session_id, next_seq),
+    ).fetchone()
+    return _steering_message_row_to_dict(rows)
+
+
+def close_steering_session(
+    conn: sqlite3.Connection,
+    session_id: str,
+    *,
+    board: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Close a steering session (terminal; the message log is preserved)."""
+    board_slug = _connection_board(conn, board)
+    session = get_steering_session(conn, session_id, board=board_slug)
+    if session is None:
+        raise ValueError(f"steering session {session_id!r} not found")
+    when = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE board_steering_sessions SET status = ?, closed_at = ?, updated_at = ? "
+            "WHERE board = ? AND session_id = ?",
+            (STEERING_STATUS_CLOSED, when, when, board_slug, session_id),
+        )
+        _safe_record_board_signal(
+            conn, board=board_slug, primitive_kind="steering", primitive_key=session_id,
+            action={"kind": "closed", "params": {}}, ts=when,
+        )
+    return get_steering_session(conn, session_id, board=board_slug)
+
+
+def _steering_recent_signals(
+    conn: sqlite3.Connection, board: str, *, limit: int = 8
+) -> list[dict[str, Any]]:
+    """Compact recent board signals for steering context (best-effort)."""
+    try:
+        rows = conn.execute(
+            "SELECT ts, primitive_kind, primitive_key, action FROM board_signals "
+            "WHERE board = ? ORDER BY ts DESC, id DESC LIMIT ?",
+            (board, int(limit)),
+        ).fetchall()
+    except Exception:  # pragma: no cover - defensive read guard
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append({
+            "ts": row["ts"],
+            "kind": row["primitive_kind"],
+            "key": row["primitive_key"],
+            "action": _amendment_json_load(row["action"], None),
+        })
+    return out
+
+
+def _steering_contract_and_coverage(
+    meta: dict[str, Any],
+) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    """Resolve (contract_or_None, coverage_report_dict_or_None) for context.
+
+    A board with a real synthesized/active contract yields its contract and the
+    contract-scored coverage report (which dimensions are still weak). A board
+    that is pre-contract (mid-intake) yields ``None`` for the contract and, when
+    intake answers exist, an answers-scored coverage report so the CEO still
+    knows what is under-specified.
+    """
+    from hermes_cli import kanban_launch_coverage as _cov
+
+    contract = _metadata_as_business_contract(meta)
+    has_contract = bool(
+        isinstance(contract, dict)
+        and (contract.get("objective") or contract.get("workflow"))
+    )
+    if has_contract:
+        try:
+            coverage = _cov.coverage_report_for_contract(contract).as_dict()
+        except Exception:  # pragma: no cover - defensive
+            coverage = None
+        return contract, coverage
+    # Pre-contract: score whatever launch-intake answers exist so launch_buildout
+    # still surfaces gaps.
+    intake = meta.get("launch_intake") if isinstance(meta.get("launch_intake"), dict) else {}
+    answers = intake.get("answers") if isinstance(intake, dict) else None
+    rough_goal = (meta.get("objective") or {}).get("statement") if isinstance(meta.get("objective"), dict) else None
+    coverage = None
+    try:
+        coverage = _cov.evaluate_launch_intake_coverage(
+            answers if isinstance(answers, dict) else None,
+            rough_goal=rough_goal,
+        ).as_dict()
+    except Exception:  # pragma: no cover - defensive
+        coverage = None
+    return None, coverage
+
+
+def _compose_amendment_reflection(
+    amendment: dict[str, Any], *, live_version: int
+) -> tuple[str, dict[str, Any]]:
+    """Build the (content, attachments) system message reflecting an amendment.
+
+    This is how the conversation surfaces a P5 amendment back to the owner: the
+    drafted change, the required owner inputs, a validation failure with the
+    exact errors, or a successful mint. The attachments carry the structured
+    side-channel (amendment_id / status / required inputs / errors) for the UI.
+    """
+    aid = amendment["amendment_id"]
+    status = amendment["status"]
+    report = amendment.get("validation_report") or {}
+    satisfied, missing = _amendment_inputs_status(
+        amendment.get("required_inputs") or [],
+        amendment.get("provided_inputs") or {},
+    )
+    attachments: dict[str, Any] = {
+        "amendment_id": aid,
+        "amendment_status": status,
+        "origin": amendment.get("origin"),
+        "required_inputs": amendment.get("required_inputs") or [],
+        "missing_inputs": missing,
+        "inputs_satisfied": satisfied,
+    }
+    if status == AMENDMENT_STATUS_PENDING_INPUT:
+        labels = ", ".join(
+            spec.get("label") or spec.get("key")
+            for spec in (amendment.get("required_inputs") or [])
+            if spec.get("key") in missing
+        )
+        content = (
+            f"I've drafted amendment {aid}, but it needs your input before it can be "
+            f"approved: {labels}. Supply these, then approve -> validate -> mint to "
+            f"apply it. The live contract is unchanged until then."
+        )
+    elif status == AMENDMENT_STATUS_DRAFTED:
+        content = (
+            f"I've drafted amendment {aid} for your review. To apply it: issue an "
+            f"owner approval token for this amendment, approve, then validate and "
+            f"mint. Nothing changes on the live board until you mint it."
+        )
+    elif status == AMENDMENT_STATUS_APPROVED:
+        content = f"Amendment {aid} is approved. Running validation against the launch bar next."
+    elif status == AMENDMENT_STATUS_VALIDATED:
+        content = (
+            f"Amendment {aid} passed the full launch bar (invariants + simulation) "
+            f"and is ready to mint."
+        )
+    elif status == AMENDMENT_STATUS_VALIDATION_FAILED:
+        errors = list(report.get("errors") or [])[:8]
+        attachments["validation_errors"] = errors
+        joined = "; ".join(errors) if errors else "validation failed"
+        content = (
+            f"Amendment {aid} did NOT pass validation, so the live contract is "
+            f"unchanged. The launch bar reported: {joined}. I can refine the change "
+            f"and re-propose."
+        )
+    elif status == AMENDMENT_STATUS_ACTIVE:
+        minted = amendment.get("minted_version") or live_version
+        attachments["contract_version"] = minted
+        content = (
+            f"Amendment {aid} has been approved, validated, and minted. The board "
+            f"contract is now live at version {minted}."
+        )
+    elif status == AMENDMENT_STATUS_SUPERSEDED:
+        content = (
+            f"Amendment {aid} was superseded (the contract advanced underneath it). "
+            f"We'll need to re-base the change on the current version and re-propose."
+        )
+    elif status == AMENDMENT_STATUS_REJECTED:
+        content = f"Amendment {aid} was rejected. The live contract is unchanged."
+    else:  # validating / unknown
+        content = f"Amendment {aid} is now {status}."
+    return content, attachments
+
+
+def steer_reflect_amendment_state(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    amendment_id: str,
+    board: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Append a system message reflecting a P5 amendment's CURRENT state.
+
+    Call this after the owner drives the amendment through the P5 rail
+    (approve/validate/mint) so the conversation reflects what happened -- a
+    validation failure with the exact errors, or a successful activation with
+    the new contract version. This is the bridge that keeps the chat in sync
+    with the safety rail behind it.
+    """
+    board_slug = _connection_board(conn, board)
+    amendment = get_contract_amendment(conn, amendment_id, board=board_slug)
+    if amendment is None:
+        raise ValueError(f"contract amendment {amendment_id!r} not found")
+    live_version = _normalize_contract_version(read_board_metadata(board_slug).get("contract_version"))
+    content, attachments = _compose_amendment_reflection(amendment, live_version=live_version)
+    return append_steering_message(
+        conn, session_id, role="system", content=content,
+        attachments=attachments, board=board_slug, now=now,
+    )
+
+
+# Deterministic fallback when no auxiliary CEO model is configured. Mirrors the
+# synthesis degraded path: a clear, honest system message instead of a crash or
+# a fabricated reply -- and never a contract change.
+_STEERING_DEGRADED_MESSAGE = (
+    "The CEO reasoning model is not configured for this Hermes install, so I "
+    "can't hold a live steering conversation right now. Your message has been "
+    "recorded. Configure the 'kanban_launch_intake' auxiliary model slot to "
+    "enable the conversational CEO. (No contract change was made.)"
+)
+
+
+def steer_send_message(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    session_id: str,
+    owner_message: str,
+    actor: str = "owner",
+    now: Optional[int] = None,
+    timeout: Optional[int] = None,
+) -> dict[str, Any]:
+    """Drive one CEO turn: owner message in -> CEO reply (+ maybe a P5 amendment).
+
+    Steps:
+      1. Append the owner message to the durable log.
+      2. Build aux-model context: current normalized contract (or "no contract
+         yet" pre-launch) + version, the coverage report (what's still weak),
+         open amendments, recent signals, and the prior conversation.
+      3. Call the ``kanban_launch_intake`` aux model with the CEO system prompt
+         (reusing the existing aux-call path). The CEO may request grounded
+         research (one bounded round) before answering.
+      4. Append the CEO reply. If the CEO emitted a structured amendment
+         proposal, route it through :func:`propose_contract_amendment`
+         (origin ``ceo``) -- the conversation NEVER mutates the live contract --
+         attach the amendment id, and surface the required inputs + approval
+         path back into the chat.
+      5. Degrade gracefully when no aux model is configured: a deterministic
+         system message, no crash, no amendment, no fabrication.
+    """
+    from hermes_cli import kanban_launch_intake as _intake
+
+    board_slug = _connection_board(conn, board)
+    session = get_steering_session(conn, session_id, board=board_slug)
+    if session is None:
+        raise ValueError(f"steering session {session_id!r} not found")
+    if session["status"] != STEERING_STATUS_OPEN:
+        raise ValueError(f"steering session {session_id!r} is not open")
+
+    # Prior conversation (before this owner turn) for model context.
+    history = [
+        {"role": m["role"], "content": m["content"]}
+        for m in get_steering_messages(conn, session_id, board=board_slug)
+    ]
+    owner_msg_row = append_steering_message(
+        conn, session_id, role="owner", content=owner_message,
+        board=board_slug, now=now,
+    )
+
+    meta = read_board_metadata(board_slug)
+    contract_version = _normalize_contract_version(meta.get("contract_version"))
+    contract, coverage = _steering_contract_and_coverage(meta)
+    amendments_model = build_contract_amendments_read_model(conn, board=board_slug)
+    open_amendments = [
+        a for a in amendments_model.get("amendments", [])
+        if a.get("status") in AMENDMENT_OPEN_STATUSES
+    ]
+    signals = _steering_recent_signals(conn, board_slug)
+
+    result = _intake.run_ceo_turn(
+        mode=session["mode"],
+        owner_message=owner_message,
+        contract=contract,
+        contract_version=contract_version,
+        coverage=coverage,
+        open_amendments=open_amendments,
+        signals=signals,
+        conversation=history,
+        timeout=timeout,
+    )
+
+    # One bounded grounded-research round if the CEO asked for facts first.
+    if result.ok and result.research_query and not result.proposal:
+        try:
+            research = _intake.run_pre_interview_research(
+                result.research_query, timeout=timeout
+            )
+        except Exception:  # pragma: no cover - research must never crash a turn
+            research = None
+        if research is not None and research.ok and research.items:
+            append_steering_message(
+                conn, session_id, role="system",
+                content=f"Researched: {result.research_query}",
+                attachments={
+                    "research": research.as_dicts(),
+                    "grounded": research.grounded,
+                    "sources": research.sources,
+                },
+                board=board_slug, now=now,
+            )
+            result = _intake.run_ceo_turn(
+                mode=session["mode"],
+                owner_message=owner_message,
+                contract=contract,
+                contract_version=contract_version,
+                coverage=coverage,
+                open_amendments=open_amendments,
+                signals=signals,
+                conversation=history,
+                external_research=research.as_dicts(),
+                timeout=timeout,
+            )
+
+    # Degraded / unusable response: deterministic system message, no fabrication.
+    if result.degraded or not result.ok:
+        sys_msg = append_steering_message(
+            conn, session_id, role="system",
+            content=_STEERING_DEGRADED_MESSAGE if result.degraded else (
+                "I couldn't produce a usable response to that. Could you rephrase "
+                "what you'd like to change or clarify?"
+            ),
+            attachments={"degraded": bool(result.degraded), "reason": result.reason},
+            board=board_slug, now=now,
+        )
+        return {
+            "session": get_steering_session(conn, session_id, board=board_slug),
+            "owner_message": owner_msg_row,
+            "ceo_message": sys_msg,
+            "amendment": None,
+            "degraded": bool(result.degraded),
+        }
+
+    # Route any agreed structural change through the P5 amendment loop.
+    amendment: Optional[dict[str, Any]] = None
+    ceo_attachments: dict[str, Any] = {}
+    if result.proposal is not None:
+        proposal = result.proposal
+        # propose_contract_amendment accepts EITHER a full contract OR a diff;
+        # prefer the full contract when the model supplied both.
+        proposed_contract = proposal.proposed_contract
+        diff = proposal.diff if proposed_contract is None else None
+        try:
+            amendment = propose_contract_amendment(
+                conn, board=board_slug, origin="ceo",
+                rationale=proposal.rationale,
+                proposed_contract=proposed_contract,
+                diff=diff,
+                required_inputs=proposal.required_inputs or None,
+                base_version=contract_version,
+                now=now,
+            )
+        except (ValueError, ContractVersionConflict) as exc:
+            # The structural payload was malformed -> surface, do not crash.
+            ceo_attachments = {"proposal_error": str(exc)}
+        if amendment is not None:
+            ceo_attachments = {
+                "amendment_id": amendment["amendment_id"],
+                "amendment_status": amendment["status"],
+            }
+
+    reply_text = result.reply or (
+        "I've drafted a structural change for your review."
+        if amendment is not None else
+        "Understood."
+    )
+    ceo_msg = append_steering_message(
+        conn, session_id, role="ceo", content=reply_text,
+        attachments=ceo_attachments or None, board=board_slug, now=now,
+    )
+
+    # Surface the drafted amendment + required inputs + approval path into chat.
+    if amendment is not None:
+        steer_reflect_amendment_state(
+            conn, session_id=session_id, amendment_id=amendment["amendment_id"],
+            board=board_slug, now=now,
+        )
+        with write_txn(conn):
+            _safe_record_board_signal(
+                conn, board=board_slug, primitive_kind="steering",
+                primitive_key=session_id,
+                action={"kind": "amendment_proposed", "params": {
+                    "amendment_id": amendment["amendment_id"],
+                }}, ts=int(time.time()) if now is None else int(now),
+            )
+
+    return {
+        "session": get_steering_session(conn, session_id, board=board_slug),
+        "owner_message": owner_msg_row,
+        "ceo_message": ceo_msg,
+        "amendment": amendment,
+        "degraded": False,
+    }
+
+
+def build_steering_read_model(
+    conn: sqlite3.Connection, *, board: Optional[str] = None, limit: int = 10
+) -> dict[str, Any]:
+    """Low-cost read-model of a board's steering sessions for the dashboard.
+
+    Surfaces open sessions, their mode, latest message preview + role, message
+    count, and any linked drafted amendment id -- without the full transcripts.
+    """
+    board_slug = _connection_board(conn, board)
+    items: list[dict[str, Any]] = []
+    open_count = 0
+    for session in list_steering_sessions(conn, board=board_slug, limit=limit):
+        if session["status"] == STEERING_STATUS_OPEN:
+            open_count += 1
+        last = conn.execute(
+            "SELECT seq, role, content, attachments FROM board_steering_messages "
+            "WHERE board = ? AND session_id = ? ORDER BY seq DESC, id DESC LIMIT 1",
+            (board_slug, session["session_id"]),
+        ).fetchone()
+        count_row = conn.execute(
+            "SELECT COUNT(*) AS c FROM board_steering_messages "
+            "WHERE board = ? AND session_id = ?",
+            (board_slug, session["session_id"]),
+        ).fetchone()
+        # Collect any drafted amendment ids referenced by the session's messages.
+        amend_rows = conn.execute(
+            "SELECT attachments FROM board_steering_messages "
+            "WHERE board = ? AND session_id = ? AND attachments LIKE '%amendment_id%'",
+            (board_slug, session["session_id"]),
+        ).fetchall()
+        linked: list[str] = []
+        if session.get("amendment_id"):
+            linked.append(session["amendment_id"])
+        for ar in amend_rows:
+            data = _amendment_json_load(ar["attachments"], None)
+            aid = data.get("amendment_id") if isinstance(data, dict) else None
+            if aid and aid not in linked:
+                linked.append(aid)
+        last_attachments = _amendment_json_load(last["attachments"], None) if last else None
+        items.append({
+            "session_id": session["session_id"],
+            "mode": session["mode"],
+            "status": session["status"],
+            "title": session["title"],
+            "message_count": int(count_row["c"]) if count_row else 0,
+            "last_role": last["role"] if last else None,
+            "last_message": (str(last["content"])[:240] if last else None),
+            "last_attachments": last_attachments,
+            "amendment_ids": linked,
+            "created_at": session["created_at"],
+            "updated_at": session["updated_at"],
+        })
+    return {"board": board_slug, "open": open_count, "sessions": items}
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
@@ -5178,7 +6909,11 @@ CREATE TABLE IF NOT EXISTS board_signals (
     context_features TEXT,
     reward_value     REAL,
     reward_kind      TEXT,
-    realized_at      INTEGER
+    realized_at      INTEGER,
+    -- Stable per-logical-outcome key for exactly-once reward attribution. NULL
+    -- for signals that are not deduped (most non-outcome telemetry). A partial
+    -- UNIQUE index over (board, dedupe_key) makes a repeated emit a no-op.
+    dedupe_key       TEXT
 );
 
 -- Append-only audit log for optimizer knob changes (P2 closed loop). Every
@@ -5199,6 +6934,118 @@ CREATE TABLE IF NOT EXISTS board_knob_audit (
     actor            TEXT,
     contract_version INTEGER,
     context_features TEXT
+);
+
+-- Compacted sufficient statistics for outcome signals pruned by retention.
+-- When old 'outcome' rows are pruned beyond the retention horizon they are
+-- first folded into this table as additive sufficient stats keyed by the
+-- (knob_snapshot, reward_kind) that produced them. The learner reads these
+-- rollups ALONGSIDE the live rows, so pruning the raw rows does NOT change any
+-- posterior -- the evidence the optimizer needs is preserved exactly (n,
+-- success count, utility sums are all additive). Non-learning telemetry rows
+-- (stage/substate/event_loop/knob_action/approval) are not rolled up; they are
+-- simply pruned because the learner never reads them.
+CREATE TABLE IF NOT EXISTS board_signal_rollup (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    board            TEXT NOT NULL,
+    snapshot_key     TEXT NOT NULL,   -- canonical knob_snapshot JSON (the arm)
+    reward_kind      TEXT NOT NULL,
+    knob_snapshot    TEXT,            -- raw knob_snapshot JSON (for the learner)
+    context_features TEXT,            -- representative context (newest pruned)
+    n                INTEGER NOT NULL DEFAULT 0,
+    pos_count        REAL NOT NULL DEFAULT 0,   -- count of reward_value > 0 (binary success)
+    reward_sum       REAL NOT NULL DEFAULT 0,   -- sum of raw reward_value (continuous)
+    reward_sq_sum    REAL NOT NULL DEFAULT 0,   -- sum of reward_value^2 (continuous variance)
+    oldest_ts        INTEGER,
+    newest_ts        INTEGER,
+    updated_at       INTEGER NOT NULL,
+    UNIQUE(board, snapshot_key, reward_kind)
+);
+
+-- Tier-1 sensor primitive state. Each declared sensor (heartbeat / circuit
+-- breaker / budget) keeps its current status + a JSON internal-state blob here,
+-- keyed by (board, sensor_kind, sensor_key, entity_ref). This is the
+-- authoritative, O(1)-readable runtime state the dispatch gate consults
+-- (circuit open? over budget?) and the read-model surfaces -- distinct from the
+-- append-only board_signals telemetry (which is pruned by retention and so
+-- cannot hold a running budget total). ``entity_ref`` is '' for board-level
+-- sensors (circuit/budget) and the task id for per-entity sensors (heartbeat);
+-- an empty-string sentinel (not NULL) so the UNIQUE upsert key works.
+CREATE TABLE IF NOT EXISTS board_sensor_state (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    board       TEXT NOT NULL,
+    sensor_kind TEXT NOT NULL,   -- heartbeat | circuit_breaker | budget
+    sensor_key  TEXT NOT NULL,   -- the declared sensor key
+    entity_ref  TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL,   -- healthy/stalled | closed/open/half_open | ok/warn/tripped
+    state       TEXT,            -- JSON internal counters/timestamps
+    updated_at  INTEGER NOT NULL,
+    UNIQUE(board, sensor_kind, sensor_key, entity_ref)
+);
+
+-- P5 (the contract-amendment loop). A persisted, owner-gated, versioned
+-- proposal to make a STRUCTURAL change to a board's operating contract
+-- (new stages/loops/sensors/side-effect classes/knob-range changes). Distinct
+-- from the in-range knob tuning that ``board_knob_audit`` records (which is
+-- applied autonomously) and from the launch-time ``board_launch_*`` rails: a
+-- structural change ALWAYS needs the owner approval gate + the full launch
+-- validation bar (invariants + simulation), and only then is minted via the
+-- atomic compare-and-swap contract write. ``base_version`` is the
+-- ``contract_version`` the proposal was drafted against; mint CAS-rejects
+-- (``superseded``) if the on-disk version advanced since. The canonical
+-- internal representation is the full ``proposed_contract`` (a source ``diff``
+-- is materialized into it at propose time and kept only for provenance).
+CREATE TABLE IF NOT EXISTS board_contract_amendments (
+    amendment_id      TEXT PRIMARY KEY,
+    board             TEXT NOT NULL,
+    base_version      INTEGER NOT NULL,
+    status            TEXT NOT NULL,   -- drafted|pending_owner_input|approved|validating|validated|validation_failed|active|rejected|superseded
+    origin            TEXT NOT NULL,   -- optimizer|sensor|ceo|owner
+    rationale         TEXT,
+    proposed_contract TEXT NOT NULL,   -- canonical full proposed contract JSON
+    diff              TEXT,            -- optional source patch JSON (provenance only)
+    required_inputs   TEXT,            -- JSON list of {key,label,type,required,inject_path} the owner must supply
+    provided_inputs   TEXT,            -- JSON object of owner-supplied values
+    validation_report TEXT,            -- JSON: {ok, invariants, simulation, readiness, errors}
+    approval          TEXT,            -- JSON launch_approval record (approver, token id, evidence)
+    minted_version    INTEGER,         -- contract_version after a successful mint
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL
+);
+
+-- P6: the conversational CEO steering channel. A durable, owner-facing
+-- conversation with the system's top-level reasoning ("CEO agent"). It is a
+-- thin human-friendly layer ON TOP of the P5 amendment loop: the conversation
+-- NEVER mutates the live contract; the only structural change it can produce
+-- is a P5 amendment (origin 'ceo'/'owner') held to the full launch bar. A
+-- session is one ongoing thread for a board; messages are an ordered log that
+-- survives process restarts (durable in kanban.db).
+CREATE TABLE IF NOT EXISTS board_steering_sessions (
+    session_id   TEXT PRIMARY KEY,
+    board        TEXT NOT NULL,
+    mode         TEXT NOT NULL,   -- launch_buildout | runtime_evolution
+    status       TEXT NOT NULL,   -- open | closed
+    title        TEXT,
+    -- Optional amendment this thread was auto-opened to discuss (a sensor /
+    -- optimizer trigger drafted a change; the owner discusses it before
+    -- approving). NULL for owner-initiated sessions.
+    amendment_id TEXT,
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    closed_at    INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS board_steering_messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    board       TEXT NOT NULL,
+    seq         INTEGER NOT NULL,   -- 1-based ordering within the session
+    role        TEXT NOT NULL,      -- owner | ceo | system
+    content     TEXT NOT NULL,
+    -- JSON structured side-channel: {amendment_id, required_inputs, coverage,
+    -- research, validation_errors, degraded, ...}. NULL for plain messages.
+    attachments TEXT,
+    created_at  INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
@@ -5228,7 +7075,12 @@ CREATE INDEX IF NOT EXISTS idx_launch_reviews_token  ON board_launch_reviews(app
 CREATE INDEX IF NOT EXISTS idx_launch_reviews_contract ON board_launch_reviews(kind, contract_hash, contract_version);
 CREATE INDEX IF NOT EXISTS idx_board_signals_kind    ON board_signals(board, primitive_kind, ts);
 CREATE INDEX IF NOT EXISTS idx_board_signals_entity  ON board_signals(board, entity_ref, ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_board_signals_dedupe ON board_signals(board, dedupe_key) WHERE dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_board_knob_audit      ON board_knob_audit(board, knob, ts);
+CREATE INDEX IF NOT EXISTS idx_board_sensor_state     ON board_sensor_state(board, sensor_kind, sensor_key);
+CREATE INDEX IF NOT EXISTS idx_contract_amendments     ON board_contract_amendments(board, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_steering_sessions       ON board_steering_sessions(board, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_steering_messages       ON board_steering_messages(board, session_id, seq);
 """
 
 
@@ -5273,6 +7125,7 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
 # serialized by _INIT_LOCK (threading.RLock) as before.
 
 _LOCK_FDS: dict[str, int] = {}  # path -> fd, so we don't double-lock in-process
+_LOCK_REFS: dict[str, int] = {}  # path -> live holder count, for re-entrant connect()
 
 
 @contextlib.contextmanager
@@ -5314,8 +7167,14 @@ def _acquire_db_lock(db_path: Path) -> int:
         raise sqlite3.OperationalError("kanban DB file locking requires fcntl on this platform")
     lockfile = db_path.parent / ".kanban.lock"
     resolved = str(lockfile.resolve())
-    # If this process already holds the lock (re-entrant connect), return existing fd
+    # If this process already holds the lock (re-entrant connect), bump the
+    # holder count and return the existing fd. Reference counting keeps the
+    # flock alive until the *last* in-process connection releases it, so a
+    # connection released at the end of its `with` block (see
+    # _LockedConnection.__exit__) cannot pull the lock out from under a still
+    # open outer/nested connection in the same process.
     if resolved in _LOCK_FDS:
+        _LOCK_REFS[resolved] = _LOCK_REFS.get(resolved, 0) + 1
         return _LOCK_FDS[resolved]
     fd = os.open(str(lockfile), os.O_CREAT | os.O_RDWR, 0o644)
     try:
@@ -5344,15 +7203,27 @@ def _acquire_db_lock(db_path: Path) -> int:
         os.close(fd)
         raise
     _LOCK_FDS[resolved] = fd
+    _LOCK_REFS[resolved] = 1
     return fd
 
 
 def _release_db_lock(db_path: Path) -> None:
-    """Release the cross-process lock for a kanban DB directory."""
+    """Release one in-process hold on the cross-process board lock.
+
+    Reference counted: the flock is only actually unlocked/closed when the
+    last live in-process holder releases it. This pairs with the per-call
+    increment in :func:`_acquire_db_lock` so nested/re-entrant ``connect()``
+    calls keep the single-owner guarantee until they have *all* exited.
+    """
     if fcntl is None:
         return
     lockfile = db_path.parent / ".kanban.lock"
     resolved = str(lockfile.resolve())
+    refs = _LOCK_REFS.get(resolved)
+    if refs is not None and refs > 1:
+        _LOCK_REFS[resolved] = refs - 1
+        return
+    _LOCK_REFS.pop(resolved, None)
     fd = _LOCK_FDS.pop(resolved, None)
     if fd is not None:
         try:
@@ -5403,12 +7274,23 @@ class _LockedConnection:
         return self
 
     def __exit__(self, *args):
-        # Match sqlite3.Connection context-manager semantics: commit/rollback
-        # the transaction but do NOT close the file descriptor. The explicit
-        # connect_closing() helper below is the leak-safe context manager for
-        # gateway/dashboard call paths.
+        # First mirror sqlite3.Connection context-manager semantics:
+        # commit on success, roll back on an exception in the block.
         conn = object.__getattribute__(self, '_conn')
-        return conn.__exit__(*args)
+        suppress = conn.__exit__(*args)
+        # Then close the connection and release the cross-process board lock so
+        # the exclusive flock is held only for the duration of the `with`
+        # block, NOT for the lifetime of the process. Holding it until close()
+        # was called (or interpreter exit) starved every other process on the
+        # same board — the `hermes` CLI, spawned workers, the gateway — which
+        # blocked in the 30s acquire poll and then errored. Releasing here is
+        # safe because no caller reuses the connection after its `with` block
+        # (CLI handlers and internal callers all scope use to the block); the
+        # single-owner guarantee for the corruption-prone WAL init/checkpoint
+        # window still holds for the full block, and reference counting in
+        # _release_db_lock keeps any nested connection's lock alive.
+        self.close()
+        return suppress
 
     def __getattr__(self, name):
         return getattr(object.__getattribute__(self, '_conn'), name)
@@ -6093,6 +7975,25 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         conn.execute(
             "UPDATE task_events SET kind = ? WHERE kind = ?",
             (new, old),
+        )
+
+    # board_signals gained a ``dedupe_key`` column (exactly-once reward
+    # attribution). Legacy rows get NULL (no dedupe key -> never collapsed),
+    # which preserves their historical counts. The partial UNIQUE index makes a
+    # repeated emit of the same logical outcome a no-op so replaying ticks or
+    # re-reading signals can never double-count toward a knob's posterior.
+    signals_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='board_signals'"
+    ).fetchone() is not None
+    if signals_table_exists:
+        sig_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(board_signals)")
+        }
+        if "dedupe_key" not in sig_cols:
+            _add_column_if_missing(conn, "board_signals", "dedupe_key", "dedupe_key TEXT")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_board_signals_dedupe "
+            "ON board_signals(board, dedupe_key) WHERE dedupe_key IS NOT NULL"
         )
 
 
@@ -6895,6 +8796,17 @@ def evaluate_dispatch_eligibility(
             board=board_slug,
         )
     )
+    # Tier-1 sensor gating: a tripped circuit breaker auto-pauses dispatch on
+    # the path it gates, and an over-budget/over-rate meter throttles new
+    # spawns. Read off the persisted sensor state (refreshed by sensors_tick /
+    # record_budget_consumption). Best-effort: a sensor-read hiccup must never
+    # wedge dispatch.
+    try:
+        blockers.extend(
+            _sensor_dispatch_blockers(conn, board=board_slug, side_effect_class=side_effect)
+        )
+    except Exception:  # pragma: no cover - defensive: sensors never break dispatch
+        _log.debug("sensor dispatch gating read failed", exc_info=True)
     return {"ok": not blockers, "task_id": task_id, "contract": contract, "blockers": blockers}
 
 
@@ -8677,8 +10589,18 @@ def _append_event(
 # The closed set of primitive kinds a signal can describe. Kept tight so the
 # table is a clean datapoint stream for a future optimizer rather than a junk
 # drawer of ad-hoc strings.
+#: Tier-1 sensor signal kinds. These are TELEMETRY (sensor state/transition
+#: records), not learning-outcome rows: they carry no reward and the optimizer
+#: never reads them, so retention prunes them with the other non-'outcome'
+#: telemetry (see _prune_telemetry_signals) -- they never bloat the rollup.
+SENSOR_SIGNAL_KINDS: frozenset[str] = frozenset(
+    {"sensor_heartbeat", "sensor_circuit", "sensor_budget"}
+)
+
 SIGNAL_PRIMITIVE_KINDS: frozenset[str] = frozenset(
-    {"stage", "substate", "event_loop", "knob_action", "outcome", "approval"}
+    {"stage", "substate", "event_loop", "knob_action", "outcome", "approval",
+     "amendment", "steering"}
+    | SENSOR_SIGNAL_KINDS
 )
 
 
@@ -8796,6 +10718,7 @@ def record_board_signal(
     realized_at: Optional[int] = None,
     ts: Optional[int] = None,
     board: Optional[str] = None,
+    dedupe_key: Optional[str] = None,
 ) -> int:
     """Append one row to the ``board_signals`` ledger and return its id.
 
@@ -8807,6 +10730,16 @@ def record_board_signal(
     The ``reward_*`` / ``realized_at`` columns are filled when the outcome lands
     (which may be at emission time, for terminal outcomes).
 
+    ``dedupe_key`` makes reward attribution **exactly-once**: when supplied it
+    is a stable identifier for the *logical* outcome (e.g.
+    ``reply:<route>:<fingerprint>`` or ``loop_terminal:<schedule_id>``). A
+    second emit with the same ``(board, dedupe_key)`` is a no-op (the partial
+    UNIQUE index rejects it), so replaying a tick or re-emitting at both
+    event-time and terminal cannot double-count toward a knob's posterior. The
+    id of the already-recorded row is returned in that case; ``-1`` if it
+    cannot be located. ``dedupe_key=None`` keeps the legacy append-always
+    behaviour for non-outcome telemetry.
+
     Called from within an already-open write txn (like :func:`_append_event`).
     """
     kind = str(primitive_kind)
@@ -8817,10 +10750,12 @@ def record_board_signal(
         )
     board_slug = _connection_board(conn, board)
     when = int(time.time()) if ts is None else int(ts)
+    key = str(dedupe_key) if dedupe_key not in (None, "") else None
+    verb = "INSERT OR IGNORE INTO" if key is not None else "INSERT INTO"
     cur = conn.execute(
-        "INSERT INTO board_signals (board, ts, primitive_kind, primitive_key, "
+        f"{verb} board_signals (board, ts, primitive_kind, primitive_key, "
         "entity_ref, knob_snapshot, action, context_features, reward_value, "
-        "reward_kind, realized_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "reward_kind, realized_at, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             board_slug,
             when,
@@ -8833,8 +10768,17 @@ def record_board_signal(
             reward_value,
             reward_kind,
             realized_at,
+            key,
         ),
     )
+    if key is not None and not cur.rowcount:
+        # The insert was ignored: a row with this (board, dedupe_key) already
+        # exists. Return the existing id so callers see the idempotent identity.
+        existing = conn.execute(
+            "SELECT id FROM board_signals WHERE board = ? AND dedupe_key = ? LIMIT 1",
+            (board_slug, key),
+        ).fetchone()
+        return int(existing[0]) if existing else -1
     return int(cur.lastrowid)
 
 
@@ -9898,6 +11842,9 @@ def complete_task(
             reward_value=(float(time_to_done) if time_to_done is not None else None),
             reward_kind=("time_to_done" if time_to_done is not None else None),
             realized_at=now,
+            # Exactly-once: one terminal completion per (task, run). A replayed
+            # completion of the same run must not re-credit time_to_done.
+            dedupe_key=f"complete:{task_id}:{run_id}",
         )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
@@ -11755,6 +13702,11 @@ def trigger_reactive_event(
                         reward_value=1.0,
                         reward_kind="reply",
                         realized_at=now,
+                        # Exactly-once: one reply reward per (route, inbound
+                        # fingerprint). Distinct replies carry distinct
+                        # fingerprints and still each count; a replay of the
+                        # SAME inbound event (same fingerprint) does not.
+                        dedupe_key=f"reply:{route.id}:{fingerprint}",
                     )
                 # A timer schedule sleeping on this loop should re-arm on the
                 # reply (the conversation advanced); reactive_tick resumes it.
@@ -12671,6 +14623,595 @@ def reactive_tick(
 
 
 # ---------------------------------------------------------------------------
+# Tier-1 sensor primitives: per-board evaluation tick + dispatch gating.
+#
+# Three first-class, contract-declarable detectors (heartbeat/stall, circuit
+# breaker, budget meter) are evaluated once per board per tick at the SAME tick
+# site as reactive_tick/optimizer_tick (gateway/run.py and run_daemon). Each
+# sensor: reads its live inputs, calls a PURE decision in kanban_sensors, folds
+# its bounded-knob thresholds in, persists state to board_sensor_state, and
+# emits a structured signal (sensor_heartbeat / sensor_circuit / sensor_budget)
+# ONLY on a state transition. The persisted state is what evaluate_dispatch_
+# eligibility consults to block (circuit open) / throttle (over budget/rate)
+# dispatch. The whole tick is best-effort -- a sensor error cannot break the
+# dispatcher (wrapped at the call site like retention).
+# ---------------------------------------------------------------------------
+
+#: Sentinel ``entity_ref`` for board-level (non-per-entity) sensor state rows.
+_SENSOR_BOARD_ENTITY: str = ""
+
+
+def _board_contract_tunables(contract: dict[str, Any]) -> dict[str, Any]:
+    """Return the contract's tunables block (top-level or under runtime)."""
+    tunables = contract.get("tunables")
+    if not isinstance(tunables, dict):
+        runtime = contract.get("runtime")
+        tunables = runtime.get("tunables") if isinstance(runtime, dict) else None
+    return tunables if isinstance(tunables, dict) else {}
+
+
+def _read_sensor_state_row(
+    conn: sqlite3.Connection, board: str, kind: str, key: str, entity_ref: str
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT status, state, updated_at FROM board_sensor_state "
+        "WHERE board = ? AND sensor_kind = ? AND sensor_key = ? AND entity_ref = ?",
+        (board, kind, key, entity_ref),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        state = json.loads(row["state"]) if row["state"] else {}
+    except (TypeError, ValueError):
+        state = {}
+    return {"status": row["status"], "state": state, "updated_at": row["updated_at"]}
+
+
+def _write_sensor_state(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    kind: str,
+    key: str,
+    entity_ref: str,
+    status: str,
+    state: dict[str, Any],
+    now: int,
+) -> None:
+    conn.execute(
+        "INSERT INTO board_sensor_state (board, sensor_kind, sensor_key, entity_ref, "
+        "status, state, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(board, sensor_kind, sensor_key, entity_ref) DO UPDATE SET "
+        "status = excluded.status, state = excluded.state, updated_at = excluded.updated_at",
+        (board, kind, key, entity_ref, status, _json_text_or_none(state), now),
+    )
+
+
+def get_sensor_states(
+    conn: sqlite3.Connection, *, board: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """Return every persisted sensor-state row for a board (read-model helper)."""
+    board_slug = _connection_board(conn, board)
+    rows = conn.execute(
+        "SELECT sensor_kind, sensor_key, entity_ref, status, state, updated_at "
+        "FROM board_sensor_state WHERE board = ? "
+        "ORDER BY sensor_kind ASC, sensor_key ASC, entity_ref ASC",
+        (board_slug,),
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            state = json.loads(row["state"]) if row["state"] else {}
+        except (TypeError, ValueError):
+            state = {}
+        out.append({
+            "sensor_kind": row["sensor_kind"],
+            "sensor_key": row["sensor_key"],
+            "entity_ref": row["entity_ref"] or None,
+            "status": row["status"],
+            "state": state,
+            "updated_at": row["updated_at"],
+        })
+    return out
+
+
+def build_sensor_state_read_model(
+    conn: sqlite3.Connection, *, board: Optional[str] = None
+) -> dict[str, Any]:
+    """Read-model of declared Tier-1 sensors + their current live state.
+
+    ``declared`` lists the contract's sensors (kind, key, knob bindings) so the
+    dashboard can show which detectors exist even before they have ticked;
+    ``states`` is the live ``board_sensor_state`` (per-entity for heartbeat,
+    board-level for circuit/budget). Pure read-model, no side effects.
+    """
+    board_slug = _connection_board(conn, board)
+    declared: list[dict[str, Any]] = []
+    try:
+        contract = _metadata_as_business_contract(read_board_metadata(board_slug))
+        for sensor in board_sensors(contract):
+            declared.append({
+                "kind": sensor.get("kind"),
+                "key": sensor.get("key"),
+                "knobs": sensor.get("knobs"),
+                "gates_side_effect_class": sensor.get("gates_side_effect_class"),
+            })
+    except Exception:  # pragma: no cover - defensive read
+        declared = []
+    return {"declared": declared, "states": get_sensor_states(conn, board=board_slug)}
+
+
+def _emit_sensor_signal(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    signal_kind: str,
+    sensor_key: str,
+    entity_ref: Optional[str],
+    payload: dict[str, Any],
+    now: int,
+) -> None:
+    """Emit a sensor transition as append-only telemetry (best-effort).
+
+    De-duped by ``(board, dedupe_key)`` where the key embeds the transition + a
+    coarse time bucket, so a tick replayed within the same second is a no-op but
+    a genuine later re-transition is recorded.
+    """
+    transition = str(payload.get("transition") or payload.get("status") or "")
+    dedupe = f"{signal_kind}:{sensor_key}:{entity_ref or ''}:{transition}:{now}"
+    _safe_record_board_signal(
+        conn,
+        board=board,
+        primitive_kind=signal_kind,
+        primitive_key=sensor_key,
+        entity_ref=entity_ref,
+        action={"kind": signal_kind, "params": payload},
+        context_features=_signal_context_features(board, None),
+        ts=now,
+        dedupe_key=dedupe,
+    )
+
+
+def _sensors_tick_heartbeat(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    sensor: dict[str, Any],
+    tunables: dict[str, Any],
+    now: int,
+    result: dict[str, Any],
+) -> None:
+    from hermes_cli import kanban_sensors as _sensors
+
+    key = str(sensor.get("key") or "heartbeat")
+    knobs = _sensors.resolve_sensor_knobs(sensor, tunables)
+    stall_timeout = knobs.get("stall_timeout")
+    heartbeat_interval = knobs.get("heartbeat_interval")
+    max_missed = knobs.get("max_missed_beats")
+    live_task_ids: set[str] = set()
+    rows = conn.execute(
+        "SELECT id, started_at, last_heartbeat_at FROM tasks WHERE status = 'running'"
+    ).fetchall()
+    for row in rows:
+        task_id = row["id"]
+        live_task_ids.add(task_id)
+        last_progress = row["last_heartbeat_at"] or row["started_at"]
+        prev = _read_sensor_state_row(conn, board, "heartbeat", key, task_id)
+        decision = _sensors.heartbeat_decision(
+            prev_status=prev["status"] if prev else None,
+            now=now,
+            last_progress_at=last_progress,
+            stall_timeout=stall_timeout,
+            heartbeat_interval=heartbeat_interval,
+            max_missed_beats=max_missed,
+        )
+        _write_sensor_state(
+            conn, board=board, kind="heartbeat", key=key, entity_ref=task_id,
+            status=decision.status, state=decision.state, now=now,
+        )
+        if decision.transitioned:
+            payload = dict(decision.signal)
+            payload["sensor_key"] = key
+            payload["task_id"] = task_id
+            _emit_sensor_signal(
+                conn, board=board, signal_kind="sensor_heartbeat", sensor_key=key,
+                entity_ref=task_id, payload=payload, now=now,
+            )
+            result.setdefault("heartbeat", []).append(
+                {"task_id": task_id, "transition": decision.signal.get("transition")}
+            )
+    # A previously-stalled entity that is no longer running has recovered (the
+    # work finished / was reclaimed): emit the recovery transition once.
+    stalled_rows = conn.execute(
+        "SELECT entity_ref FROM board_sensor_state "
+        "WHERE board = ? AND sensor_kind = 'heartbeat' AND sensor_key = ? "
+        "AND status = ? AND entity_ref != ''",
+        (board, key, _sensors.HEARTBEAT_STALLED),
+    ).fetchall()
+    for row in stalled_rows:
+        entity_ref = row["entity_ref"]
+        if entity_ref in live_task_ids:
+            continue
+        _write_sensor_state(
+            conn, board=board, kind="heartbeat", key=key, entity_ref=entity_ref,
+            status=_sensors.HEARTBEAT_HEALTHY, state={"recovered": True}, now=now,
+        )
+        payload = {
+            "transition": f"{_sensors.HEARTBEAT_STALLED}->{_sensors.HEARTBEAT_HEALTHY}",
+            "sensor_key": key, "task_id": entity_ref, "reason": "no_longer_running",
+        }
+        _emit_sensor_signal(
+            conn, board=board, signal_kind="sensor_heartbeat", sensor_key=key,
+            entity_ref=entity_ref, payload=payload, now=now,
+        )
+        result.setdefault("heartbeat", []).append(
+            {"task_id": entity_ref, "transition": payload["transition"]}
+        )
+
+
+def _circuit_window_counts(
+    conn: sqlite3.Connection, *, window: Optional[float], now: int
+) -> tuple[int, int]:
+    """Count (failures, successes) among task_runs ended within the window."""
+    from hermes_cli import kanban_sensors as _sensors
+
+    if window and window > 0:
+        cutoff = int(now) - int(window)
+        rows = conn.execute(
+            "SELECT outcome, COUNT(*) AS n FROM task_runs "
+            "WHERE ended_at IS NOT NULL AND ended_at >= ? GROUP BY outcome",
+            (cutoff,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT outcome, COUNT(*) AS n FROM task_runs "
+            "WHERE ended_at IS NOT NULL GROUP BY outcome"
+        ).fetchall()
+    failures = successes = 0
+    for row in rows:
+        outcome = str(row["outcome"] or "").strip().lower()
+        n = int(row["n"] or 0)
+        if outcome in _sensors.CIRCUIT_FAILURE_OUTCOMES:
+            failures += n
+        elif outcome in _sensors.CIRCUIT_SUCCESS_OUTCOMES:
+            successes += n
+    return failures, successes
+
+
+def _sensors_tick_circuit(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    sensor: dict[str, Any],
+    tunables: dict[str, Any],
+    now: int,
+    result: dict[str, Any],
+) -> None:
+    from hermes_cli import kanban_sensors as _sensors
+
+    key = str(sensor.get("key") or "circuit_breaker")
+    knobs = _sensors.resolve_sensor_knobs(sensor, tunables)
+    failures, successes = _circuit_window_counts(conn, window=knobs.get("window"), now=now)
+    prev = _read_sensor_state_row(conn, board, "circuit_breaker", key, _SENSOR_BOARD_ENTITY)
+    opened_at = (prev or {}).get("state", {}).get("opened_at") if prev else None
+    decision = _sensors.circuit_decision(
+        prev_state=prev["status"] if prev else None,
+        now=now,
+        opened_at=opened_at,
+        failures=failures,
+        successes=successes,
+        failure_rate_threshold=knobs.get("failure_rate_threshold"),
+        min_samples=knobs.get("min_samples"),
+        cooldown=knobs.get("cooldown"),
+    )
+    state = dict(decision.state)
+    state["gates_side_effect_class"] = sensor.get("gates_side_effect_class")
+    _write_sensor_state(
+        conn, board=board, kind="circuit_breaker", key=key,
+        entity_ref=_SENSOR_BOARD_ENTITY, status=decision.status, state=state, now=now,
+    )
+    if decision.transitioned:
+        payload = dict(decision.signal)
+        payload["sensor_key"] = key
+        payload["gates_side_effect_class"] = sensor.get("gates_side_effect_class")
+        # An open transition is an escalation -- the owner is notified via the
+        # signal stream (P5 can turn this into an amendment proposal).
+        payload["escalated"] = decision.status == _sensors.CIRCUIT_OPEN
+        _emit_sensor_signal(
+            conn, board=board, signal_kind="sensor_circuit", sensor_key=key,
+            entity_ref=None, payload=payload, now=now,
+        )
+        result.setdefault("circuit", []).append(
+            {
+                "sensor_key": key,
+                "transition": decision.signal.get("transition"),
+                "status": decision.status,
+                "gates_side_effect_class": sensor.get("gates_side_effect_class"),
+            }
+        )
+
+
+def _sensors_tick_budget(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    sensor: dict[str, Any],
+    tunables: dict[str, Any],
+    now: int,
+    result: dict[str, Any],
+) -> None:
+    from hermes_cli import kanban_sensors as _sensors
+
+    key = str(sensor.get("key") or "budget")
+    knobs = _sensors.resolve_sensor_knobs(sensor, tunables)
+    prev = _read_sensor_state_row(conn, board, "budget", key, _SENSOR_BOARD_ENTITY)
+    prev_state = (prev or {}).get("state", {}) if prev else {}
+    decision = _sensors.budget_decision(
+        prev_level=prev["status"] if prev else None,
+        now=now,
+        window_start=prev_state.get("window_start"),
+        spend=float(prev_state.get("spend") or 0.0),
+        requests=float(prev_state.get("requests") or 0.0),
+        budget_cap=knobs.get("budget_cap"),
+        rate_limit=knobs.get("rate_limit"),
+        warn_fraction=knobs.get("warn_fraction"),
+        window=knobs.get("window"),
+    )
+    _write_sensor_state(
+        conn, board=board, kind="budget", key=key, entity_ref=_SENSOR_BOARD_ENTITY,
+        status=decision.status, state=decision.state, now=now,
+    )
+    if decision.transitioned:
+        payload = dict(decision.signal)
+        payload["sensor_key"] = key
+        _emit_sensor_signal(
+            conn, board=board, signal_kind="sensor_budget", sensor_key=key,
+            entity_ref=None, payload=payload, now=now,
+        )
+        result.setdefault("budget", []).append(
+            {"sensor_key": key, "transition": decision.signal.get("transition")}
+        )
+
+
+def sensors_tick(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[int] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Evaluate every declared Tier-1 sensor for a board once (per-tick).
+
+    Sibling to :func:`reactive_tick`/:func:`optimizer_tick`: the gateway and the
+    standalone daemon call this once per board per tick. For each declared
+    sensor it reads live inputs, runs the pure decision in
+    :mod:`hermes_cli.kanban_sensors`, persists the new state to
+    ``board_sensor_state``, and emits a ``sensor_*`` signal on a transition.
+    Each sensor is wrapped so one sensor's failure cannot abort the others (and
+    the call site wraps the whole tick so a sensors failure cannot break
+    dispatch). Returns ``{"board", "heartbeat": [...], "circuit": [...],
+    "budget": [...], "evaluated": N}``.
+    """
+    board_slug = _connection_board(conn, board)
+    now = int(time.time()) if now is None else int(now)
+    result: dict[str, Any] = {"board": board_slug, "evaluated": 0}
+    try:
+        contract = _metadata_as_business_contract(read_board_metadata(board_slug))
+    except Exception:
+        return result
+    sensors = board_sensors(contract)
+    if not sensors:
+        return result
+    tunables = _board_contract_tunables(contract)
+    handlers = {
+        "heartbeat": _sensors_tick_heartbeat,
+        "circuit_breaker": _sensors_tick_circuit,
+        "budget": _sensors_tick_budget,
+    }
+    for sensor in sensors:
+        kind = sensor.get("kind")
+        handler = handlers.get(kind)
+        if handler is None:
+            continue
+        result["evaluated"] += 1
+        try:
+            with write_txn(conn):
+                handler(conn, board=board_slug, sensor=sensor, tunables=tunables,
+                        now=now, result=result)
+        except Exception:  # pragma: no cover - one sensor must not break the rest
+            _log.warning(
+                "kanban sensor %s/%s evaluation failed on board %s",
+                kind, sensor.get("key"), board_slug, exc_info=True,
+            )
+    # P5 closed-loop hook: a circuit breaker that just OPENED on a side-effect-
+    # gating path proposes a structural contract amendment (owner-gated). Run
+    # OUTSIDE the per-sensor write_txn (propose opens its own txn) and fully
+    # best-effort -- a proposal failure must never break the sensor tick.
+    from hermes_cli import kanban_sensors as _sensors
+    for entry in result.get("circuit", []):
+        if entry.get("status") != _sensors.CIRCUIT_OPEN:
+            continue
+        if not entry.get("gates_side_effect_class"):
+            continue
+        try:
+            drafted = propose_amendment_from_trigger(
+                conn, board=board_slug, trigger_kind="circuit_open",
+                sensor_key=entry.get("sensor_key"),
+                detail={"gates_side_effect_class": entry.get("gates_side_effect_class")},
+                now=now,
+            )
+            if drafted is not None:
+                result.setdefault("amendments_proposed", []).append(drafted["amendment_id"])
+        except Exception:  # pragma: no cover - proposal must not break the tick
+            _log.warning(
+                "P5 amendment proposal from circuit_open failed on board %s",
+                board_slug, exc_info=True,
+            )
+    return result
+
+
+def record_budget_consumption(
+    conn: sqlite3.Connection,
+    *,
+    cost: float = 0.0,
+    requests: float = 1.0,
+    board: Optional[str] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Record spend + request consumption against every declared budget sensor.
+
+    Called from the dispatcher after a successful spawn (a "request" consumes
+    one rate unit and, optionally, ``cost`` of budget). It rolls the per-window
+    meter, increments the counters, re-evaluates the level, persists the meter,
+    and emits a ``sensor_budget`` signal on a warn/trip transition. The budget
+    meter is the authoritative ledger (a single keyed row, O(1) to read at the
+    dispatch gate) -- NOT the append-only signals stream, which is pruned by
+    retention and so cannot hold a running total. Best-effort.
+    """
+    from hermes_cli import kanban_sensors as _sensors
+
+    board_slug = _connection_board(conn, board)
+    now = int(time.time()) if now is None else int(now)
+    out: dict[str, Any] = {"board": board_slug, "metered": []}
+    try:
+        contract = _metadata_as_business_contract(read_board_metadata(board_slug))
+    except Exception:
+        return out
+    sensors = [s for s in board_sensors(contract) if s.get("kind") == "budget"]
+    if not sensors:
+        return out
+    tunables = _board_contract_tunables(contract)
+    for sensor in sensors:
+        key = str(sensor.get("key") or "budget")
+        knobs = _sensors.resolve_sensor_knobs(sensor, tunables)
+        window = knobs.get("window")
+        try:
+            with write_txn(conn):
+                prev = _read_sensor_state_row(
+                    conn, board_slug, "budget", key, _SENSOR_BOARD_ENTITY
+                )
+                pstate = (prev or {}).get("state", {}) if prev else {}
+                window_start = pstate.get("window_start")
+                spend = float(pstate.get("spend") or 0.0)
+                reqs = float(pstate.get("requests") or 0.0)
+                if window_start is None:
+                    window_start = now
+                # Roll the window before adding so new consumption lands in the
+                # current window, not a stale one.
+                if window and window > 0 and now - int(window_start) >= int(window):
+                    window_start = now
+                    spend = 0.0
+                    reqs = 0.0
+                spend += float(cost)
+                reqs += float(requests)
+                decision = _sensors.budget_decision(
+                    prev_level=prev["status"] if prev else None,
+                    now=now,
+                    window_start=window_start,
+                    spend=spend,
+                    requests=reqs,
+                    budget_cap=knobs.get("budget_cap"),
+                    rate_limit=knobs.get("rate_limit"),
+                    warn_fraction=knobs.get("warn_fraction"),
+                    window=window,
+                )
+                _write_sensor_state(
+                    conn, board=board_slug, kind="budget", key=key,
+                    entity_ref=_SENSOR_BOARD_ENTITY, status=decision.status,
+                    state=decision.state, now=now,
+                )
+                if decision.transitioned:
+                    payload = dict(decision.signal)
+                    payload["sensor_key"] = key
+                    _emit_sensor_signal(
+                        conn, board=board_slug, signal_kind="sensor_budget",
+                        sensor_key=key, entity_ref=None, payload=payload, now=now,
+                    )
+                out["metered"].append({
+                    "sensor_key": key, "level": decision.status,
+                    "usage_fraction": decision.state.get("usage_fraction"),
+                })
+        except Exception:  # pragma: no cover - metering is best-effort
+            _log.warning(
+                "kanban budget metering failed on board %s sensor %s",
+                board_slug, key, exc_info=True,
+            )
+    return out
+
+
+def _sensor_dispatch_blockers(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    side_effect_class: Optional[str],
+) -> list[dict[str, Any]]:
+    """Dispatch blockers from tripped sensors (circuit open / over budget).
+
+    Reads the persisted ``board_sensor_state`` (refreshed each tick by
+    :func:`sensors_tick` and, for budget, by :func:`record_budget_consumption`)
+    so the dispatch gate honours a tripped sensor without re-deriving it:
+
+    * an **open** circuit breaker blocks dispatch on the path it gates -- a
+      breaker with no ``gates_side_effect_class`` gates the whole board; one
+      that names a class gates only tasks carrying that side-effect class;
+    * an **over-budget / over-rate** budget meter blocks new spawns board-wide.
+
+    A half-open breaker does NOT block (it lets a probe through to test
+    recovery).
+    """
+    blockers: list[dict[str, Any]] = []
+    sec = str(side_effect_class).strip() if side_effect_class else ""
+    rows = conn.execute(
+        "SELECT sensor_kind, sensor_key, status, state FROM board_sensor_state "
+        "WHERE board = ? AND sensor_kind IN ('circuit_breaker', 'budget') "
+        "AND entity_ref = ''",
+        (board,),
+    ).fetchall()
+    for row in rows:
+        try:
+            state = json.loads(row["state"]) if row["state"] else {}
+        except (TypeError, ValueError):
+            state = {}
+        if row["sensor_kind"] == "circuit_breaker" and row["status"] == "open":
+            gate = state.get("gates_side_effect_class")
+            # A breaker with no gates_side_effect_class is board-wide (blocks
+            # every dispatch). A path-specific breaker blocks ONLY tasks that
+            # carry the side-effect class it gates -- a task with a different (or
+            # no) side effect is on a different path and is not blocked.
+            if gate and (not sec or str(gate) != sec):
+                continue
+            blockers.append({
+                "code": "circuit_open",
+                "sensor_key": row["sensor_key"],
+                "gates_side_effect_class": gate,
+                "failure_rate": state.get("failure_rate"),
+                "message": (
+                    f"circuit breaker {row['sensor_key']!r} is OPEN "
+                    f"(failure_rate={state.get('failure_rate')}) -- dispatch on this "
+                    f"path is auto-paused until it recovers."
+                ),
+            })
+        elif row["sensor_kind"] == "budget":
+            over_budget = bool(state.get("over_budget"))
+            over_rate = bool(state.get("over_rate"))
+            if over_budget or over_rate:
+                blockers.append({
+                    "code": "budget_exceeded",
+                    "sensor_key": row["sensor_key"],
+                    "over_budget": over_budget,
+                    "over_rate": over_rate,
+                    "usage_fraction": state.get("usage_fraction"),
+                    "pacing": state.get("pacing"),
+                    "message": (
+                        f"budget sensor {row['sensor_key']!r} is over "
+                        f"{'budget' if over_budget else 'rate limit'} "
+                        f"(usage={state.get('usage_fraction')}) -- new spawns are "
+                        f"throttled until the window resets."
+                    ),
+                })
+    return blockers
+
+
+# ---------------------------------------------------------------------------
 # P2 optimizer: bounded-autonomy knob writes + the per-board optimizer tick.
 #
 # The learner math lives in :mod:`hermes_cli.kanban_optimizer` (pure, testable
@@ -12692,6 +15233,284 @@ OPTIMIZER_MIN_NEW_OUTCOMES: int = 5
 #: Approval-gate key namespace for knob updates that exceed the declared
 #: bounds (or name an unknown knob). Distinct from side-effect gate keys.
 KNOB_UPDATE_GATE_PREFIX: str = "knob_update"
+
+# ---------------------------------------------------------------------------
+# Signal / audit retention (operational hygiene).
+#
+# board_signals and board_knob_audit are append-only and otherwise unbounded.
+# Retention prunes rows beyond a horizon, run opportunistically from
+# ``optimizer_tick``. The chosen policy preserves the learner exactly:
+#
+#   * Learning-relevant 'outcome' rows older than the horizon are ROLLED UP into
+#     board_signal_rollup (additive sufficient stats per knob arm + reward_kind)
+#     and only then deleted. The learner reads live rows + rollups, so the
+#     posterior is identical before and after a prune -- no learning regression.
+#   * Non-learning telemetry rows (stage/substate/event_loop/knob_action/
+#     approval) are pruned outright once beyond the horizon (the learner never
+#     reads them) and also capped at a max row count.
+#   * board_knob_audit (human-facing) is pruned by horizon + max rows.
+#
+# Safe defaults are generous; env vars allow ops override without code changes.
+# ---------------------------------------------------------------------------
+
+
+def _retention_int(env_name: str, default: int) -> int:
+    raw = os.environ.get(env_name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        val = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return val if val > 0 else default
+
+
+#: Default age (seconds) beyond which signal/audit rows are eligible for prune.
+#: 90 days -- comfortably longer than any optimizer learning window, and
+#: outcome evidence is rolled up (not lost) when pruned anyway.
+def SIGNAL_RETENTION_SECONDS() -> int:
+    return _retention_int("HERMES_KANBAN_SIGNAL_RETENTION_SECONDS", 90 * 24 * 3600)
+
+
+#: Hard cap on retained non-outcome telemetry rows per board (newest kept).
+def SIGNAL_RETENTION_MAX_TELEMETRY_ROWS() -> int:
+    return _retention_int("HERMES_KANBAN_SIGNAL_MAX_TELEMETRY_ROWS", 50_000)
+
+
+#: Hard cap on retained knob-audit rows per board (newest kept).
+def KNOB_AUDIT_RETENTION_MAX_ROWS() -> int:
+    return _retention_int("HERMES_KANBAN_KNOB_AUDIT_MAX_ROWS", 10_000)
+
+
+#: Signal primitive kinds the learner reads (must be rolled up, never dropped).
+_LEARNING_SIGNAL_KINDS: frozenset[str] = frozenset({"outcome"})
+
+
+def _rollup_and_prune_outcomes(
+    conn: sqlite3.Connection, *, board: str, cutoff_ts: int
+) -> int:
+    """Fold outcome rows older than ``cutoff_ts`` into rollups, then delete them.
+
+    Returns the number of raw outcome rows pruned. Sufficient stats (n, success
+    count, reward sums) are additive, so the learner's posterior is unchanged.
+    """
+    rows = conn.execute(
+        "SELECT id, knob_snapshot, context_features, reward_value, reward_kind, ts "
+        "FROM board_signals WHERE board = ? AND primitive_kind = 'outcome' "
+        "AND reward_value IS NOT NULL AND reward_kind IS NOT NULL AND ts < ? "
+        "ORDER BY ts ASC, id ASC",
+        (board, cutoff_ts),
+    ).fetchall()
+    if not rows:
+        return 0
+    pruned_ids: list[int] = []
+    for row in rows:
+        snapshot_raw = row["knob_snapshot"]
+        reward_kind = row["reward_kind"]
+        try:
+            reward_value = float(row["reward_value"])
+        except (TypeError, ValueError):
+            continue
+        if not snapshot_raw or reward_kind is None:
+            # Cannot attribute to an arm -> safe to drop (learner skips it too).
+            pruned_ids.append(int(row["id"]))
+            continue
+        # Canonicalize the snapshot so identical arms collapse to one rollup row.
+        try:
+            snap_obj = json.loads(snapshot_raw)
+            snapshot_key = json.dumps(snap_obj, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            snapshot_key = str(snapshot_raw)
+        pos = 1.0 if reward_value > 0 else 0.0
+        ts = int(row["ts"]) if row["ts"] is not None else cutoff_ts
+        conn.execute(
+            """
+            INSERT INTO board_signal_rollup (
+                board, snapshot_key, reward_kind, knob_snapshot, context_features,
+                n, pos_count, reward_sum, reward_sq_sum, oldest_ts, newest_ts, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(board, snapshot_key, reward_kind) DO UPDATE SET
+                n             = n + 1,
+                pos_count     = pos_count + excluded.pos_count,
+                reward_sum    = reward_sum + excluded.reward_sum,
+                reward_sq_sum = reward_sq_sum + excluded.reward_sq_sum,
+                oldest_ts     = MIN(oldest_ts, excluded.oldest_ts),
+                newest_ts     = MAX(newest_ts, excluded.newest_ts),
+                context_features = COALESCE(excluded.context_features, context_features),
+                updated_at    = excluded.updated_at
+            """,
+            (
+                board, snapshot_key, reward_kind, snapshot_raw, row["context_features"],
+                pos, reward_value, reward_value * reward_value, ts, ts, cutoff_ts,
+            ),
+        )
+        pruned_ids.append(int(row["id"]))
+    if pruned_ids:
+        _delete_ids_in_batches(conn, "board_signals", pruned_ids)
+    return len(pruned_ids)
+
+
+def _delete_ids_in_batches(
+    conn: sqlite3.Connection, table: str, ids: list[int], *, batch: int = 500
+) -> None:
+    for i in range(0, len(ids), batch):
+        chunk = ids[i : i + batch]
+        placeholders = ",".join("?" for _ in chunk)
+        conn.execute(f"DELETE FROM {table} WHERE id IN ({placeholders})", tuple(chunk))
+
+
+def _prune_telemetry_signals(
+    conn: sqlite3.Connection, *, board: str, cutoff_ts: int, max_rows: int
+) -> int:
+    """Prune non-learning telemetry rows beyond the horizon and the max cap.
+
+    The learner only reads 'outcome' rows, so everything else is safe to drop
+    outright. Deletes rows older than ``cutoff_ts`` AND, beyond ``max_rows``,
+    the oldest surplus rows.
+    """
+    pruned = 0
+    cur = conn.execute(
+        "DELETE FROM board_signals WHERE board = ? AND primitive_kind != 'outcome' AND ts < ?",
+        (board, cutoff_ts),
+    )
+    pruned += int(cur.rowcount or 0)
+    # Enforce the max-row cap on whatever telemetry remains (keep newest).
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM board_signals WHERE board = ? AND primitive_kind != 'outcome'",
+        (board,),
+    ).fetchone()
+    count = int(remaining[0]) if remaining and remaining[0] is not None else 0
+    if count > max_rows:
+        surplus = count - max_rows
+        old_ids = [
+            int(r[0])
+            for r in conn.execute(
+                "SELECT id FROM board_signals WHERE board = ? AND primitive_kind != 'outcome' "
+                "ORDER BY ts ASC, id ASC LIMIT ?",
+                (board, surplus),
+            ).fetchall()
+        ]
+        if old_ids:
+            _delete_ids_in_batches(conn, "board_signals", old_ids)
+            pruned += len(old_ids)
+    return pruned
+
+
+def _prune_knob_audit(
+    conn: sqlite3.Connection, *, board: str, cutoff_ts: int, max_rows: int
+) -> int:
+    """Prune knob-audit rows beyond the horizon + the max-row cap (newest kept)."""
+    pruned = 0
+    cur = conn.execute(
+        "DELETE FROM board_knob_audit WHERE board = ? AND ts < ?",
+        (board, cutoff_ts),
+    )
+    pruned += int(cur.rowcount or 0)
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM board_knob_audit WHERE board = ?", (board,)
+    ).fetchone()
+    count = int(remaining[0]) if remaining and remaining[0] is not None else 0
+    if count > max_rows:
+        surplus = count - max_rows
+        old_ids = [
+            int(r[0])
+            for r in conn.execute(
+                "SELECT id FROM board_knob_audit WHERE board = ? ORDER BY ts ASC, id ASC LIMIT ?",
+                (board, surplus),
+            ).fetchall()
+        ]
+        if old_ids:
+            _delete_ids_in_batches(conn, "board_knob_audit", old_ids)
+            pruned += len(old_ids)
+    return pruned
+
+
+def prune_board_retention(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    now: Optional[int] = None,
+    retention_seconds: Optional[int] = None,
+    max_telemetry_rows: Optional[int] = None,
+    max_audit_rows: Optional[int] = None,
+) -> dict[str, int]:
+    """Opportunistic retention prune for a board's signal/audit ledgers.
+
+    Rolls up + prunes outcome rows beyond the horizon (posterior-preserving),
+    prunes non-learning telemetry and knob-audit rows beyond the horizon and a
+    max-row cap. Returns a small dict of how many rows were pruned per ledger.
+    Best-effort: wrapped in a write txn by the caller path.
+    """
+    board_slug = _connection_board(conn, board)
+    when = int(time.time()) if now is None else int(now)
+    horizon = retention_seconds if retention_seconds is not None else SIGNAL_RETENTION_SECONDS()
+    cutoff = when - max(0, int(horizon))
+    max_tel = max_telemetry_rows if max_telemetry_rows is not None else SIGNAL_RETENTION_MAX_TELEMETRY_ROWS()
+    max_aud = max_audit_rows if max_audit_rows is not None else KNOB_AUDIT_RETENTION_MAX_ROWS()
+    result = {"outcomes_rolled_up": 0, "telemetry_pruned": 0, "audit_pruned": 0}
+    with write_txn(conn):
+        result["outcomes_rolled_up"] = _rollup_and_prune_outcomes(
+            conn, board=board_slug, cutoff_ts=cutoff
+        )
+        result["telemetry_pruned"] = _prune_telemetry_signals(
+            conn, board=board_slug, cutoff_ts=cutoff, max_rows=max_tel
+        )
+        result["audit_pruned"] = _prune_knob_audit(
+            conn, board=board_slug, cutoff_ts=cutoff, max_rows=max_aud
+        )
+    return result
+
+
+def _read_outcome_rollups(
+    conn: sqlite3.Connection, *, board: str, knob: str
+) -> dict[Any, dict[str, float]]:
+    """Read rolled-up sufficient stats for ``knob``, grouped by reward family.
+
+    Returns ``{arm_key: {"family", "n", "success", "util_sum", "util_sq_sum"}}``
+    -- the exact additive contributions to merge into the live ArmEvidence so a
+    posterior over (live rows + rollups) matches the pre-prune posterior.
+    """
+    from hermes_cli import kanban_optimizer as _opt
+
+    try:
+        rows = conn.execute(
+            "SELECT knob_snapshot, reward_kind, n, pos_count, reward_sum, reward_sq_sum "
+            "FROM board_signal_rollup WHERE board = ?",
+            (board,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    out: dict[Any, dict[str, float]] = {}
+    for row in rows:
+        family = _opt.reward_family(row["reward_kind"])
+        if family is None:
+            continue
+        snapshot_raw = row["knob_snapshot"]
+        if not snapshot_raw:
+            continue
+        try:
+            snap = json.loads(snapshot_raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(snap, dict) or knob not in snap:
+            continue
+        arm_key = _opt._arm_key(snap.get(knob))
+        n = float(row["n"] or 0)
+        if n <= 0:
+            continue
+        entry = out.setdefault(
+            arm_key,
+            {"family": family, "n": 0.0, "success": 0.0, "util_sum": 0.0, "util_sq_sum": 0.0},
+        )
+        entry["n"] += n
+        if family == "binary":
+            entry["success"] += float(row["pos_count"] or 0)
+        else:
+            # Continuous utility is -reward (lower reward is better), so the
+            # utility sum is -reward_sum and util^2 == reward^2.
+            entry["util_sum"] += -float(row["reward_sum"] or 0)
+            entry["util_sq_sum"] += float(row["reward_sq_sum"] or 0)
+    return out
 
 
 def _record_knob_audit(
@@ -12760,16 +15579,27 @@ def _read_sibling_outcome_observations(
     except Exception:
         return out
     conn: Optional[sqlite3.Connection] = None
+    has_dedupe = True
     try:
         uri = f"file:{db_path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=0.5)
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT knob_snapshot, reward_kind, reward_value, context_features "
-            "FROM board_signals WHERE primitive_kind = 'outcome' "
-            "AND reward_value IS NOT NULL AND reward_kind IS NOT NULL "
-            "ORDER BY ts ASC, id ASC"
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                "SELECT knob_snapshot, reward_kind, reward_value, context_features, dedupe_key "
+                "FROM board_signals WHERE primitive_kind = 'outcome' "
+                "AND reward_value IS NOT NULL AND reward_kind IS NOT NULL "
+                "ORDER BY ts ASC, id ASC"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Legacy sibling DB predating the dedupe_key column.
+            has_dedupe = False
+            rows = conn.execute(
+                "SELECT knob_snapshot, reward_kind, reward_value, context_features "
+                "FROM board_signals WHERE primitive_kind = 'outcome' "
+                "AND reward_value IS NOT NULL AND reward_kind IS NOT NULL "
+                "ORDER BY ts ASC, id ASC"
+            ).fetchall()
     except Exception:
         rows = []
     finally:
@@ -12778,7 +15608,14 @@ def _read_sibling_outcome_observations(
                 conn.close()
             except Exception:
                 pass
+    seen_keys: set[str] = set()
     for row in rows:
+        if has_dedupe:
+            dedupe_key = row["dedupe_key"]
+            if dedupe_key:
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
         snapshot_raw = row["knob_snapshot"]
         if not snapshot_raw:
             continue
@@ -12838,7 +15675,11 @@ def read_cross_business_evidence(
         except Exception:
             board_slugs = []
 
-    observations: list[tuple[Any, Optional[str], Any]] = []
+    # Per-sibling observation lists (NOT one flattened stream) so the pooling
+    # guards (min-evidence floor + per-sibling per-arm cap) can bound each
+    # sibling's influence -- a single adversarial / high-volume sibling cannot
+    # dominate the cold-start prior (poisoning guard).
+    sibling_observations: list[list[tuple[Any, Optional[str], Any]]] = []
     matched_boards: list[dict] = []
     for slug in board_slugs:
         norm = _normalize_board_slug(slug) if slug else None
@@ -12848,16 +15689,16 @@ def read_cross_business_evidence(
             db_path = kanban_db_path(board=norm)
         except Exception:
             continue
-        matched_here = 0
+        this_sibling: list[tuple[Any, Optional[str], Any]] = []
         for value, reward_kind, reward_value, ctx in _read_sibling_outcome_observations(db_path, knob):
             if _opt.context_matches(target_context, ctx):
-                observations.append((value, reward_kind, reward_value))
-                matched_here += 1
-        if matched_here:
-            matched_boards.append({"board": norm, "outcomes": matched_here})
+                this_sibling.append((value, reward_kind, reward_value))
+        if this_sibling:
+            sibling_observations.append(this_sibling)
+            matched_boards.append({"board": norm, "outcomes": len(this_sibling)})
 
-    pooled_family, pooled_by_arm = _opt.aggregate_arm_evidence(
-        observations, candidates, family=family,
+    pooled_family, pooled_by_arm = _opt.pool_sibling_evidence(
+        sibling_observations, candidates, family=family,
     )
     meta = {
         "matched_boards": matched_boards,
@@ -12946,6 +15787,24 @@ def apply_knob_update(
                 context_features=ctx,
                 ts=when,
             )
+        # P5 closed-loop hook: a KNOWN-but-out-of-bounds proposal is a STRUCTURAL
+        # knob-range change -> draft an owner-gated P5 amendment (origin
+        # ``optimizer``) that widens the range to include ``new_value``, instead
+        # of leaving a dead-end ``approval_required`` record. An UNKNOWN knob
+        # (inventing a new tunable) is a larger structural change left as an
+        # explicit hook (no auto-draft). Best-effort: never break the knob path.
+        amendment_id: Optional[str] = None
+        if known:
+            try:
+                amendment_id = _propose_knob_range_amendment(
+                    conn, board=board_slug, contract=contract, knob=knob,
+                    new_value=new_value, reason=reason or deny_reason, now=when,
+                )
+            except Exception:  # pragma: no cover - defensive hook guard
+                _log.warning(
+                    "P5 knob-range amendment proposal failed for %s on board %s",
+                    knob, board_slug, exc_info=True,
+                )
         return {
             "board": board_slug,
             "knob": knob,
@@ -12958,6 +15817,7 @@ def apply_knob_update(
             "audit_id": audit_id,
             "signal_id": signal_id,
             "contract_version": contract_version,
+            "amendment_id": amendment_id,
         }
 
     # --- No-op: proposal equals the current value. --------------------------
@@ -12993,6 +15853,10 @@ def apply_knob_update(
         board_slug,
         business_contract=new_contract,
         contract_version=new_version,
+        # CAS: the knob value we are bumping was read at ``contract_version``;
+        # if a concurrent amendment moved the contract on, reject rather than
+        # clobber the newer contract with our stale tunable edit.
+        expected_version=contract_version,
     )
     rearmed = 0
     with write_txn(conn):
@@ -13138,6 +16002,14 @@ def optimizer_tick(
         "skipped": [],
         "gated": [],
     }
+    # Opportunistic retention prune (operational hygiene). Best-effort: a prune
+    # failure must never break the learning tick. The rollup keeps the learner's
+    # posterior intact, so this is safe to run before evaluating the knob.
+    try:
+        result["retention"] = prune_board_retention(conn, board=board_slug, now=when)
+    except Exception:  # pragma: no cover - retention is best-effort hygiene
+        _log.warning("kanban retention prune failed for board %s", board_slug, exc_info=True)
+
     try:
         contract = _metadata_as_business_contract(read_board_metadata(board_slug))
     except Exception as exc:
@@ -13323,6 +16195,30 @@ def build_learned_state_read_model(
 
     board_slug = _connection_board(conn, board)
     result: dict[str, Any] = {"board": board_slug, "knobs": []}
+    # Surface current Tier-1 sensor states alongside the learned knob state so
+    # the dashboard / GET /learned-state shows live heartbeat/circuit/budget
+    # status in one read-model. Best-effort: never let sensor surfacing break
+    # the learned-state read.
+    try:
+        result["sensors"] = build_sensor_state_read_model(conn, board=board_slug)
+    except Exception:  # pragma: no cover - defensive read-model guard
+        result["sensors"] = {"declared": [], "states": []}
+    # Surface pending P5 contract amendments (the self-evolution loop) alongside
+    # the learned knob state so the dashboard / GET /learned-state shows what
+    # structural changes are proposed/awaiting the owner. Best-effort + low-cost.
+    try:
+        result["contract_amendments"] = build_contract_amendments_read_model(
+            conn, board=board_slug
+        )
+    except Exception:  # pragma: no cover - defensive read-model guard
+        result["contract_amendments"] = {"board": board_slug, "pending": 0, "amendments": []}
+    # Surface open P6 steering sessions (the conversational CEO channel) + any
+    # drafted amendment ids they reference, so the dashboard / GET /learned-state
+    # shows what conversations are in flight. Best-effort + low-cost.
+    try:
+        result["steering_sessions"] = build_steering_read_model(conn, board=board_slug)
+    except Exception:  # pragma: no cover - defensive read-model guard
+        result["steering_sessions"] = {"board": board_slug, "open": 0, "sessions": []}
     try:
         contract = _metadata_as_business_contract(read_board_metadata(board_slug))
     except Exception:
@@ -13469,6 +16365,9 @@ def _close_timer_schedule(
             reward_value=reward_value,
             reward_kind=reward_kind,
             realized_at=now,
+            # Exactly-once: a timer schedule has a single terminal outcome.
+            # Shared key with the max-nudges close path so a loop counts once.
+            dedupe_key=f"loop_terminal:{int(row['id'])}",
         )
         if row["task_id"]:
             _append_event(
@@ -13569,6 +16468,9 @@ def _fire_timer_schedule(
                 reward_value=0.0,
                 reward_kind="loop_closed",
                 realized_at=now,
+                # Exactly-once: one terminal outcome per schedule (shared key
+                # with _close_timer_schedule so a loop is never counted twice).
+                dedupe_key=f"loop_terminal:{int(row['id'])}",
             )
             if row["task_id"]:
                 _append_event(
@@ -15318,6 +18220,26 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _coerce_per_profile_cap(value) -> Optional[int]:
+    """Normalize ``max_in_progress_per_profile`` to a positive int or None.
+
+    The cap reaches the dispatcher via config/env round-trips that deliver it
+    as a *string* (e.g. ``"2"``), so a bare ``count >= cap`` raised
+    ``TypeError: '>=' not supported between 'int' and 'str'``. Anything that
+    isn't a positive integer — ``0``, negatives, non-numeric strings,
+    ``None`` — means "no per-profile cap" rather than "block everything" or a
+    crash. ``bool`` is rejected too: ``True``/``False`` are never a meaningful
+    concurrency limit.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        cap = int(value)
+    except (TypeError, ValueError):
+        return None
+    return cap if cap > 0 else None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -15438,6 +18360,23 @@ def dispatch_once(
         remaining = max_in_progress - in_progress
         if max_spawn is None or max_spawn > remaining:
             max_spawn = remaining
+
+    # Per-profile concurrency cap (#21582). Coerce the (often string-valued)
+    # cap up front so the >= comparison can't TypeError and so 0/negative/
+    # non-numeric values mean "no cap". When active, snapshot the per-profile
+    # running counts ONCE, then track this tick's spawns in-memory: dry_run
+    # never mutates status='running', and even in a live tick we must count
+    # tasks we just spawned against the cap before the next ready row.
+    per_profile_cap = _coerce_per_profile_cap(max_in_progress_per_profile)
+    per_profile_running: dict[str, int] = {}
+    if per_profile_cap is not None:
+        for prof_row in conn.execute(
+            "SELECT assignee, COUNT(*) AS c FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "GROUP BY assignee"
+        ).fetchall():
+            per_profile_running[prof_row["assignee"]] = int(prof_row["c"])
+
     spawned = 0
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
@@ -15448,17 +18387,24 @@ def dispatch_once(
             if assignee and not dry_run:
                 with write_txn(conn):
                     conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (assignee, row["id"]))
+                    # Audit trail: record WHY this previously-unassigned task
+                    # gained an owner, so `hermes kanban tail` / dashboards can
+                    # distinguish an explicit assignment from the dispatcher's
+                    # default-assignee fallback.
+                    _append_event(
+                        conn,
+                        row["id"],
+                        "assigned",
+                        {"assignee": assignee, "source": "kanban.default_assignee"},
+                    )
             if assignee:
                 result.auto_assigned_default.append(row["id"])
         if not assignee:
             result.skipped_unassigned.append(row["id"])
             continue
-        if max_in_progress_per_profile is not None:
-            current_for_profile = int(conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running' AND assignee = ?",
-                (assignee,),
-            ).fetchone()[0])
-            if current_for_profile >= max_in_progress_per_profile:
+        if per_profile_cap is not None:
+            current_for_profile = per_profile_running.get(assignee, 0)
+            if current_for_profile >= per_profile_cap:
                 result.skipped_per_profile_capped.append((row["id"], assignee, current_for_profile))
                 continue
         eligibility = evaluate_dispatch_eligibility(conn, row["id"], board=board_slug)
@@ -15518,6 +18464,8 @@ def dispatch_once(
             continue
         if dry_run:
             result.spawned.append((row["id"], assignee, ""))
+            if per_profile_cap is not None:
+                per_profile_running[assignee] = per_profile_running.get(assignee, 0) + 1
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds, board=board_slug)
         if claimed is None:
@@ -15560,6 +18508,15 @@ def dispatch_once(
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            if per_profile_cap is not None:
+                per_profile_running[assignee] = per_profile_running.get(assignee, 0) + 1
+            # Tier-1 budget sensor: a spawn consumes one rate unit (+ optional
+            # spend). Meter it so the budget sensor can warn/trip and the
+            # dispatch gate can throttle further spawns this window. Best-effort.
+            try:
+                record_budget_consumption(conn, board=board_slug, requests=1.0)
+            except Exception:  # pragma: no cover - metering never breaks dispatch
+                _log.debug("budget metering after spawn failed", exc_info=True)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -16171,6 +19128,15 @@ def run_daemon(
                     _log.warning(
                         "kanban optimizer_tick failed on board %s", slug, exc_info=True
                     )
+            # Tier-1 sensor primitives: same tick site as the gateway. Wrapped
+            # best-effort (like retention) so a sensor hiccup never stops
+            # dispatch.
+            try:
+                sensors_tick(conn, board=slug)
+            except Exception:
+                _log.warning(
+                    "kanban sensors_tick failed on board %s", slug, exc_info=True
+                )
             if tick_ok:
                 try:
                     record_tick_health_success(conn, board=slug)

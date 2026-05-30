@@ -23,12 +23,51 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from hermes_cli.kanban_launch_grammar import (
+    SENSOR_KINDS,
+    SENSOR_OPTIONAL_KNOBS,
+    SENSOR_REQUIRED_KNOBS,
     SIDE_EFFECT_CLASSES,
     has_inbound as _grammar_has_inbound,
     has_timer as _grammar_has_timer,
     is_external_side_effect_class as _grammar_is_external_side_effect,
     is_known_side_effect_class as _grammar_is_known_side_effect,
     normalize_side_effect_class as _grammar_normalize_side_effect,
+    normalize_sensor_kind as _grammar_normalize_sensor_kind,
+    trigger_kind as _grammar_trigger_kind,
+)
+
+#: Side-effect classes whose actions cross an *irreversible* boundary (publish,
+#: delete, sign, move money). These MUST be explicitly gated (R5): an
+#: approval_gate ``required_before`` the action, or the class declared in the
+#: board ``side_effect_policy`` (approval_required / forbidden). The reversible
+#: external class is governed by the existing B3 rail; R5 is the stricter rail
+#: for the actions you can never take back.
+IRREVERSIBLE_SIDE_EFFECT_CLASSES: frozenset[str] = frozenset(
+    {"external_irreversible", "financial"}
+)
+
+#: Trigger fields the runtime reads as a positive timer cadence (mirrors
+#: :func:`hermes_cli.kanban_reactive_runtime.cadence_hours`). A typed timer
+#: (R2) must resolve a positive cadence from one of these, or from a managed
+#: board cadence knob.
+_CADENCE_HOUR_FIELDS: tuple[str, ...] = ("cadence_hours", "every_hours", "interval_hours")
+_CADENCE_MINUTE_FIELDS: tuple[str, ...] = ("cadence_minutes", "interval_minutes")
+_CADENCE_SECOND_FIELDS: tuple[str, ...] = ("cadence_seconds", "interval_seconds")
+_ALL_CADENCE_FIELDS: tuple[str, ...] = (
+    _CADENCE_HOUR_FIELDS + _CADENCE_MINUTE_FIELDS + _CADENCE_SECOND_FIELDS
+)
+
+#: Fields on a trigger/loop/stage that explicitly NAME a tunable knob the
+#: runtime is expected to bind to (R6). A value here that does not resolve to a
+#: bounded tunable is a dangling reference and is rejected.
+_KNOB_REFERENCE_FIELDS: tuple[str, ...] = (
+    "cadence_knob",
+    "cadence_tunable",
+    "max_nudges_knob",
+    "nudge_knob",
+    "binds_knob",
+    "tunable_ref",
+    "knob_ref",
 )
 
 
@@ -95,6 +134,24 @@ def _stage_exit_outcomes(stage: dict[str, Any]) -> int:
     return _stop_signal_count(stage.get("exit_criteria"))
 
 
+def _stage_emits_external_side_effect(stage: dict[str, Any]) -> bool:
+    """True iff the stage or one of its actions declares an external side effect.
+
+    Detected STRUCTURALLY off the typed ``side_effect_class`` primitive (R3) --
+    not by scanning free text -- so renaming a stage/label can no longer dodge
+    the conversational-stage rail. ``external_*``/``financial`` cross the board
+    boundary; ``none``/``internal`` do not.
+    """
+    if _grammar_is_external_side_effect(stage.get("side_effect_class")):
+        return True
+    for action in _as_list(stage.get("actions")):
+        if isinstance(action, dict) and _grammar_is_external_side_effect(
+            action.get("side_effect_class")
+        ):
+            return True
+    return False
+
+
 def _check_stages(root: dict[str, Any], report: InvariantReport) -> None:
     workflow = _as_dict(root.get("workflow"))
     stages = [s for s in _as_list(workflow.get("stages")) if isinstance(s, dict)]
@@ -105,14 +162,24 @@ def _check_stages(root: dict[str, Any], report: InvariantReport) -> None:
         substates = _as_list(stage.get("substates"))
         triggers = stage.get("triggers")
         has_inbound = _grammar_has_inbound(triggers)
-        # A "conversational watch stage" is one that holds an ongoing back-and-forth:
-        # it has internal substates AND can receive an external party's reply.
-        is_watch_stage = bool(substates) and has_inbound
+        emits_external = _stage_emits_external_side_effect(stage)
+        # A "conversational watch stage" is one that holds an ongoing back-and-forth.
+        # It is detected two ways so renaming free text cannot dodge the rail:
+        #   (a) classic shape: internal substates AND an inbound trigger; or
+        #   (b) R3 structural shape: an inbound trigger AND a typed external
+        #       side effect (it talks to an outside party and acts on the world),
+        #       even with no substates -- the evasion the old check missed.
+        is_watch_stage = has_inbound and (bool(substates) or emits_external)
         if is_watch_stage:
             conversational += 1
             if not _grammar_has_timer(triggers):
+                reason = (
+                    "has substates + inbound trigger"
+                    if substates
+                    else "consumes inbound and emits an external side effect"
+                )
                 report.errors.append(
-                    f"stage '{key}' is conversational (has substates + inbound trigger) "
+                    f"stage '{key}' is conversational ({reason}) "
                     f"but declares no follow-up timer trigger -- it can never decide to nudge."
                 )
             if _stage_exit_outcomes(stage) < 2:
@@ -144,6 +211,30 @@ def _check_reactive_entities(root: dict[str, Any], report: InvariantReport) -> N
                 f"reactive entity '{name}' has no terminal resolution rule and no stop "
                 f"conditions -- a watched thing that can never be closed becomes a zombie."
             )
+
+
+def _as_number(value: Any) -> Optional[float]:
+    """Return ``value`` as a float iff it is a real number (not bool/str)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _spec_numeric_range(spec: dict[str, Any]) -> Optional[tuple[Optional[float], Optional[float], bool]]:
+    """Return ``(lo, hi, declared)`` for a numeric range spec.
+
+    ``declared`` is True when the spec carries a numeric ``range``/``min``+``max``
+    shape (even a malformed one), so R1 can distinguish "no numeric range
+    declared" (discrete/allowed knob) from "declared but degenerate".
+    """
+    rng = spec.get("range")
+    if isinstance(rng, (list, tuple)) and len(rng) == 2:
+        return _as_number(rng[0]), _as_number(rng[1]), True
+    if "min" in spec or "max" in spec:
+        return _as_number(spec.get("min")), _as_number(spec.get("max")), True
+    return None
 
 
 def _coerce_nonneg_int(value: Any) -> Optional[int]:
@@ -221,15 +312,37 @@ def _check_event_loops(root: dict[str, Any], report: InvariantReport) -> None:
                     f"event loop '{name}' is conversational but has fewer than 2 terminal/stop "
                     f"outcomes -- cannot separate success from give-up."
                 )
-    # Entities (synthesized shape) must declare terminal states.
+    # Entities (synthesized shape) should declare terminal states.
     entities = [e for e in _as_list(root.get("entities")) if isinstance(e, dict)]
     report.checked["entities"] = len(entities)
+    declared_entity_keys: set[str] = set()
     for ent in entities:
         name = str(ent.get("key") or ent.get("type") or "entity")
+        for k in (ent.get("key"), ent.get("type")):
+            if isinstance(k, str) and k.strip():
+                declared_entity_keys.add(k.strip().lower())
         if _stop_signal_count(ent.get("terminal_states")) == 0:
             report.warnings.append(
                 f"entity '{name}' declares no terminal_states -- confirm how it completes."
             )
+    # R4: an event loop that watches an entity which is not declared anywhere is
+    # an immortal watcher by construction -- the runtime stop-condition evaluator
+    # has nothing to bind the entity's terminal states to, so the loop can never
+    # learn the watched thing resolved. (Only enforced when entities are declared
+    # at all; the land-style reactive_entities shape uses a different mechanism.)
+    if entities:
+        for loop in loops:
+            ref = loop.get("entity")
+            if (
+                isinstance(ref, str)
+                and ref.strip()
+                and ref.strip().lower() not in declared_entity_keys
+            ):
+                lname = str(loop.get("entity") or loop.get("type") or "loop")
+                report.errors.append(
+                    f"event loop '{lname}' watches entity {ref!r} that is not declared in "
+                    f"'entities' -- the runtime stop-condition evaluator cannot resolve it."
+                )
 
 
 def _check_tunables(root: dict[str, Any], report: InvariantReport) -> None:
@@ -259,6 +372,64 @@ def _check_tunables(root: dict[str, Any], report: InvariantReport) -> None:
             report.errors.append(
                 f"tunable '{knob}' declares no range/min-max/allowed values -- an unbounded "
                 f"knob is unsafe for autonomous tuning."
+            )
+        _check_knob_range_sanity(knob, spec, report)
+
+
+def _check_knob_range_sanity(knob: str, spec: dict[str, Any], report: InvariantReport) -> None:
+    """R1: a knob's bounds must be sane -- ``min < max``, numeric, default in range.
+
+    Rejects inverted (``min > max``) and degenerate (``min == max``) numeric
+    ranges, non-numeric range bounds, and a ``default`` that falls outside the
+    declared ``[min, max]`` (numeric) or ``allowed`` set (discrete). A
+    structurally-nonsensical range makes the bounded action space ill-defined,
+    so the optimizer could never carve safe arms from it.
+    """
+    numeric = _spec_numeric_range(spec)
+    default = spec.get("default")
+    if numeric is not None:
+        lo, hi, _declared = numeric
+        if lo is None or hi is None:
+            report.errors.append(
+                f"tunable '{knob}' declares a non-numeric range bound -- a range must be "
+                f"two numbers (min, max)."
+            )
+            return
+        if lo >= hi:
+            kind = "inverted" if lo > hi else "degenerate (min == max)"
+            report.errors.append(
+                f"tunable '{knob}' has an {kind} range [{lo}, {hi}] -- require min < max so "
+                f"the bounded action space is well-defined."
+            )
+            return
+        dv = _as_number(default)
+        if default is not None and dv is None:
+            report.errors.append(
+                f"tunable '{knob}' has a non-numeric default {default!r} for a numeric "
+                f"range [{lo}, {hi}]."
+            )
+        elif dv is not None and not (lo <= dv <= hi):
+            report.errors.append(
+                f"tunable '{knob}' default {dv} is outside its range [{lo}, {hi}]."
+            )
+        return
+    # Discrete allowed/options knob: a declared default must be a member.
+    allowed = spec.get("allowed")
+    if allowed is None:
+        allowed = spec.get("options")
+    if isinstance(allowed, (list, tuple)) and allowed and default is not None:
+        dv = _as_number(default)
+
+        def _matches(opt: Any) -> bool:
+            if default == opt:
+                return True
+            ov = _as_number(opt)
+            return dv is not None and ov is not None and dv == ov
+
+        if not any(_matches(opt) for opt in allowed):
+            report.errors.append(
+                f"tunable '{knob}' default {default!r} is not one of its allowed values "
+                f"{list(allowed)!r}."
             )
 
 
@@ -353,6 +524,328 @@ def _check_side_effect_classes(root: dict[str, Any], report: InvariantReport) ->
     report.checked["side_effect_classes"] = checked
 
 
+def _root_tunables(root: dict[str, Any]) -> dict[str, Any]:
+    tunables = root.get("tunables")
+    if not isinstance(tunables, dict):
+        tunables = _as_dict(root.get("runtime")).get("tunables")
+    return tunables if isinstance(tunables, dict) else {}
+
+
+def _iter_all_triggers(root: dict[str, Any]):
+    """Yield ``(where, trigger)`` for every trigger on a stage or event loop."""
+    workflow = _as_dict(root.get("workflow"))
+    for stage in _as_list(workflow.get("stages")):
+        if not isinstance(stage, dict):
+            continue
+        skey = str(stage.get("key") or stage.get("label") or "stage")
+        for trig in _as_list(stage.get("triggers")):
+            yield (f"stage '{skey}'", trig)
+    for loop in _as_list(root.get("event_loops")):
+        if not isinstance(loop, dict):
+            continue
+        lkey = str(loop.get("entity") or loop.get("type") or "loop")
+        for trig in _as_list(loop.get("triggers")):
+            yield (f"event loop '{lkey}'", trig)
+
+
+def _trigger_positive_cadence(trigger: Any) -> bool:
+    """True iff the trigger declares a positive timer cadence the runtime reads."""
+    if not isinstance(trigger, dict):
+        return False
+    for key in _CADENCE_HOUR_FIELDS + _CADENCE_MINUTE_FIELDS + _CADENCE_SECOND_FIELDS:
+        val = trigger.get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+            return True
+    return False
+
+
+def _trigger_bad_cadence_field(trigger: Any) -> Optional[str]:
+    """Return a description of a DECLARED-but-unusable cadence field, else None.
+
+    A cadence field present with a non-positive number or a non-numeric value
+    is degenerate -- the runtime cannot turn it into a real fire interval.
+    """
+    if not isinstance(trigger, dict):
+        return None
+    for key in _ALL_CADENCE_FIELDS:
+        if key not in trigger:
+            continue
+        val = trigger.get(key)
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return f"{key}={val!r} (not a number)"
+        if val <= 0:
+            return f"{key}={val} (must be > 0)"
+    return None
+
+
+def _has_managed_cadence_knob(root: dict[str, Any]) -> bool:
+    """True iff a tunable knob supplies a positive managed timer cadence.
+
+    Mirrors the optimizer's managed-cadence resolution: a knob whose name
+    signals a cadence/follow-up interval and whose default is a positive
+    number can drive a timer's fire interval, so a typed timer that binds to
+    the board's cadence knob does NOT need its own literal ``cadence_hours``.
+    """
+    for knob, spec in _root_tunables(root).items():
+        name = str(knob).lower()
+        if any(tok in name for tok in ("cadence", "interval", "follow_up", "followup")):
+            default = spec.get("default") if isinstance(spec, dict) else spec
+            if isinstance(default, (int, float)) and not isinstance(default, bool) and default > 0:
+                return True
+    return False
+
+
+def _check_timer_cadence(root: dict[str, Any], report: InvariantReport) -> None:
+    """R2: a typed ``kind:"timer"`` loop must declare a usable cadence.
+
+    Going-forward (typed) timers must resolve a positive fire interval: a
+    positive ``cadence_hours``/``cadence_minutes``/... on the trigger, or a
+    positive managed board cadence knob it binds to. A timer with no/zero/
+    negative cadence can never decide when to fire. Any trigger (typed or
+    legacy) that DECLARES a cadence field with a non-positive/non-numeric value
+    is rejected outright -- a declared-but-degenerate cadence is always a bug.
+
+    Legacy free-text timers (no explicit ``kind``) are upcast by the ingest
+    shim and are not held to the typed-declaration bar here.
+    """
+    managed_cadence = _has_managed_cadence_knob(root)
+    checked = 0
+    for where, trig in _iter_all_triggers(root):
+        bad = _trigger_bad_cadence_field(trig)
+        if bad is not None:
+            checked += 1
+            report.errors.append(
+                f"{where} declares a timer cadence {bad} -- a zero/negative/non-numeric "
+                f"cadence is not a usable fire interval."
+            )
+            continue
+        if _grammar_trigger_kind(trig) == "timer":
+            checked += 1
+            if not (_trigger_positive_cadence(trig) or managed_cadence):
+                report.errors.append(
+                    f"{where} is a typed timer but declares no usable cadence (a positive "
+                    f"cadence_hours/cadence_minutes/... or a managed cadence knob) -- it can "
+                    f"never decide when to fire."
+                )
+    report.checked["timer_cadences"] = checked
+
+
+def _check_irreversible_gating(root: dict[str, Any], report: InvariantReport) -> None:
+    """R5: every irreversible/financial action must be explicitly gated.
+
+    An ``external_irreversible``/``financial`` side effect cannot be undone, so
+    it must be gated by an ``approval_gates`` entry whose ``required_before``
+    names the action, OR by the board ``side_effect_policy`` declaring the
+    class in ``approval_required``/``forbidden``. An ungated irreversible/
+    financial action would dispatch autonomously -- the most dangerous kind of
+    ungoverned side effect.
+    """
+    _declared_policy, gated_policy = _policy_declared_classes(root)
+
+    # Collect every action name guarded by an approval gate's ``required_before``.
+    gated_actions: set[str] = set()
+    for gate in _as_list(root.get("approval_gates")):
+        if not isinstance(gate, dict):
+            continue
+        req = gate.get("required_before")
+        for item in (_as_list(req) if not isinstance(req, str) else [req]):
+            if isinstance(item, str) and item.strip():
+                gated_actions.add(item.strip().lower())
+
+    workflow = _as_dict(root.get("workflow"))
+    checked = 0
+    for stage in _as_list(workflow.get("stages")):
+        if not isinstance(stage, dict):
+            continue
+        skey = str(stage.get("key") or stage.get("label") or "stage")
+        for action in _as_list(stage.get("actions")):
+            if not isinstance(action, dict):
+                continue
+            canon = _grammar_normalize_side_effect(action.get("side_effect_class"))
+            if canon not in IRREVERSIBLE_SIDE_EFFECT_CLASSES:
+                continue
+            checked += 1
+            akey = str(action.get("key") or action.get("label") or "action")
+            action_names = {
+                str(action.get(k)).strip().lower()
+                for k in ("key", "label")
+                if isinstance(action.get(k), str) and str(action.get(k)).strip()
+            }
+            gate_covers = bool(action_names & gated_actions)
+            policy_covers = canon in gated_policy
+            if not (gate_covers or policy_covers):
+                report.errors.append(
+                    f"stage '{skey}' action '{akey}' has an irreversible side_effect_class "
+                    f"({canon!r}) but is neither named in any approval_gate.required_before "
+                    f"nor governed by side_effect_policy (approval_required/forbidden) -- an "
+                    f"ungated irreversible/financial action would dispatch autonomously."
+                )
+    report.checked["irreversible_actions"] = checked
+
+
+def _check_knob_references(root: dict[str, Any], report: InvariantReport) -> None:
+    """R6: a knob referenced by a loop/stage must exist as a bounded tunable.
+
+    When a trigger/loop/stage explicitly NAMES a tunable knob (e.g.
+    ``cadence_knob: "follow_up_interval_hours"``), that knob must exist in
+    ``tunables`` AND declare a bounded range/allowed set. A dangling reference
+    (or a reference to an unbounded knob) means the runtime would bind to a
+    knob it cannot resolve or safely tune.
+    """
+    tunables = _root_tunables(root)
+
+    def _knob_is_bounded(name: str) -> bool:
+        spec = tunables.get(name)
+        if not isinstance(spec, dict):
+            return False
+        return (
+            ("range" in spec)
+            or ("min" in spec and "max" in spec)
+            or ("allowed" in spec)
+            or ("options" in spec)
+        )
+
+    checked = 0
+    sources: list[tuple[str, Any]] = list(_iter_all_triggers(root))
+    for loop in _as_list(root.get("event_loops")):
+        if isinstance(loop, dict):
+            sources.append((f"event loop '{loop.get('entity') or loop.get('type') or 'loop'}'", loop))
+    workflow = _as_dict(root.get("workflow"))
+    for stage in _as_list(workflow.get("stages")):
+        if isinstance(stage, dict):
+            sources.append((f"stage '{stage.get('key') or stage.get('label') or 'stage'}'", stage))
+
+    for where, obj in sources:
+        if not isinstance(obj, dict):
+            continue
+        for field_name in _KNOB_REFERENCE_FIELDS:
+            ref = obj.get(field_name)
+            if not isinstance(ref, str) or not ref.strip():
+                continue
+            checked += 1
+            knob_name = ref.strip()
+            if knob_name not in tunables:
+                report.errors.append(
+                    f"{where} references knob {knob_name!r} via '{field_name}' but it is not "
+                    f"declared in 'tunables' -- a dangling knob reference the runtime cannot bind."
+                )
+            elif not _knob_is_bounded(knob_name):
+                report.errors.append(
+                    f"{where} references knob {knob_name!r} via '{field_name}' but that knob "
+                    f"declares no bounded range/allowed set -- it is unsafe to bind/tune."
+                )
+    report.checked["knob_references"] = checked
+
+
+def _check_sensors(root: dict[str, Any], report: InvariantReport) -> None:
+    """S1-S3: Tier-1 sensor primitives are typed, bounded, and gating-consistent.
+
+    Mirrors the trigger/side-effect rails for the new ``sensors`` block:
+
+    * **S1 (typed kind).** Every declared sensor must carry a ``kind`` from the
+      closed :data:`SENSOR_KINDS` vocabulary -- an unknown/missing kind cannot
+      be wired to a detector and is rejected.
+    * **S2 (bounded-knob thresholds).** Every threshold/window the sensor needs
+      (the kind's required knobs) must be bound, via the sensor's ``knobs`` map,
+      to a board ``tunables`` knob that declares a bounded range/allowed set --
+      so the optimizer can tune it and a P5 amendment can move it. A missing
+      required binding, a dangling binding (names a knob that does not exist),
+      or a binding to an unbounded knob is rejected. (DECLARE, DON'T INFER: no
+      inline magic thresholds.)
+    * **S3 (circuit gating consistency).** A circuit breaker that gates an
+      ``external_*``/``financial`` side-effect path must be consistent with the
+      approval rail: that class must be governed in ``side_effect_policy``
+      (approval_required/forbidden), exactly like B3 -- a breaker cannot pretend
+      to gate a path the board never declared as governed.
+    """
+    sensors = _as_list(root.get("sensors"))
+    report.checked["sensors"] = len(sensors)
+    if not sensors:
+        return
+    tunables = _root_tunables(root)
+    _declared_policy, gated_policy = _policy_declared_classes(root)
+
+    def _knob_is_bounded(name: str) -> bool:
+        spec = tunables.get(name)
+        if not isinstance(spec, dict):
+            return False
+        return (
+            ("range" in spec)
+            or ("min" in spec and "max" in spec)
+            or ("allowed" in spec)
+            or ("options" in spec)
+        )
+
+    for idx, sensor in enumerate(sensors):
+        if not isinstance(sensor, dict):
+            report.errors.append(f"sensors[{idx}] must be an object/dict.")
+            continue
+        kind = _grammar_normalize_sensor_kind(sensor.get("kind"))
+        skey = str(sensor.get("key") or sensor.get("kind") or f"sensor[{idx}]")
+        if kind is None:
+            report.errors.append(
+                f"sensor '{skey}' declares unknown/missing kind {sensor.get('kind')!r} -- "
+                f"must be one of {sorted(SENSOR_KINDS)}; an untyped sensor cannot be wired."
+            )
+            continue
+        knobs = sensor.get("knobs") if isinstance(sensor.get("knobs"), dict) else {}
+        required = SENSOR_REQUIRED_KNOBS.get(kind, ())
+        optional = SENSOR_OPTIONAL_KNOBS.get(kind, ())
+        for logical in required:
+            binding = knobs.get(logical)
+            if not isinstance(binding, str) or not binding.strip():
+                report.errors.append(
+                    f"sensor '{skey}' ({kind}) does not bind its required '{logical}' "
+                    f"threshold to a tunable knob -- a sensor threshold must be a bounded, "
+                    f"tunable knob, not an inline value."
+                )
+                continue
+            name = binding.strip()
+            if name not in tunables:
+                report.errors.append(
+                    f"sensor '{skey}' binds '{logical}' to knob {name!r} which is not "
+                    f"declared in 'tunables' -- a dangling sensor knob reference."
+                )
+            elif not _knob_is_bounded(name):
+                report.errors.append(
+                    f"sensor '{skey}' binds '{logical}' to knob {name!r} which declares no "
+                    f"bounded range/allowed set -- it is unsafe to tune."
+                )
+        # Optional knobs, when bound, must also resolve to a bounded tunable.
+        for logical in optional:
+            binding = knobs.get(logical)
+            if isinstance(binding, str) and binding.strip():
+                name = binding.strip()
+                if name not in tunables:
+                    report.errors.append(
+                        f"sensor '{skey}' binds optional '{logical}' to knob {name!r} which "
+                        f"is not declared in 'tunables' -- a dangling sensor knob reference."
+                    )
+                elif not _knob_is_bounded(name):
+                    report.errors.append(
+                        f"sensor '{skey}' binds optional '{logical}' to knob {name!r} which "
+                        f"declares no bounded range/allowed set -- it is unsafe to tune."
+                    )
+        # S3: a circuit breaker gating an external side-effect path must be
+        # governed by the approval rail (consistent with B3).
+        if kind == "circuit_breaker":
+            gate_raw = sensor.get("gates_side_effect_class")
+            if gate_raw is not None:
+                canon = _grammar_normalize_side_effect(gate_raw)
+                if canon is None:
+                    report.errors.append(
+                        f"circuit breaker '{skey}' gates unknown side_effect_class "
+                        f"{gate_raw!r} -- must be one of {sorted(SIDE_EFFECT_CLASSES)}."
+                    )
+                elif _grammar_is_external_side_effect(canon) and canon not in gated_policy:
+                    report.errors.append(
+                        f"circuit breaker '{skey}' gates an external side effect ({canon!r}) "
+                        f"that is neither approval-gated nor forbidden in side_effect_policy "
+                        f"-- the gated path is ungoverned. Add {canon!r} to "
+                        f"side_effect_policy.approval_required or .forbidden."
+                    )
+
+
 def check_contract_invariants(contract: Any) -> InvariantReport:
     """Validate the structural grammar of a board operating contract.
 
@@ -368,5 +861,9 @@ def check_contract_invariants(contract: Any) -> InvariantReport:
     _check_event_loops(root, report)
     _check_tunables(root, report)
     _check_side_effect_classes(root, report)
+    _check_timer_cadence(root, report)
+    _check_irreversible_gating(root, report)
+    _check_knob_references(root, report)
+    _check_sensors(root, report)
     report.ok = not report.errors
     return report

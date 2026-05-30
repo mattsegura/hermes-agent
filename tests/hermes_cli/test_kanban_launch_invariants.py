@@ -337,3 +337,338 @@ def test_undeclared_internal_class_is_rejected():
     assert not report.ok
     assert any("not declared in" in e for e in report.errors), report.errors
 
+
+# --- Hardening Pass 2: invariant semantic gaps R1-R6 ------------------------
+#
+# Each Rn gets a positive (valid passes) and negative (violating contract is
+# rejected with a clear error) case. The four golden fixtures continue to pass
+# all invariants (covered by the fixture tests above + the eval ratchet).
+
+
+# R1: knob ranges must be sane (min < max, default in range, numeric types).
+
+
+def test_r1_valid_knob_range_passes():
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": []},
+        "tunables": {
+            "follow_up_interval_hours": {"default": 72, "range": [24, 240]},
+            "fit_threshold": {"default": 70, "min": 0, "max": 100},
+            "mode": {"default": "fast", "allowed": ["fast", "slow"]},
+        },
+    }
+    report = check_contract_invariants(contract)
+    assert report.ok, report.errors
+
+
+def test_r1_inverted_range_is_rejected():
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": []},
+        "tunables": {"cadence_hours": {"default": 48, "range": [240, 24]}},  # min > max
+    }
+    report = check_contract_invariants(contract)
+    assert not report.ok
+    assert any("inverted" in e and "range" in e for e in report.errors), report.errors
+
+
+def test_r1_degenerate_range_is_rejected():
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": []},
+        "tunables": {"cadence_hours": {"default": 24, "range": [24, 24]}},  # min == max
+    }
+    report = check_contract_invariants(contract)
+    assert not report.ok
+    assert any("degenerate" in e for e in report.errors), report.errors
+
+
+def test_r1_default_outside_range_is_rejected():
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": []},
+        "tunables": {"cadence_hours": {"default": 999, "range": [24, 240]}},
+    }
+    report = check_contract_invariants(contract)
+    assert not report.ok
+    assert any("outside its range" in e for e in report.errors), report.errors
+
+
+def test_r1_default_not_in_allowed_is_rejected():
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": []},
+        "tunables": {"mode": {"default": "turbo", "allowed": ["fast", "slow"]}},
+    }
+    report = check_contract_invariants(contract)
+    assert not report.ok
+    assert any("not one of its allowed values" in e for e in report.errors), report.errors
+
+
+# R2: a typed kind:"timer" loop must declare a usable cadence.
+
+
+def test_r2_typed_timer_with_cadence_passes():
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": []},
+        "entities": [{"key": "t", "type": "t", "terminal_states": ["done"]}],
+        "event_loops": [
+            {
+                "type": "t_loop",
+                "entity": "t",
+                "triggers": [{"kind": "timer", "detail": "nudge", "cadence_hours": 24}],
+                "terminal_states": ["done"],
+            }
+        ],
+    }
+    report = check_contract_invariants(contract)
+    assert report.ok, report.errors
+
+
+def test_r2_typed_timer_binds_managed_cadence_knob_passes():
+    # No literal cadence on the trigger, but a managed cadence knob supplies it.
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": []},
+        "entities": [{"key": "t", "type": "t", "terminal_states": ["done"]}],
+        "event_loops": [
+            {
+                "type": "t_loop",
+                "entity": "t",
+                "triggers": [{"kind": "timer", "detail": "nudge"}],
+                "terminal_states": ["done"],
+            }
+        ],
+        "tunables": {"follow_up_interval_hours": {"default": 72, "range": [24, 240]}},
+    }
+    report = check_contract_invariants(contract)
+    assert report.ok, report.errors
+
+
+def test_r2_typed_timer_without_cadence_is_rejected():
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": []},
+        "entities": [{"key": "t", "type": "t", "terminal_states": ["done"]}],
+        "event_loops": [
+            {
+                "type": "t_loop",
+                "entity": "t",
+                "triggers": [{"kind": "timer", "detail": "nudge"}],  # no cadence, no knob
+                "terminal_states": ["done"],
+            }
+        ],
+    }
+    report = check_contract_invariants(contract)
+    assert not report.ok
+    assert any("no usable cadence" in e for e in report.errors), report.errors
+
+
+def test_r2_zero_cadence_is_rejected():
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": []},
+        "entities": [{"key": "t", "type": "t", "terminal_states": ["done"]}],
+        "event_loops": [
+            {
+                "type": "t_loop",
+                "entity": "t",
+                "triggers": [{"kind": "timer", "detail": "nudge", "cadence_hours": 0}],
+                "terminal_states": ["done"],
+            }
+        ],
+    }
+    report = check_contract_invariants(contract)
+    assert not report.ok
+    assert any("not a usable fire interval" in e for e in report.errors), report.errors
+
+
+# R3: a stage that consumes inbound AND emits an external side effect must have
+# a timer/timeout exit and >= 2 exits -- detected structurally so renaming the
+# free text cannot dodge the rail.
+
+
+def _r3_external_inbound_stage(extra: dict | None = None) -> dict:
+    stage = {
+        "key": "outreach",
+        # NOTE: no substates -- this is the evasion the old check missed.
+        "triggers": [
+            {"kind": "inbound", "detail": "they reply"},
+            {"kind": "timer", "detail": "follow up", "cadence_hours": 48},
+        ],
+        "actions": [{"key": "send", "side_effect_class": "external_reversible"}],
+        "exit_criteria": [
+            {"transition": "won", "evidence_required": ["reply"]},
+            {"transition": "lost", "evidence_required": ["ghost"]},
+        ],
+        "side_effect_policy": None,
+    }
+    if extra:
+        stage.update(extra)
+    return {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": [stage]},
+        "side_effect_policy": {
+            "allowed": ["none"],
+            "approval_required": ["external_reversible"],
+        },
+    }
+
+
+def test_r3_external_inbound_stage_with_timer_and_two_exits_passes():
+    report = check_contract_invariants(_r3_external_inbound_stage())
+    assert report.ok, report.errors
+    assert report.checked.get("conversational_stages", 0) >= 1
+
+
+def test_r3_external_inbound_stage_without_timer_is_rejected():
+    contract = _r3_external_inbound_stage()
+    # Drop the timer trigger -> conversational stage can never nudge.
+    contract["workflow"]["stages"][0]["triggers"] = [
+        {"kind": "inbound", "detail": "they reply"}
+    ]
+    report = check_contract_invariants(contract)
+    assert not report.ok
+    assert any("no follow-up timer" in e for e in report.errors), report.errors
+
+
+def test_r3_external_inbound_stage_with_single_exit_is_rejected():
+    contract = _r3_external_inbound_stage()
+    contract["workflow"]["stages"][0]["exit_criteria"] = [
+        {"transition": "won", "evidence_required": ["reply"]}
+    ]
+    report = check_contract_invariants(contract)
+    assert not report.ok
+    assert any("fewer than 2 exit" in e for e in report.errors), report.errors
+
+
+# R4: an event loop must not watch an entity that is never declared.
+
+
+def test_r4_loop_watching_declared_entity_passes():
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": []},
+        "entities": [{"key": "lead", "type": "lead", "terminal_states": ["won", "lost"]}],
+        "event_loops": [
+            {
+                "type": "lead_loop",
+                "entity": "lead",
+                "triggers": [{"kind": "timer", "detail": "nudge", "cadence_hours": 24}],
+                "terminal_states": ["won", "lost"],
+            }
+        ],
+    }
+    report = check_contract_invariants(contract)
+    assert report.ok, report.errors
+
+
+def test_r4_loop_watching_undeclared_entity_is_rejected():
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": []},
+        "entities": [{"key": "lead", "type": "lead", "terminal_states": ["won", "lost"]}],
+        "event_loops": [
+            {
+                "type": "ghost_loop",
+                "entity": "ghost",  # not declared in entities
+                "triggers": [{"kind": "timer", "detail": "nudge", "cadence_hours": 24}],
+                "terminal_states": ["done"],
+            }
+        ],
+    }
+    report = check_contract_invariants(contract)
+    assert not report.ok
+    assert any("not declared in 'entities'" in e for e in report.errors), report.errors
+
+
+# R5: an irreversible/financial action must be explicitly gated.
+
+
+def _r5_contract(gated: bool) -> dict:
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {
+            "stages": [
+                {
+                    "key": "close",
+                    "actions": [
+                        {"key": "wire_funds", "side_effect_class": "financial"},
+                    ],
+                    "exit_criteria": [
+                        {"transition": "done", "evidence_required": ["receipt"]},
+                    ],
+                }
+            ]
+        },
+        "side_effect_policy": {"allowed": ["none"]},
+    }
+    if gated:
+        contract["approval_gates"] = [
+            {"key": "owner_payment_approval", "required_before": ["wire_funds"]}
+        ]
+        contract["side_effect_policy"]["approval_required"] = ["financial"]
+    return contract
+
+
+def test_r5_gated_financial_action_passes():
+    report = check_contract_invariants(_r5_contract(gated=True))
+    assert report.ok, report.errors
+    assert report.checked.get("irreversible_actions", 0) >= 1
+
+
+def test_r5_ungated_financial_action_is_rejected():
+    # No approval gate AND not in side_effect_policy.approval_required/forbidden.
+    contract = _r5_contract(gated=False)
+    contract["side_effect_policy"]["approval_required"] = []
+    report = check_contract_invariants(contract)
+    assert not report.ok
+    assert any("ungated irreversible/financial" in e for e in report.errors), report.errors
+
+
+# R6: a knob referenced by a loop/stage must exist as a bounded tunable.
+
+
+def test_r6_resolvable_knob_reference_passes():
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": []},
+        "entities": [{"key": "t", "type": "t", "terminal_states": ["done"]}],
+        "event_loops": [
+            {
+                "type": "t_loop",
+                "entity": "t",
+                "cadence_knob": "follow_up_interval_hours",
+                "triggers": [{"kind": "timer", "detail": "nudge", "cadence_hours": 24}],
+                "terminal_states": ["done"],
+            }
+        ],
+        "tunables": {"follow_up_interval_hours": {"default": 72, "range": [24, 240]}},
+    }
+    report = check_contract_invariants(contract)
+    assert report.ok, report.errors
+    assert report.checked.get("knob_references", 0) >= 1
+
+
+def test_r6_dangling_knob_reference_is_rejected():
+    contract = {
+        "objective": {"statement": "x"},
+        "workflow": {"stages": []},
+        "entities": [{"key": "t", "type": "t", "terminal_states": ["done"]}],
+        "event_loops": [
+            {
+                "type": "t_loop",
+                "entity": "t",
+                "cadence_knob": "does_not_exist",  # dangling reference
+                "triggers": [{"kind": "timer", "detail": "nudge", "cadence_hours": 24}],
+                "terminal_states": ["done"],
+            }
+        ],
+        "tunables": {"follow_up_interval_hours": {"default": 72, "range": [24, 240]}},
+    }
+    report = check_contract_invariants(contract)
+    assert not report.ok
+    assert any("dangling knob reference" in e for e in report.errors), report.errors
+

@@ -77,6 +77,43 @@ class ContractSynthesisResult:
 
 
 @dataclass
+class CeoAmendmentProposal:
+    """A structured structural-change proposal emitted by the CEO turn.
+
+    Exactly one of ``proposed_contract`` / ``diff`` carries the structural
+    change; ``rationale`` explains it; ``required_inputs`` declares any owner
+    inputs (API keys, caps) needed before approval. This is handed verbatim to
+    :func:`hermes_cli.kanban_db.propose_contract_amendment` (origin ``ceo``) --
+    the conversation never mutates the live contract directly.
+    """
+
+    rationale: str
+    proposed_contract: Optional[dict[str, Any]] = None
+    diff: Optional[dict[str, Any]] = None
+    required_inputs: list[Any] = field(default_factory=list)
+
+
+@dataclass
+class CeoTurnResult:
+    """The CEO's reply to one owner message in a steering conversation.
+
+    ``reply`` is the natural-language message shown to the owner. ``proposal``
+    is set only when the conversation converged on a concrete STRUCTURAL change
+    (it becomes a P5 amendment). ``research_query`` is set when the CEO wants
+    grounded web research before answering (the engine runs it and re-asks).
+    ``degraded`` mirrors the rest of this module: True means no usable aux model
+    and the caller must emit a deterministic system message instead.
+    """
+
+    ok: bool
+    degraded: bool
+    reply: str = ""
+    proposal: Optional[CeoAmendmentProposal] = None
+    research_query: str = ""
+    reason: str = ""
+
+
+@dataclass
 class ExternalResearchItem:
     """A single persisted pre-interview research finding."""
 
@@ -263,6 +300,131 @@ Output ONLY the corrected JSON contract object, nothing else.
 
 def _format_repair_errors(errors: list[str]) -> str:
     return "\n".join(f"- {e}" for e in errors if str(e).strip())
+
+
+_CEO_STEERING_PROMPT = """\
+You are the Hermes CEO: the top-level reasoning for a durable agentic workflow
+("board"). You are talking directly to the board's OWNER in an ongoing
+conversation. Your job depends on the conversation mode:
+
+- mode "launch_buildout": the board is mid-intake or freshly synthesized and
+  not yet strong. Walk the owner through the coverage gaps, ask sharpening
+  questions, and converge on a STRONGER initial contract.
+- mode "runtime_evolution": the board is live. Understand the change the owner
+  wants (or explain a change a sensor/optimizer already proposed), answer
+  questions, and refine it.
+
+You are given (as JSON): the current normalized "contract" (or null pre-launch),
+its "contract_version", a deterministic "coverage" report listing which of the
+six rubric dimensions are still weak ("gaps"), the "open_amendments" already in
+flight, recent "signals", any "external_research" you previously asked for, and
+the prior "conversation" turns. Ground every statement in those inputs.
+
+CRITICAL SAFETY RAIL: you CANNOT change the live contract. The ONLY way to make
+a structural change is to emit an "amendment" proposal, which the owner must
+still explicitly approve -> validate -> mint through the P5 amendment loop. So:
+- When the conversation has NOT yet agreed on a concrete structural change,
+  just converse: ask questions, explain, clarify. Set "amendment" to null.
+- ONLY when a concrete structural change is genuinely agreed, emit an
+  "amendment" object carrying EITHER a full "proposed_contract" (a complete
+  board operating contract JSON) OR a "diff" (a partial patch deep-merged over
+  the current contract), plus a one-sentence "rationale" and, if the change
+  needs owner-supplied values (API keys, spend caps), a "required_inputs" list
+  of {key,label,type,required,inject_path} specs. The amendment is held to the
+  full launch bar (structural invariants + behavioural simulation), so keep it
+  valid: every tunable knob declares a range/allowed set; every watched
+  entity/loop declares terminal_states or stop_conditions; triggers are typed
+  objects (kind in timer|inbound|state_change|metric|manual); external side
+  effects stay owner-approval-gated.
+- If you need external facts before you can answer well, set "research_query" to
+  a focused web-search query and you will be re-invoked with the results.
+
+Output ONLY a JSON object:
+{"reply": "<message to the owner>",
+ "amendment": null | {"rationale": "...", "proposed_contract": {...} | null,
+                      "diff": {...} | null, "required_inputs": [...]},
+ "research_query": "" | "<focused query>"}
+"""
+
+
+def _coerce_ceo_proposal(value: Any) -> Optional[CeoAmendmentProposal]:
+    if not isinstance(value, dict):
+        return None
+    rationale = str(value.get("rationale") or "").strip()
+    proposed = value.get("proposed_contract")
+    diff = value.get("diff")
+    proposed = proposed if isinstance(proposed, dict) and proposed else None
+    diff = diff if isinstance(diff, dict) and diff else None
+    if proposed is None and diff is None:
+        # No structural payload -> not an actionable proposal.
+        return None
+    required = value.get("required_inputs")
+    required_list = list(required) if isinstance(required, list) else []
+    if not rationale:
+        rationale = "CEO-proposed structural change"
+    return CeoAmendmentProposal(
+        rationale=rationale,
+        proposed_contract=proposed,
+        diff=diff,
+        required_inputs=required_list,
+    )
+
+
+def run_ceo_turn(
+    *,
+    mode: str,
+    owner_message: str,
+    contract: Optional[dict[str, Any]],
+    contract_version: int,
+    coverage: Optional[dict[str, Any]] = None,
+    open_amendments: Optional[list[Any]] = None,
+    signals: Optional[list[Any]] = None,
+    conversation: Optional[list[Any]] = None,
+    external_research: Optional[Iterable[Any]] = None,
+    timeout: Optional[int] = None,
+) -> CeoTurnResult:
+    """Run one CEO conversational turn against the auxiliary model.
+
+    Reuses the SAME aux-call path as launch synthesis (``_call_model`` resolves
+    the ``kanban_launch_intake`` slot, degrades gracefully when unconfigured).
+    Returns a parsed :class:`CeoTurnResult`. When the model emits an
+    ``amendment`` object the caller routes it through ``propose_contract_amendment``
+    (origin ``ceo``); the CEO never mutates the live contract.
+    """
+    payload = {
+        "mode": str(mode or "").strip() or "runtime_evolution",
+        "owner_message": str(owner_message or "").strip(),
+        "contract": contract,
+        "contract_version": int(contract_version),
+        "coverage": coverage or {},
+        "open_amendments": list(open_amendments or []),
+        "signals": list(signals or []),
+        "conversation": list(conversation or []),
+        "external_research": list(external_research or []),
+    }
+    raw, degraded = _call_model(
+        _CEO_STEERING_PROMPT,
+        payload,
+        timeout=timeout,
+        max_tokens=HERMES_LAUNCH_INTAKE_MAX_TOKENS,
+    )
+    if degraded:
+        return CeoTurnResult(ok=False, degraded=True, reason="auxiliary unavailable")
+    parsed = _extract_json(raw or "")
+    if not isinstance(parsed, dict):
+        return CeoTurnResult(ok=False, degraded=False, reason="unparseable response")
+    reply = str(parsed.get("reply") or "").strip()
+    proposal = _coerce_ceo_proposal(parsed.get("amendment"))
+    research_query = str(parsed.get("research_query") or "").strip()
+    if not reply and proposal is None and not research_query:
+        return CeoTurnResult(ok=False, degraded=False, reason="empty response")
+    return CeoTurnResult(
+        ok=True,
+        degraded=False,
+        reply=reply,
+        proposal=proposal,
+        research_query=research_query,
+    )
 
 
 _PRE_INTERVIEW_RESEARCH_PROMPT = """\

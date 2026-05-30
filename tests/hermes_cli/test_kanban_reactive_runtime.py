@@ -823,21 +823,23 @@ def test_run_daemon_runs_reactive_and_optimizer_and_dispatch(fresh_home, monkeyp
         assert health is not None and health["last_successful_tick"] is not None
 
 
-def test_doctor_cli_exit_code_flags_stale_board(fresh_home):
+def test_doctor_cli_exit_code_flags_stale_board(fresh_home, monkeypatch):
+    # Exercise the `kanban doctor` CLI handler's exit-code contract directly,
+    # pinned at an explicit board (no global enumeration) for determinism: a
+    # board with live work and no successful tick exits non-zero; once a tick
+    # is recorded the doctor exits 0. The underlying liveness logic is covered
+    # in depth by test_doctor_flags_stale_board_with_live_work.
     from types import SimpleNamespace
 
     from hermes_cli import kanban as kbc
 
     _approve("serious", _contract())
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "serious")
     args = SimpleNamespace(
-        json=False, all_boards=True, staleness_seconds=kb.TICK_STALENESS_SECONDS,
+        json=False, all_boards=False, staleness_seconds=kb.TICK_STALENESS_SECONDS,
     )
-    # Never ticked -> live work but no successful tick -> non-zero exit.
     assert kbc._cmd_doctor(args) == 1
 
-    # Once every board with live work has a fresh successful tick, doctor is OK.
-    for slug in [b.get("slug") for b in kb.list_boards(include_archived=False)]:
-        with kb.connect(board=slug) as conn:
-            if kb.board_tick_stale(conn, board=slug)["has_live_work"]:
-                kb.record_tick_health_success(conn, board=slug)
+    with kb.connect(board="serious") as conn:
+        kb.record_tick_health_success(conn, board="serious")
     assert kbc._cmd_doctor(args) == 0

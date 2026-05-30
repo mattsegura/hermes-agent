@@ -88,6 +88,70 @@ def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypa
     ]
 
 
+@pytest.mark.skipif(
+    kb.fcntl is None, reason="POSIX flock required for cross-process board lock"
+)
+def test_bare_connect_releases_board_lock_after_block(kanban_home):
+    """Regression: a bare ``with kb.connect() as conn:`` must release the
+    cross-process board flock when the block exits, not hold it for the
+    lifetime of the process.
+
+    Previously ``_LockedConnection.__exit__`` only committed/rolled back, so
+    the exclusive ``.kanban.lock`` flock leaked until ``close()`` / process
+    exit — every other process on the same board then blocked in the 30s
+    acquire poll and errored. We verify release two ways: the in-process lock
+    registry is empty afterward, and a *fresh* file descriptor (which, like a
+    separate process, gets its own open file description and so contends with
+    any surviving flock) can take the exclusive lock non-blocking.
+    """
+    import fcntl as _fcntl
+
+    db_path = kb.kanban_db_path()
+    lockfile = db_path.parent / ".kanban.lock"
+    resolved = str(lockfile.resolve())
+
+    with kb.connect() as conn:
+        conn.execute("SELECT 1").fetchone()
+        # Inside the block the lock is held.
+        assert resolved in kb._LOCK_FDS
+
+    # After the block the registry no longer tracks the lock...
+    assert resolved not in kb._LOCK_FDS
+
+    # ...and the flock is genuinely free: a brand-new fd can grab it NB.
+    probe_fd = os.open(resolved, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        _fcntl.flock(probe_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        _fcntl.flock(probe_fd, _fcntl.LOCK_UN)
+    finally:
+        os.close(probe_fd)
+
+
+@pytest.mark.skipif(
+    kb.fcntl is None, reason="POSIX flock required for cross-process board lock"
+)
+def test_nested_connect_keeps_lock_until_outermost_block_exits(kanban_home):
+    """Reference counting: a nested ``connect()`` re-entrant on the same board
+    must not release the lock when the inner block exits — the outer block
+    still owns it. Only when the last in-process holder exits is the flock
+    actually released."""
+    db_path = kb.kanban_db_path()
+    resolved = str((db_path.parent / ".kanban.lock").resolve())
+
+    with kb.connect() as outer:
+        outer.execute("SELECT 1").fetchone()
+        with kb.connect() as inner:
+            inner.execute("SELECT 1").fetchone()
+            assert kb._LOCK_REFS.get(resolved) == 2
+        # Inner block exited, but the outer block still holds the lock.
+        assert resolved in kb._LOCK_FDS
+        assert kb._LOCK_REFS.get(resolved) == 1
+        outer.execute("SELECT 1").fetchone()
+
+    assert resolved not in kb._LOCK_FDS
+    assert resolved not in kb._LOCK_REFS
+
+
 def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
     """Kanban should classify TLS-looking page-0 clobbers before WAL setup."""
     home = tmp_path / ".hermes"
@@ -4820,17 +4884,24 @@ def test_connect_closing_yields_usable_connection(tmp_path):
         assert task.title == "closing-cm test"
 
 
-def test_bare_connect_does_not_close_on_context_exit(tmp_path):
-    """Document the leak that connect_closing exists to prevent.
+def test_bare_connect_closes_and_releases_on_context_exit(tmp_path):
+    """A bare ``with kb.connect() as conn:`` block now closes the connection
+    and releases the cross-process board lock on exit.
 
-    sqlite3.Connection's __exit__ commits/rollbacks but doesn't close.
-    This is the upstream behaviour we cannot change; the regression
-    guard is to make sure connect_closing() does the right thing.
+    Previously ``_LockedConnection.__exit__`` mirrored ``sqlite3.Connection``
+    and only committed/rolled back, leaving the connection open AND the
+    ``.kanban.lock`` flock held for the lifetime of the process — which
+    starved every other process on the same board. The fix scopes the lock
+    (and the handle) to the ``with`` block; ``connect_closing()`` remains
+    available for callers that open the connection outside a ``with``.
     """
     db_path = tmp_path / "kanban.db"
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     with kb.connect(db_path=db_path) as conn:
-        pass
-    # Still usable after with-block exit (the leak).
-    conn.execute("SELECT 1").fetchone()
-    conn.close()  # explicit close to avoid leaking THIS test
+        conn.execute("SELECT 1").fetchone()
+    # Closed on exit — no leaked handle, no leaked lock.
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT 1").fetchone()
+    if kb.fcntl is not None:
+        resolved = str((db_path.parent / ".kanban.lock").resolve())
+        assert resolved not in kb._LOCK_FDS

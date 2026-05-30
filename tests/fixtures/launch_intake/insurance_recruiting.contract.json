@@ -174,8 +174,49 @@
     "max_nudges": {"default": 3, "range": [0, 8]},
     "ghost_timeout_days": {"default": 21, "range": [7, 60]},
     "fit_threshold": {"default": 70, "range": [0, 100]},
-    "monthly_qualified_target": {"default": 15, "min": 1, "max": 200}
+    "monthly_qualified_target": {"default": 15, "min": 1, "max": 200},
+    "heartbeat_interval_seconds": {"default": 300, "range": [30, 3600]},
+    "stall_timeout_seconds": {"default": 1800, "range": [60, 86400]},
+    "circuit_failure_rate_threshold": {"default": 0.5, "range": [0.1, 1.0]},
+    "circuit_window_seconds": {"default": 3600, "range": [60, 86400]},
+    "circuit_cooldown_seconds": {"default": 600, "range": [30, 86400]},
+    "circuit_min_samples": {"default": 5, "range": [1, 100]},
+    "budget_cap_units": {"default": 100, "range": [1, 100000]},
+    "rate_limit_per_window": {"default": 30, "range": [1, 10000]},
+    "budget_warn_fraction": {"default": 0.8, "range": [0.1, 1.0]},
+    "budget_window_seconds": {"default": 3600, "range": [60, 86400]}
   },
+  "sensors": [
+    {
+      "kind": "heartbeat",
+      "key": "candidate_worker_liveness",
+      "knobs": {
+        "heartbeat_interval": "heartbeat_interval_seconds",
+        "stall_timeout": "stall_timeout_seconds"
+      }
+    },
+    {
+      "kind": "circuit_breaker",
+      "key": "outreach_dispatch",
+      "gates_side_effect_class": "external_reversible",
+      "knobs": {
+        "failure_rate_threshold": "circuit_failure_rate_threshold",
+        "window": "circuit_window_seconds",
+        "cooldown": "circuit_cooldown_seconds",
+        "min_samples": "circuit_min_samples"
+      }
+    },
+    {
+      "kind": "budget",
+      "key": "outreach_spend",
+      "knobs": {
+        "budget_cap": "budget_cap_units",
+        "rate_limit": "rate_limit_per_window",
+        "warn_fraction": "budget_warn_fraction",
+        "window": "budget_window_seconds"
+      }
+    }
+  ],
   "approval_gates": [
     {"key": "owner_outreach_approval", "required_before": ["send_after_approval", "book_interview"]},
     {"key": "license_verification_gate", "required_before": ["schedule_interview"]}
