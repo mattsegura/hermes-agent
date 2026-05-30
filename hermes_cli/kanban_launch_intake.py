@@ -226,7 +226,14 @@ must include every one of these top-level keys:
 - "workflow": {"id","goal_id","require_semantics": true,
   "workstreams": [...], "stages": [>=5 stages, each with domain-specific
   "actions" and "exit_criteria" carrying "evidence_required". Any stage
-  "triggers" must be TYPED objects (see the trigger grammar below)]}
+  "triggers" must be TYPED objects (see the trigger grammar below). A
+  CONVERSATIONAL stage -- one that consumes an inbound trigger AND either holds
+  "substates" or emits an external side effect (it waits on an outside party,
+  e.g. a reply/approval/seller back-and-forth) -- MUST also declare a "timer"
+  trigger (follow-up cadence) AND >=2 exit_criteria outcomes (at least one
+  success transition and one kill/recycle/give-up transition), so it can tell
+  a win from a dead end. A pure approval-wait stage is conversational too: give
+  it an approved->next transition and a rejected->recycle transition.]}
 - "entities": [{"key","type","states","terminal_states"}]
 - "event_loops": [{"entity","triggers","terminal_states","stop_conditions"}]
   where every entry in "triggers" (and in any stage "triggers") is a TYPED
@@ -298,8 +305,18 @@ these problems. Keep everything that was already valid; do not introduce new
 violations. In particular remember:
 - every tunable knob MUST declare a "range" or an "allowed" set;
 - any event loop / watched entity MUST declare terminal_states or stop_conditions;
-- a conversational loop (one with an inbound trigger) MUST also declare a timer
+- a conversational LOOP (one with an inbound trigger) MUST also declare a timer
   trigger and >=2 terminal/stop outcomes;
+- a conversational STAGE (an inbound trigger PLUS substates or an external
+  side_effect_class -- this includes any owner-approval-wait or reply-wait
+  stage) MUST declare a follow-up "timer" trigger AND >=2 "exit_criteria"
+  entries: at least one success transition and one kill/recycle/give-up
+  transition. To fix "fewer than 2 exit outcomes", ADD a second exit_criteria
+  (e.g. {"transition":"<recycle_or_dead_stage>","evidence_required":[...]});
+- every external_*/financial side_effect_class you use on any action MUST be
+  declared in side_effect_policy.approval_required or .forbidden (and an
+  irreversible/financial action must also be named in an approval_gate or that
+  policy) -- an undeclared/ungated external side effect is rejected;
 - triggers MUST be typed objects whose "kind" is one of:
   timer, inbound, state_change, metric, manual.
 

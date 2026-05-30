@@ -132,8 +132,12 @@ LAUNCH_INTAKE_STATE_READY_FOR_OWNER_REVIEW = "ready_for_owner_review"
 # drafter. Attempt 1 is the cold draft; the remaining attempts are repair passes
 # fed the prior attempt's structural-invariant errors. Kept small so the loop is
 # strictly bounded (no infinite re-synthesis) and cheap in aux-model calls.
+# Default 3 (1 cold + 2 repair): observed real synthesis sometimes needs a
+# second repair pass to converge on the conversational-stage / side-effect-policy
+# rails before producing a clean contract; the loop still degrades gracefully if
+# every attempt fails.
 LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS = max(
-    1, int(os.getenv("HERMES_LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS", "2"))
+    1, int(os.getenv("HERMES_LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS", "3"))
 )
 BOARD_DISPATCH_PHASES = {"active"}
 MANAGED_BOARD_RUNTIME_MODES = {"company", "business", "managed"}
