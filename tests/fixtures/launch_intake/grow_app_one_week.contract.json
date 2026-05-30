@@ -928,13 +928,13 @@
     }
   ],
   "tunables": {
-    "lifecycle_followup_delay_hours": {
+    "follow_up_interval_hours": {
       "default": 24,
       "range": [
         4,
         72
       ],
-      "controls": "How long to wait after install, activation, or trial start before triggering the next drafted lifecycle follow-up once the campaign is owner-approved."
+      "controls": "Lifecycle follow-up interval: how long to wait after install, activation, or trial start before triggering the next drafted lifecycle follow-up once the campaign is owner-approved. This is the optimizer-managed cadence knob the runtime tunes against measured conversion."
     },
     "max_lifecycle_nudges_per_user_7_days": {
       "default": 3,

@@ -309,11 +309,33 @@ def loop_max_nudges(loop: dict, tunables: Optional[dict] = None) -> Optional[int
             if n is not None and n >= 0:
                 return n
     if isinstance(tunables, dict):
+        # A nudge cap is a COUNT, not a DURATION. ``follow_up_interval_hours``
+        # (a cadence) used to match here because the name contains "follow_up",
+        # so the runtime read 72 *hours* as 72 *follow-ups* -- a ghosting
+        # counterpart would be nudged 72 times before recycling instead of the
+        # 3-4 the owner declared. Skip any knob whose name signals a duration,
+        # and prefer an explicit count-cap knob (max_*/*_cap/*_count) when more
+        # than one nudge-ish knob is present.
+        _DURATION_TOKENS = (
+            "interval", "hour", "minute", "second", "_sec", "msec", "millis",
+            "_ms", "day", "delay", "cadence", "timeout", "window", "duration",
+            "age", "ttl",
+        )
+        best: Optional[tuple[int, int]] = None  # (priority, value); lower priority wins
         for knob, spec in tunables.items():
             name = str(knob).lower()
-            if "nudge" in name or "follow_up" in name or "followup" in name:
-                default = spec.get("default") if isinstance(spec, dict) else spec
-                n = _coerce_int(default)
-                if n is not None and n >= 0:
-                    return n
+            if not ("nudge" in name or "follow_up" in name or "followup" in name
+                    or "retr" in name):
+                continue
+            if any(tok in name for tok in _DURATION_TOKENS):
+                continue
+            default = spec.get("default") if isinstance(spec, dict) else spec
+            n = _coerce_int(default)
+            if n is None or n < 0:
+                continue
+            priority = 0 if ("max" in name or "cap" in name or "count" in name) else 1
+            if best is None or priority < best[0]:
+                best = (priority, n)
+        if best is not None:
+            return best[1]
     return None

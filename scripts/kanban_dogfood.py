@@ -21,6 +21,7 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
+from typing import Optional
 
 _WORKTREE = Path(__file__).resolve().parents[1]
 if str(_WORKTREE) not in sys.path:
@@ -559,6 +560,285 @@ def scenario_steering() -> list[str]:
     return findings
 
 
+def _loop_terminal_state(contract: dict, loop_key: str) -> Optional[str]:
+    """First declared terminal_state for the loop whose entity the watcher tracks."""
+    for loop in (contract.get("event_loops") or []):
+        if str(loop.get("type")) == loop_key:
+            ts = loop.get("terminal_states") or []
+            if ts:
+                return str(ts[0])
+    return None
+
+
+def _drive_watcher(kb, conn, board: str, contract: dict, findings: list[str]) -> None:
+    """Drive the compiled prospect/entity watcher: inbound wake -> timer nudge ->
+    terminal stop, asserting exactly-once wake/nudge/outcome signals. Robust to
+    timer-only (non-inbound) loops, e.g. a metric-driven sprint."""
+    sched = conn.execute(
+        "SELECT * FROM reactive_timer_schedules WHERE board=? AND active=1 "
+        "ORDER BY id ASC LIMIT 1", (board,),
+    ).fetchone()
+    if sched is None:
+        findings.append(f"[{board}] no active timer schedule compiled for the watcher")
+        return
+    cadence = int(sched["cadence_seconds"])
+    base = int(sched["next_fire_at"])
+    entity_id = sched["entity_id"]
+    task_id = sched["task_id"]
+    loop_key = sched["loop_key"]
+    print(f"  watcher: loop_key={loop_key} cadence={cadence}s "
+          f"max_nudges={sched['max_nudges']} entity_id={entity_id}")
+
+    # 1) Inbound reply wakes the watcher (prospect replies on the business line).
+    routes = kb.list_watch_routes(conn, task_id, active=True) if task_id else []
+    had_inbound = bool(routes)
+    if routes:
+        route = routes[0]
+        kb.trigger_reactive_event(
+            conn, trigger_type=route.trigger_type, trigger_key=route.trigger_key,
+            payload={"event_id": "evt-reply-1", "body": "yes still interested"},
+            actor="mock-gateway", board=board,
+        )
+        wakes = conn.execute(
+            "SELECT action FROM board_signals WHERE board=? AND primitive_kind='event_loop'",
+            (board,),
+        ).fetchall()
+        woke = any(w["action"] and "wake" in w["action"] for w in wakes)
+        replies = conn.execute(
+            "SELECT reward_value FROM board_signals WHERE board=? AND primitive_kind='outcome' "
+            "AND reward_kind='reply'", (board,),
+        ).fetchall()
+        print(f"  inbound reply -> watcher woke={woke}; reply rewards={len(replies)}")
+        if not woke:
+            findings.append(f"[{board}] inbound reply did not wake the watcher")
+        if not replies:
+            findings.append(f"[{board}] inbound reply emitted no reply reward for the optimizer")
+    else:
+        print(f"  (watcher task {task_id} timer-only; no inbound route -- metric/timer loop)")
+
+    # 2) Timer fires a follow-up nudge on cadence; re-ticking same instant is idempotent.
+    res = kb.reactive_tick(conn, now=base, board=board)
+    fired1 = res["fired"]
+    res_again = kb.reactive_tick(conn, now=base, board=board)
+    print(f"  timer fire @cadence -> fired={fired1}; re-tick same instant -> fired={res_again['fired']}")
+    if not fired1:
+        findings.append(f"[{board}] follow-up timer did not fire on cadence")
+    if res_again["fired"]:
+        findings.append(f"[{board}] timer double-fired within one cadence window")
+
+    # 3) Resolve the watched entity to a declared terminal state -> timer stops
+    #    (no zombie). For an inbound (conversation) loop a conversion outcome is
+    #    credited exactly once.
+    if entity_id:
+        term = _loop_terminal_state(contract, loop_key) or "won"
+        kb.resolve_reactive_entity(conn, entity_id, terminal_outcome="won",
+                                   state=term, actor="dogfood")
+        stop = kb.reactive_tick(conn, now=base + cadence, board=board)
+        zombie = kb.reactive_tick(conn, now=base + 10 * cadence, board=board)
+        # Only THIS loop must have stopped; a board may have other independent
+        # loops still legitimately firing (e.g. grow_app's 5 parallel loops).
+        this_stopped = any(s["loop_key"] == loop_key for s in stop["stopped"])
+        this_zombie = any(f["loop_key"] == loop_key for f in zombie["fired"])
+        print(f"  resolve entity -> '{term}'; this-loop stopped={this_stopped}; "
+              f"this-loop later fires={this_zombie} (other loops: "
+              f"stopped={[s['loop_key'] for s in stop['stopped'] if s['loop_key']!=loop_key]}, "
+              f"fired={[f['loop_key'] for f in zombie['fired'] if f['loop_key']!=loop_key]})")
+        if not this_stopped:
+            findings.append(f"[{board}] watcher loop {loop_key} did not stop after terminal state")
+        if this_zombie:
+            findings.append(f"[{board}] zombie: loop {loop_key} kept firing after terminal stop")
+        if had_inbound:
+            conv = conn.execute(
+                "SELECT COUNT(*) n FROM board_signals WHERE board=? AND primitive_kind='outcome' "
+                "AND reward_kind='conversion'", (board,),
+            ).fetchone()["n"]
+            print(f"  terminal conversion outcomes credited: {conv}")
+            if conv < 1:
+                findings.append(f"[{board}] terminal resolution credited no conversion outcome")
+
+
+def _trip_circuit_to_amendment(kb, conn, board: str, findings: list[str]) -> Optional[str]:
+    """Drive a failure burst -> circuit breaker open -> sensor amendment proposal.
+
+    Returns the proposed amendment id (or None). Uses the domain's own
+    side-effect-gating breaker so the trip is faithful to the contract.
+    """
+    now = 9_000_000
+    with kb.write_txn(conn):
+        for i in range(8):
+            conn.execute(
+                "INSERT INTO task_runs (task_id,status,started_at,ended_at,outcome) "
+                "VALUES (?, 'crashed', ?, ?, 'crashed')", (f"cb{i}", now - 100, now - 10))
+    tick = kb.sensors_tick(conn, board=board, now=now)
+    circuits = [c.get("status") for c in (tick.get("circuit") or [])]
+    proposed = tick.get("amendments_proposed") or []
+    print(f"  circuit states={circuits}; sensor amendments proposed={proposed}")
+    if not any(s == "open" for s in circuits):
+        findings.append(f"[{board}] failure burst did not open the circuit breaker")
+    return proposed[0] if proposed else None
+
+
+def scenario_golden_lifecycle(domain: str) -> list[str]:
+    """Full live lifecycle for a repaired golden domain: launch -> compile ->
+    prospect/entity watcher (inbound wake + timer nudge + terminal stop) ->
+    sensor trip -> optimizer auto-apply -> P5 amendment mint + recompile + re-arm."""
+    findings: list[str] = []
+    import copy
+    import random
+    from hermes_cli import kanban_db as kb
+
+    contract = load_contract(domain)
+    banner(f"GL launch+compile :: {domain}")
+    res = activate(kb, domain, contract)
+    summary = kb.compile_contract_reactive_runtime(domain)
+    meta = kb.read_board_metadata(domain)
+    print(f"  activate ok={res.get('ok')} version={meta.get('contract_version')} "
+          f"phase={meta.get('launch_phase')} compiled_loops={summary.get('reused') or summary.get('compiled')}")
+
+    # ---- P5 amendment FIRST (schedule still active) to prove re-arm visibly. ----
+    banner(f"GL P5 amendment :: {domain} owner change cadence -> mint -> recompile + re-arm")
+    cad_knob = "follow_up_interval_hours"
+    with kb.connect(board=domain) as conn:
+        before_v = kb.read_board_metadata(domain).get("contract_version") or 1
+        sched_before = conn.execute(
+            "SELECT cadence_seconds FROM reactive_timer_schedules WHERE board=? AND active=1 "
+            "ORDER BY id ASC LIMIT 1", (domain,)).fetchone()
+        proposed = copy.deepcopy(contract)
+        ptun = proposed.get("tunables") or {}
+        rearm_expected = None
+        if cad_knob in ptun and "range" in ptun[cad_knob]:
+            # Halve the follow-up cadence (in-range) so the re-armed schedule must change.
+            old_default = int(ptun[cad_knob]["default"])
+            new_default = max(int(ptun[cad_knob]["range"][0]), old_default // 2)
+            ptun[cad_knob]["default"] = new_default
+            rearm_expected = new_default * 3600
+            print(f"  changing {cad_knob} default {old_default}h -> {new_default}h "
+                  f"(expect cadence {rearm_expected}s)")
+        amd = kb.propose_contract_amendment(conn, board=domain, proposed_contract=proposed,
+                                            rationale="dogfood change cadence", origin="owner")
+        aid = amd["amendment_id"]
+        tok = kb.issue_board_launch_approval_token(domain, amendment_id=aid, approved_by="owner",
+                                                   approval_evidence={"s": "x"},
+                                                   owner_authority_confirmed=True)["token"]
+        kb.approve_contract_amendment(conn, aid, board=domain, approver="owner", token=tok)
+        v = kb.validate_contract_amendment(conn, aid, board=domain)
+        m = kb.mint_contract_amendment(conn, aid, board=domain)
+        after_v = kb.read_board_metadata(domain).get("contract_version")
+        sched_after = conn.execute(
+            "SELECT cadence_seconds FROM reactive_timer_schedules WHERE board=? AND active=1 "
+            "ORDER BY id ASC LIMIT 1", (domain,)).fetchone()
+        cb = sched_before and sched_before["cadence_seconds"]
+        ca = sched_after and sched_after["cadence_seconds"]
+        print(f"  validated={v['status']} minted={m['status']} version {before_v}->{after_v}; "
+              f"cadence re-arm {cb} -> {ca}")
+        if m["status"] != kb.AMENDMENT_STATUS_ACTIVE:
+            findings.append(f"[{domain}] amendment did not mint active: {m}")
+        if after_v != before_v + 1:
+            findings.append(f"[{domain}] contract_version not bumped after mint ({before_v}->{after_v})")
+        if rearm_expected is not None and ca is not None and int(ca) != rearm_expected:
+            findings.append(f"[{domain}] timer not re-armed to new cadence "
+                            f"(got {ca}, expected {rearm_expected})")
+
+    banner(f"GL watcher :: {domain} (inbound wake / timer nudge / terminal stop)")
+    with kb.connect(board=domain) as conn:
+        _drive_watcher(kb, conn, domain, contract, findings)
+
+    # Derive a workstream/stage/action whose action carries an external_reversible
+    # side effect so the breaker (which gates external_reversible) actually gates
+    # this task's dispatch; assign a REAL worker envelope so the envelope check
+    # passes and circuit_open is the operative blocker.
+    wf = contract.get("workflow") or {}
+    goal_id = wf.get("goal_id")
+    worker_profile = ((contract.get("runtime") or {}).get("profiles") or {}).get("worker")
+    gated_ws = gated_stage = gated_action = None
+    for ws in (wf.get("workstreams") or []):
+        for st in (wf.get("stages") or []):
+            if st.get("key") not in (ws.get("stages") or []):
+                continue
+            for a in (st.get("actions") or []):
+                if isinstance(a, dict) and a.get("side_effect_class") == "external_reversible":
+                    gated_ws, gated_stage, gated_action = ws.get("key"), st.get("key"), a.get("key")
+                    break
+            if gated_action:
+                break
+        if gated_action:
+            break
+
+    banner(f"GL sensor trip :: {domain} circuit breaker -> dispatch gating")
+    with kb.connect(board=domain) as conn:
+        before = None
+        wid = None
+        if gated_action and worker_profile:
+            wid = kb.create_task(conn, title="gated worker", assignee=worker_profile, board=domain,
+                                 initial_status="blocked", goal_id=goal_id, workstream_id=gated_ws,
+                                 stage_key=gated_stage, action_key=gated_action)
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (wid,))
+            before = kb.evaluate_dispatch_eligibility(conn, wid, board=domain)
+        cb_amd = _trip_circuit_to_amendment(kb, conn, domain, findings)
+        if wid is not None:
+            after = kb.evaluate_dispatch_eligibility(conn, wid, board=domain)
+            after_codes = {b["code"] for b in after["blockers"]}
+            print(f"  gated task ({gated_stage}/{gated_action}) dispatch before trip ok={before['ok']} "
+                  f"codes_before={ {b['code'] for b in before['blockers']} }; "
+                  f"after trip ok={after['ok']} codes={after_codes}")
+            if "circuit_open" not in after_codes:
+                findings.append(f"[{domain}] circuit open but dispatch not gated by circuit_open "
+                                f"(codes={after_codes})")
+        # Drive the sensor-origin amendment through mint to prove the sensor->P5 path.
+        if cb_amd:
+            kb.submit_amendment_inputs(conn, cb_amd, {"api_key": "sk-test-1"}, board=domain)
+            tok = kb.issue_board_launch_approval_token(domain, amendment_id=cb_amd, approved_by="owner",
+                                                       approval_evidence={"s": "x"},
+                                                       owner_authority_confirmed=True)["token"]
+            kb.approve_contract_amendment(conn, cb_amd, board=domain, approver="owner", token=tok)
+            kb.validate_contract_amendment(conn, cb_amd, board=domain)
+            sm = kb.mint_contract_amendment(conn, cb_amd, board=domain)
+            print(f"  sensor amendment {cb_amd} minted status={sm['status']}")
+
+    banner(f"GL optimizer :: {domain} convergence + in-range auto-apply")
+    # Pick a ranged tunable and feed an outcome stream that favours its low arm.
+    tun = contract.get("tunables") or {}
+    knob = next((k for k, s in tun.items()
+                 if isinstance(s, dict) and "range" in s and k not in (
+                     "heartbeat_interval_seconds", "stall_timeout_seconds")), None)
+    if knob is None:
+        findings.append(f"[{domain}] no ranged tunable to drive optimizer")
+    else:
+        lo, hi = tun[knob]["range"]
+        # Two candidate arms strictly inside the declared range.
+        arm_good = lo if lo > 0 else (lo + max(1, (hi - lo) // 4))
+        arm_bad = hi
+        with kb.connect(board=domain) as conn:
+            base_ts = 3_000_000
+            for i in range(40):
+                for value, rv in ((arm_good, 1.0), (arm_bad, 0.0)):
+                    with kb.write_txn(conn):
+                        kb.record_board_signal(conn, board=domain, primitive_kind="outcome",
+                                               primitive_key="opt", knob_snapshot={knob: value},
+                                               reward_value=rv, reward_kind="conversion",
+                                               realized_at=base_ts + i, ts=base_ts + i,
+                                               dedupe_key=f"opt:{i}:{value}")
+            out = kb.optimizer_tick(conn, board=domain, now=base_ts + 100, rng=random.Random(0))
+            applied = [(a["knob"], a["new_value"]) for a in out["applied"]]
+            print(f"  optimizer knob={knob} arms=({arm_good}<-good,{arm_bad}<-bad) applied={applied}")
+            if not any(a[0] == knob for a in applied):
+                findings.append(f"[{domain}] optimizer did not auto-apply the converged knob {knob}")
+            else:
+                new_val = next(a[1] for a in applied if a[0] == knob)
+                if not (lo <= new_val <= hi):
+                    findings.append(f"[{domain}] optimizer applied out-of-range value {new_val} for {knob}")
+    return findings
+
+
+def scenario_land_lifecycle() -> list[str]:
+    return scenario_golden_lifecycle("land_wholesaling")
+
+
+def scenario_grow_lifecycle() -> list[str]:
+    return scenario_golden_lifecycle("grow_app_one_week")
+
+
 def scenario_perf() -> list[str]:
     """S8a: volume/perf -- many tasks, ticks, signals; watch for superlinear scaling."""
     findings: list[str] = []
@@ -808,6 +1088,8 @@ def scenario_perf_scale() -> list[str]:
 
 SCENARIOS = {
     "launch": scenario_launch_compile,
+    "land_lifecycle": scenario_land_lifecycle,
+    "grow_lifecycle": scenario_grow_lifecycle,
     "sensors": scenario_sensors,
     "optimizer": scenario_optimizer,
     "amendment": scenario_amendment,

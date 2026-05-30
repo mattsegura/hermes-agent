@@ -233,6 +233,33 @@ def test_timer_driver_fires_then_stops_at_max_nudges_no_zombie(fresh_home):
         assert res["fired"] == [] and res["stopped"] == []
 
 
+def test_loop_max_nudges_does_not_read_an_interval_knob_as_a_count():
+    """Regression: a nudge cap is a COUNT, not a DURATION.
+
+    ``loop_max_nudges`` used to match any tunable whose name merely contained
+    ``follow_up`` -- so ``follow_up_interval_hours`` (a 72-HOUR cadence) was read
+    as 72 FOLLOW-UPS. A ghosting counterpart would then be nudged 72 times before
+    recycling instead of the 3-4 the owner declared. Interval/cadence/duration
+    knobs must be ignored; only an explicit nudge-COUNT knob caps the loop."""
+    # A lone interval knob is NOT a nudge cap.
+    assert rr.loop_max_nudges({}, {"follow_up_interval_hours": {"default": 72}}) is None
+    # The real count knob wins even when an interval knob is also present and
+    # appears first in declaration order.
+    assert rr.loop_max_nudges(
+        {},
+        {
+            "follow_up_interval_hours": {"default": 72},
+            "max_nudges": {"default": 4},
+        },
+    ) == 4
+    # A loop-level explicit cap always wins over any tunable.
+    assert rr.loop_max_nudges(
+        {"max_nudges": 2}, {"follow_up_interval_hours": {"default": 72}}
+    ) == 2
+    # Other duration knobs are likewise ignored.
+    assert rr.loop_max_nudges({}, {"follow_up_delay_seconds": {"default": 3600}}) is None
+
+
 def test_timer_driver_stops_when_entity_reaches_terminal_state(fresh_home):
     _approve("serious", _contract())
     with kb.connect(board="serious") as conn:
