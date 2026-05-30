@@ -40,6 +40,11 @@ try:  # the knobs the optimizer actually tunes count as "consumed"
 except Exception:  # pragma: no cover
     _MANAGED_KNOBS = ("follow_up_interval_hours", "cadence_hours")
 
+try:  # reuse the typed trigger grammar so "conversational" is detected the same
+    from hermes_cli.kanban_launch_grammar import has_inbound as _grammar_has_inbound
+except Exception:  # pragma: no cover - keep the module loadable if grammar import fails
+    _grammar_has_inbound = None  # type: ignore
+
 
 # --- net-new dimension D: success must be scoreable (mirrors the A1 helper) ---
 _SCOREABLE_SUCCESS_RE = re.compile(
@@ -117,6 +122,139 @@ def _finite_number(v: Any) -> bool:
         return float(v) > 0
     except (TypeError, ValueError):
         return False
+
+
+# --- net-new dimension C: a conversion loop must declare a win-class terminal ---
+# A "won"-class outcome is the signal the reward/scoreboard binds to (audit #4:
+# the optimizer tunes toward a 'won' substring). A conversational loop whose only
+# terminals are failure/neutral (dead, rejected, paused, measured) can never emit
+# a conversion signal -> no reward, ever. Vocabulary is domain-agnostic and covers
+# the marquee domains (under_contract/onboarded/published-as-deliverable, etc.).
+_WIN_TERMINAL_TOKENS: tuple[str, ...] = (
+    "won", "win", "closed", "close", "converted", "convert", "conversion",
+    "signed", "sign", "under_contract", "contracted", "onboarded", "hired",
+    "paid", "subscriber", "accepted", "sold", "delivered", "published",
+    "completed", "complete", "fulfilled", "succeeded", "success", "approved",
+)
+
+
+def _terminal_state_tokens(loop: Any) -> list[str]:
+    """Lowercased terminal-state labels for a loop/entity (str or dict shapes)."""
+    out: list[str] = []
+    for src in ("terminal_states", "terminal_state", "terminal_outcomes", "terminal_outcome"):
+        for item in _as_list(loop.get(src) if isinstance(loop, dict) else None):
+            if isinstance(item, str) and item.strip():
+                out.append(item.strip().lower())
+            elif isinstance(item, dict):
+                key = str(item.get("key") or item.get("state") or item.get("outcome") or "").strip().lower()
+                cls = str(item.get("class") or item.get("kind") or "").strip().lower()
+                if key:
+                    out.append(key)
+                if cls:
+                    out.append(cls)
+    return out
+
+
+def _looks_like_win(token: str) -> bool:
+    t = (token or "").lower()
+    return any(tok in t for tok in _WIN_TERMINAL_TOKENS)
+
+
+def _loop_is_conversational(loop: Any) -> bool:
+    """A loop is conversational when it consumes an inbound trigger (it talks to
+    an outside party and is meant to drive that party toward a conversion)."""
+    if not isinstance(loop, dict):
+        return False
+    triggers = loop.get("triggers")
+    if _grammar_has_inbound is not None:
+        try:
+            return bool(_grammar_has_inbound(triggers))
+        except Exception:  # pragma: no cover - defensive
+            pass
+    # Fallback keyword check if the grammar import failed.
+    for t in _as_list(triggers):
+        text = ""
+        if isinstance(t, str):
+            text = t.lower()
+        elif isinstance(t, dict):
+            text = str(t.get("kind") or t.get("type") or t.get("reason") or "").lower()
+        if "inbound" in text or "reply" in text or "incoming" in text:
+            return True
+    return False
+
+
+def _stage_next_refs(stage: dict) -> set[str]:
+    """Next-stage keys a stage points at, read from exit_criteria + transitions."""
+    refs: set[str] = set()
+    for ec in _as_list(stage.get("exit_criteria")):
+        if isinstance(ec, dict):
+            for k in ("transition", "next_stage", "next", "to", "target"):
+                v = ec.get(k)
+                if isinstance(v, str) and v.strip():
+                    refs.add(v.strip())
+    for tr in _as_list(stage.get("transitions")):
+        if isinstance(tr, str) and tr.strip():
+            refs.add(tr.strip())
+        elif isinstance(tr, dict):
+            for k in ("to", "next", "next_stage", "target", "transition"):
+                v = tr.get(k)
+                if isinstance(v, str) and v.strip():
+                    refs.add(v.strip())
+    return refs
+
+
+def _stage_is_terminal(stage: dict) -> bool:
+    """A stage is terminal if flagged, or it has no outbound next-stage refs."""
+    if isinstance(stage, dict) and bool(stage.get("terminal")):
+        return True
+    return not _stage_next_refs(stage)
+
+
+def _proof_artifact_keys(contract: dict) -> set[str]:
+    """Every evidence key SOME declared artifact can produce: proof_requirements
+    entries (string keys or {artifact|key|name} dicts) + worker_envelope
+    required_proof + stage action emits/produces/artifact declarations."""
+    produced: set[str] = set()
+
+    def _add(v: Any) -> None:
+        if isinstance(v, str) and v.strip():
+            produced.add(v.strip())
+
+    for pr in _as_list(_section(contract, "proof_requirements")):
+        if isinstance(pr, str):
+            _add(pr)
+        elif isinstance(pr, dict):
+            for k in ("artifact", "key", "name", "id", "evidence", "produces"):
+                _add(pr.get(k))
+
+    runtime = contract.get("runtime") if isinstance(contract.get("runtime"), dict) else {}
+    envelopes = runtime.get("worker_envelopes")
+    if not isinstance(envelopes, dict):
+        envelopes = _section(contract, "worker_envelopes")
+    if isinstance(envelopes, dict):
+        for env in envelopes.values():
+            if isinstance(env, dict):
+                for rp in _as_list(env.get("required_proof")):
+                    _add(rp)
+                    if isinstance(rp, dict):
+                        for k in ("artifact", "key", "name"):
+                            _add(rp.get(k))
+
+    # Stage actions may also declare what artifact they emit/produce.
+    workflow = contract.get("workflow") if isinstance(contract.get("workflow"), dict) else {}
+    for st in _as_list(workflow.get("stages")):
+        if not isinstance(st, dict):
+            continue
+        for a in _as_list(st.get("actions")):
+            if isinstance(a, dict):
+                for k in ("produces", "emits", "artifact", "produces_evidence", "evidence"):
+                    val = a.get(k)
+                    if isinstance(val, (list, tuple)):
+                        for v in val:
+                            _add(v)
+                    else:
+                        _add(val)
+    return produced
 
 
 def assess_launch_completeness(contract: Optional[dict], *, enforce: bool = False) -> dict:
@@ -227,6 +365,148 @@ def assess_launch_completeness(contract: Optional[dict], *, enforce: bool = Fals
         )
     emit("tunable_consumer_binding", f_tun)
 
+    # --- C: win-signal rail (a conversion loop must declare a 'won'-class terminal) ---
+    # A conversational loop (inbound trigger) is meant to drive an outside party
+    # toward a conversion that produces reward. If it has terminal_states but NONE
+    # looks like a win/closed/converted outcome, the optimizer has nothing to tune
+    # toward -- reward stays permanently zero (audit #4). Report-mode warning.
+    no_win: list[str] = []
+    for i, lp in enumerate(loops):
+        if not isinstance(lp, dict):
+            continue
+        if not _loop_is_conversational(lp):
+            continue
+        terminals = _terminal_state_tokens(lp)
+        if not terminals:
+            continue  # no terminals at all is the F10 zombie rail's concern, not C
+        if not any(_looks_like_win(t) for t in terminals):
+            name = str(lp.get("entity") or lp.get("type") or f"loop[{i}]")
+            no_win.append(
+                f"{name} (terminals: {', '.join(sorted(set(terminals))[:6])})"
+            )
+    f_win: list[str] = []
+    if no_win:
+        f_win.append(
+            f"{len(no_win)} conversational loop(s) declare terminal_states but none looks like a "
+            f"win/closed/converted outcome -> no conversion signal for reward to bind to: "
+            + "; ".join(no_win[:6])
+        )
+    emit("win_signal_rail", f_win)
+
+    # --- E1: evidence_namespace (each evidence_required key must be produced) ---
+    # Every workflow.stages[].exit_criteria.evidence_required key should be
+    # produced by SOME declared artifact (proof_requirements / worker_envelope
+    # required_proof / action emits). An evidence key nothing produces is a
+    # permanent strand: the stage can never satisfy its exit (audit #5).
+    produced = _proof_artifact_keys(contract)
+    orphan_evidence: list[str] = []
+    for st in stages:
+        skey = str(st.get("key") or st.get("label") or "stage")
+        for ec in _as_list(st.get("exit_criteria")):
+            if not isinstance(ec, dict):
+                continue
+            for ev in _as_list(ec.get("evidence_required")):
+                evk = ev.strip() if isinstance(ev, str) else str(ev.get("key") or ev.get("artifact") or "").strip() if isinstance(ev, dict) else ""
+                if evk and evk not in produced:
+                    orphan_evidence.append(f"{skey}:{evk}")
+    f_ev: list[str] = []
+    if orphan_evidence:
+        # dedupe while preserving order
+        seen_ev: set[str] = set()
+        uniq_ev = [e for e in orphan_evidence if not (e in seen_ev or seen_ev.add(e))]
+        f_ev.append(
+            f"{len(uniq_ev)} evidence_required key(s) are produced by no declared artifact "
+            f"(not in proof_requirements / worker_envelope required_proof / action emits) -> "
+            f"strandable exit: " + ", ".join(uniq_ev[:8])
+            + (" ..." if len(uniq_ev) > 8 else "")
+        )
+    emit("evidence_namespace", f_ev)
+
+    # --- E2: stage_reachability (every non-terminal stage must reach a terminal) ---
+    # Build the stage next-graph and BFS from each non-terminal stage; warn on
+    # island stages (next-ref to a missing stage) or stages from which no terminal
+    # stage is reachable (audit #10: abnormal exits strand).
+    stage_by_key: dict[str, dict] = {}
+    for st in stages:
+        k = str(st.get("key") or st.get("label") or "").strip()
+        if k and k not in stage_by_key:
+            stage_by_key[k] = st
+    f_reach: list[str] = []
+    if stage_by_key:
+        terminal_keys = {k for k, st in stage_by_key.items() if _stage_is_terminal(st)}
+
+        def _reaches_terminal(start: str) -> tuple[bool, set[str]]:
+            seen: set[str] = set()
+            stack = [start]
+            dangling: set[str] = set()
+            while stack:
+                cur = stack.pop()
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                if cur in terminal_keys:
+                    return True, dangling
+                for nxt in _stage_next_refs(stage_by_key.get(cur, {})):
+                    if nxt in stage_by_key:
+                        stack.append(nxt)
+                    else:
+                        dangling.add(nxt)
+            return (bool(seen & terminal_keys), dangling)
+
+        unreachable: list[str] = []
+        islands: list[str] = []
+        for k, st in stage_by_key.items():
+            if k in terminal_keys:
+                continue
+            reaches, dangling = _reaches_terminal(k)
+            if dangling:
+                islands.append(f"{k}->{','.join(sorted(dangling)[:3])}")
+            if not reaches:
+                unreachable.append(k)
+        if not terminal_keys:
+            f_reach.append(
+                f"workflow has {len(stage_by_key)} stage(s) but NO terminal stage "
+                f"(no stage flagged terminal and every stage has an outbound transition) -> "
+                f"the workflow can never end."
+            )
+        if unreachable:
+            f_reach.append(
+                f"{len(unreachable)} non-terminal stage(s) cannot reach any terminal stage "
+                f"via exit_criteria/transitions -> abnormal exits strand: "
+                + ", ".join(sorted(set(unreachable))[:6])
+            )
+        if islands:
+            f_reach.append(
+                f"{len(islands)} stage(s) transition to an undeclared next-stage (island ref): "
+                + ", ".join(islands[:6])
+            )
+    emit("stage_reachability", f_reach)
+
+    # --- E3: distinct_terminals (a conversation must separate done/paused/disqualified) ---
+    # A conversational loop should have DISTINCT done/paused/disqualified terminal
+    # states; if it collapses them into a single terminal it cannot tell success
+    # from kill from recycle (audit #10). Report-mode warning (the invariants
+    # already HARD-error on conversational loops with <2 outcomes; this is the
+    # softer "exactly one terminal" smell on loops the invariants may not classify).
+    collapsed: list[str] = []
+    for i, lp in enumerate(loops):
+        if not isinstance(lp, dict):
+            continue
+        if not _loop_is_conversational(lp):
+            continue
+        distinct = sorted(set(_terminal_state_tokens(lp)))
+        if len(distinct) == 1:
+            name = str(lp.get("entity") or lp.get("type") or f"loop[{i}]")
+            collapsed.append(f"{name} (only terminal: {distinct[0]})")
+    f_distinct: list[str] = []
+    if collapsed:
+        f_distinct.append(
+            f"{len(collapsed)} conversational loop(s) collapse done/paused/disqualified into a "
+            f"single terminal_state -> cannot distinguish success from kill/recycle: "
+            + "; ".join(collapsed[:6])
+        )
+    emit("distinct_terminals", f_distinct)
+
     return {"ok": not errors, "errors": errors, "warnings": warnings, "dimensions": dims}
 
 
@@ -292,6 +572,79 @@ if __name__ == "__main__":
     # 5. enforce-mode turns net-new findings into hard errors (ok=False)
     r5 = assess_launch_completeness(c1, enforce=True)
     check("enforce-mode makes prose success a hard error", (not r5["ok"]) and any("success_scoreability" in e for e in r5["errors"]), str(r5))
+
+    print("== net-new dimensions C + E: win-signal, evidence namespace, reachability, distinct terminals ==")
+    # C1. conversational loop whose terminals carry NO win-class outcome -> warns
+    cC = json.loads(json.dumps(base))
+    cC["event_loops"] = [{
+        "entity": "lead", "triggers": ["inbound_reply", "follow_up_timer"],
+        "terminal_states": ["dead", "recycled", "paused"],
+    }]
+    rC = assess_launch_completeness(cC)
+    check("conversion loop with no win terminal warns", any("win_signal_rail" in w for w in rC["warnings"]), str(rC["warnings"]))
+    # C1b. same loop but one terminal IS a win ('under_contract') -> no win warn
+    cCb = json.loads(json.dumps(cC)); cCb["event_loops"][0]["terminal_states"] = ["under_contract", "dead", "recycled"]
+    rCb = assess_launch_completeness(cCb)
+    check("conversion loop WITH win terminal does not warn", not any("win_signal_rail" in w for w in rCb["warnings"]), str(rCb["warnings"]))
+    # C1c. a NON-conversational loop (no inbound trigger) is exempt from C
+    cCc = json.loads(json.dumps(cC)); cCc["event_loops"][0]["triggers"] = ["daily_timer"]
+    rCc = assess_launch_completeness(cCc)
+    check("non-conversational loop is exempt from win_signal_rail", not any("win_signal_rail" in w for w in rCc["warnings"]), str(rCc["warnings"]))
+
+    # E1. an evidence_required key produced by NOTHING -> evidence_namespace warns
+    cE1 = json.loads(json.dumps(base))
+    cE1["workflow"]["stages"] = [
+        {"key": "s1", "actions": [{"key": "a1", "side_effect_class": "internal"}],
+         "exit_criteria": [{"transition": "done", "evidence_required": ["ghost_artifact"]}]},
+        {"key": "done", "terminal": True, "exit_criteria": []},
+    ]
+    cE1["proof_requirements"] = ["some_other_proof"]
+    rE1 = assess_launch_completeness(cE1)
+    check("orphan evidence key warns", any("evidence_namespace" in w and "ghost_artifact" in w for w in rE1["warnings"]), str(rE1["warnings"]))
+    # E1b. same key now produced by proof_requirements -> no warn
+    cE1b = json.loads(json.dumps(cE1)); cE1b["proof_requirements"] = ["ghost_artifact"]
+    rE1b = assess_launch_completeness(cE1b)
+    check("evidence key produced by proof_requirements does not warn", not any("evidence_namespace" in w for w in rE1b["warnings"]), str(rE1b["warnings"]))
+    # E1c. key produced by a worker_envelope required_proof (under runtime) -> no warn
+    cE1c = json.loads(json.dumps(cE1)); cE1c["runtime"] = {"worker_envelopes": {"w": {"required_proof": ["ghost_artifact"]}}}
+    rE1c = assess_launch_completeness(cE1c)
+    check("evidence key produced by worker_envelope does not warn", not any("evidence_namespace" in w for w in rE1c["warnings"]), str(rE1c["warnings"]))
+
+    # E2a. an island stage (transition to a missing stage) -> reachability warns
+    cE2 = json.loads(json.dumps(base))
+    cE2["workflow"]["stages"] = [
+        {"key": "s1", "exit_criteria": [{"transition": "nowhere", "evidence_required": []}]},
+        {"key": "done", "terminal": True, "exit_criteria": []},
+    ]
+    cE2["proof_requirements"] = []
+    rE2 = assess_launch_completeness(cE2)
+    check("island stage ref warns reachability", any("stage_reachability" in w for w in rE2["warnings"]), str(rE2["warnings"]))
+    # E2b. no terminal stage at all -> reachability warns
+    cE2b = json.loads(json.dumps(base))
+    cE2b["workflow"]["stages"] = [
+        {"key": "s1", "exit_criteria": [{"transition": "s2", "evidence_required": []}]},
+        {"key": "s2", "exit_criteria": [{"transition": "s1", "evidence_required": []}]},
+    ]
+    rE2b = assess_launch_completeness(cE2b)
+    check("no-terminal cycle warns reachability", any("stage_reachability" in w and "terminal" in w for w in rE2b["warnings"]), str(rE2b["warnings"]))
+    # E2c. a clean linear graph reaching a terminal -> no reachability warn
+    cE2c = json.loads(json.dumps(base))
+    cE2c["workflow"]["stages"] = [
+        {"key": "s1", "exit_criteria": [{"transition": "done", "evidence_required": []}]},
+        {"key": "done", "terminal": True, "exit_criteria": []},
+    ]
+    rE2c = assess_launch_completeness(cE2c)
+    check("reachable linear graph does not warn reachability", not any("stage_reachability" in w for w in rE2c["warnings"]), str(rE2c["warnings"]))
+
+    # E3. a conversational loop with a SINGLE terminal -> distinct_terminals warns
+    cE3 = json.loads(json.dumps(base))
+    cE3["event_loops"] = [{"entity": "lead", "triggers": ["inbound_reply", "follow_up_timer"], "terminal_states": ["closed"]}]
+    rE3 = assess_launch_completeness(cE3)
+    check("single-terminal conversation warns distinct_terminals", any("distinct_terminals" in w for w in rE3["warnings"]), str(rE3["warnings"]))
+    # E3b. distinct done/paused/disqualified terminals -> no distinct warn
+    cE3b = json.loads(json.dumps(cE3)); cE3b["event_loops"][0]["terminal_states"] = ["closed", "paused", "disqualified"]
+    rE3b = assess_launch_completeness(cE3b)
+    check("distinct terminals do not warn distinct_terminals", not any("distinct_terminals" in w for w in rE3b["warnings"]), str(rE3b["warnings"]))
 
     print(f"\n{'ALL PASS' if failures == 0 else str(failures) + ' FAILURES'}")
     sys.exit(1 if failures else 0)

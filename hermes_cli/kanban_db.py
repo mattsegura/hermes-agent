@@ -3138,6 +3138,50 @@ def _record_launch_intake_invariant_failure(
     return merged
 
 
+def _run_degraded_fallback_through_completeness(
+    contract: dict[str, Any]
+) -> dict[str, Any]:
+    """Run the degraded universal-drafter fallback through the SAME unified
+    completeness checker the dispatch gate consults (audit: the degraded path
+    bypassed both ``check_contract_invariants`` and ``assess_launch_completeness``
+    -- a degraded board could dispatch having passed only the presence checker).
+
+    REPORT-MODE / NON-BREAKING: this runs ``assess_launch_completeness`` in
+    report-mode (enforce=False), attaches the merged report to
+    ``launch_intake.completeness`` for telemetry, and logs a warning summary. It
+    NEVER blocks, mutates the contract shape, or raises -- a degraded fallback
+    that already shipped keeps shipping; we just stop the checks being silent.
+    """
+    if not isinstance(contract, dict):
+        return contract
+    try:
+        from hermes_cli.launch_completeness import assess_launch_completeness
+
+        report = assess_launch_completeness(contract, enforce=False)
+    except Exception as exc:  # pragma: no cover - defensive: never break the fallback
+        _log.warning(
+            "launch_intake: degraded fallback completeness check raised: %r", exc
+        )
+        return contract
+
+    findings = list(report.get("errors", [])) + list(report.get("warnings", []))
+    if findings:
+        _log.warning(
+            "launch_intake: degraded universal-drafter fallback has %d completeness "
+            "finding(s) (report-mode, non-blocking): %s",
+            len(findings),
+            "; ".join(findings[:5]),
+        )
+    intake = _contract_object(contract.get("launch_intake"))
+    if not intake:
+        return contract
+    merged = dict(contract)
+    intake = dict(intake)
+    intake["completeness"] = report
+    merged["launch_intake"] = intake
+    return merged
+
+
 def _synthesize_launch_contract_from_intake(draft: dict[str, Any]) -> dict[str, Any]:
     """Produce the launch contract: server synthesis when configured, else the
     deterministic universal drafter as an explicit degraded-mode fallback."""
@@ -3224,6 +3268,11 @@ def _synthesize_launch_contract_from_intake(draft: dict[str, Any]) -> dict[str, 
 
     # Degraded fallback: deterministic universal drafter.
     fallback = _build_universal_contract_from_launch_intake(draft)
+    # The degraded path previously bypassed the structural + completeness checks
+    # the dispatch gate relies on (audit: kanban_db.py degraded fallback). Run it
+    # through the SAME unified checker (report-mode, non-blocking) so the gap is
+    # surfaced as telemetry instead of silently shipping unchecked.
+    fallback = _run_degraded_fallback_through_completeness(fallback)
     return _mark_launch_intake_provenance(
         fallback, source="model_generated", degraded=True
     )
