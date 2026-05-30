@@ -3223,6 +3223,35 @@ def _deep_merge_contract(base: Any, patch: Any) -> Any:
     return patch
 
 
+def _normalize_objective_budget(value: Optional[Any]) -> Optional[dict]:
+    """Normalize an objective-level budget ceiling.
+
+    This is the OWNER-declared spend/effort ceiling on the objective, distinct
+    from the runtime ``budget`` sensor (which is a per-window rolling meter).
+    Accepts a bare number (a total-spend ceiling) or an object
+    ``{ceiling, currency, period}``. Returns ``None`` when absent so existing
+    contracts round-trip byte-identically.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return {"ceiling": float(value), "currency": "USD", "period": "total"}
+    if isinstance(value, dict):
+        raw_ceiling = value.get("ceiling")
+        try:
+            ceiling = float(raw_ceiling) if raw_ceiling is not None else None
+        except (TypeError, ValueError):
+            ceiling = None
+        return {
+            "ceiling": ceiling,
+            "currency": str(value.get("currency") or "USD").strip() or "USD",
+            "period": str(value.get("period") or "total").strip() or "total",
+        }
+    return None
+
+
 def normalize_objective_metadata(objective: Optional[Any]) -> Optional[dict]:
     """Validate and normalize board-level objective metadata."""
     if objective is None:
@@ -3241,6 +3270,18 @@ def normalize_objective_metadata(objective: Optional[Any]) -> Optional[dict]:
     out["success"] = _string_list(out.get("success") or out.get("success_criteria"))
     out["failure"] = _string_list(out.get("failure") or out.get("failure_criteria"))
     out["constraints"] = _string_list(out.get("constraints"))
+    budget = _normalize_objective_budget(out.get("budget"))
+    if budget is not None:
+        out["budget"] = budget
+    else:
+        out.pop("budget", None)
+    _dod = out.get("definition_of_done")
+    if isinstance(_dod, str) and _dod.strip():
+        out["definition_of_done"] = _dod.strip()
+    elif isinstance(_dod, (list, tuple)) and _string_list(_dod):
+        out["definition_of_done"] = _string_list(_dod)
+    else:
+        out.pop("definition_of_done", None)
     return out
 
 
@@ -3251,14 +3292,24 @@ def build_objective_metadata(
     success: Optional[Iterable[str]] = None,
     failure: Optional[Iterable[str]] = None,
     constraints: Optional[Iterable[str]] = None,
+    budget: Optional[Any] = None,
+    definition_of_done: Optional[Any] = None,
 ) -> dict:
     """Build the objective scaffold used by goal/company runtime boards."""
-    return {
+    out = {
         "statement": str(statement or fallback_statement or "").strip(),
         "success": _string_list(success),
         "failure": _string_list(failure),
         "constraints": _string_list(constraints),
     }
+    normalized_budget = _normalize_objective_budget(budget)
+    if normalized_budget is not None:
+        out["budget"] = normalized_budget
+    if isinstance(definition_of_done, str) and definition_of_done.strip():
+        out["definition_of_done"] = definition_of_done.strip()
+    elif isinstance(definition_of_done, (list, tuple)) and _string_list(definition_of_done):
+        out["definition_of_done"] = _string_list(definition_of_done)
+    return out
 
 
 def normalize_runtime_metadata(runtime: Optional[Any]) -> Optional[dict]:
