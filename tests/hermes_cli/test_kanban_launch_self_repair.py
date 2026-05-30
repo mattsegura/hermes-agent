@@ -174,6 +174,54 @@ def test_aux_unconfigured_degrades_without_looping(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 3b. The REAL repair-prompt assembly (the .format() that injects the prior
+#     attempt's invariant errors) must never raise -- a literal JSON example in
+#     the prompt body has to be brace-escaped or str.format() throws KeyError and
+#     the entire repair pass crashes instead of fixing the contract. The other
+#     repair tests mock run_contract_synthesis wholesale, so this is the only
+#     test that exercises the prompt-string construction itself.
+# ---------------------------------------------------------------------------
+
+
+def test_repair_prompt_assembly_does_not_raise_on_real_format(monkeypatch):
+    captured: dict = {}
+
+    def fake_call_model(system_prompt, payload, **kw):
+        captured["system_prompt"] = system_prompt
+        captured["payload"] = payload
+        # Return a minimal well-formed contract so the call path completes.
+        return (
+            '{"objective": {"statement": "x"}, "workflow": {"stages": []}}',
+            False,
+        )
+
+    monkeypatch.setattr(kli, "_call_model", fake_call_model)
+
+    feedback = [
+        "stage 'review' is conversational but has fewer than 2 exit outcomes "
+        "-- it cannot distinguish success from kill/recycle.",
+        "action 'publish' uses side_effect_class 'external_irreversible' but it "
+        "is not declared in side_effect_policy.",
+    ]
+
+    # This is the exact call the bounded repair loop makes on attempt >= 2. With
+    # an unescaped "{...}" JSON example in the repair prompt this raised
+    # KeyError('"transition"') and the whole synthesis crashed.
+    result = kli.run_contract_synthesis(
+        "Automate my content pipeline", {"raw": "..."}, repair_feedback=feedback
+    )
+    assert result.ok
+
+    sp = captured["system_prompt"]
+    # The prior errors were interpolated into the {errors} slot.
+    assert "fewer than 2 exit outcomes" in sp
+    # The literal JSON example survived un-mangled (brace-escaped, not consumed).
+    assert '{"transition":"<recycle_or_dead_stage>","evidence_required":[...]}' in sp
+    # And the feedback also rode along in the user payload.
+    assert captured["payload"]["repair_feedback"] == feedback
+
+
+# ---------------------------------------------------------------------------
 # 4. A degraded synthesis result (aux became unavailable mid-flight) does not
 #    loop -- it breaks immediately to the universal drafter.
 # ---------------------------------------------------------------------------

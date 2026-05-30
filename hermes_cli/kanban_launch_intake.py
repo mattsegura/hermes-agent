@@ -312,7 +312,7 @@ violations. In particular remember:
   stage) MUST declare a follow-up "timer" trigger AND >=2 "exit_criteria"
   entries: at least one success transition and one kill/recycle/give-up
   transition. To fix "fewer than 2 exit outcomes", ADD a second exit_criteria
-  (e.g. {"transition":"<recycle_or_dead_stage>","evidence_required":[...]});
+  (e.g. {{"transition":"<recycle_or_dead_stage>","evidence_required":[...]}});
 - every external_*/financial side_effect_class you use on any action MUST be
   declared in side_effect_policy.approval_required or .forbidden (and an
   irreversible/financial action must also be named in an approval_gate or that
