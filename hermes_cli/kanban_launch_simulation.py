@@ -27,7 +27,11 @@ from hermes_cli.kanban_launch_grammar import (
 
 # Outcome categorisation (test-infra heuristics over the contract's declared
 # terminal/stop labels). An outcome may match more than one category.
-_SUCCESS_TOKENS = ("qualif", "onboard", "hired", "won", "accept", "book", "hot", "contract", "advanc", "complete", "convert")
+# Note: use the stem "approve" (not "approv") for the approval/content family so
+# it matches "approved"/"Owner approves the reel." but NOT "Approval expires ..."
+# (a timeout/ghost outcome). "publish" covers content-pipeline success without
+# colliding with the common "... is not posted" ghost phrasing.
+_SUCCESS_TOKENS = ("qualif", "onboard", "hired", "won", "accept", "book", "hot", "contract", "advanc", "complete", "convert", "approve", "publish", "posted live")
 _DISQUALIFY_TOKENS = ("reject", "ineligible", "declin", "not_fit", "notfit", "disqualif", "no active", "no license", "unlicensed", "dead", "not a fit")
 _GHOST_TOKENS = ("ghost", "stop responding", "stops responding", "no reply", "no response", "timeout", "unresponsive", "recycle", "stops respond", "no viable")
 

@@ -1,0 +1,992 @@
+{
+  "objective": {
+    "statement": "Automate the @crispykitchen TikTok reels operating system: ideate from cooking trends, draft scripts and storyboards, produce short videos with CapCut and approved stock B-roll, schedule or post through Buffer/TikTok on a regular cadence, monitor 48-hour performance, and double down on themes that grow the account toward 50k followers and 5% engagement within 90 days.",
+    "success": [
+      "Publish 1 to 2 TikTok reels per day on @crispykitchen for the 90-day campaign window.",
+      "Reach 50,000 TikTok followers on @crispykitchen by day 90.",
+      "Maintain at least 5% average engagement rate across published reels during the campaign.",
+      "Every published reel has a logged source file, final video file, caption, hashtag set, TikTok post URL, and 48-hour metrics record.",
+      "Each reel is watched for the first 48 hours after posting and assigned a double-down, iterate, or cut recommendation.",
+      "Themes with 3 consecutive reels under 1,000 views are stopped and marked inactive before more videos are produced from that theme."
+    ],
+    "failure": [
+      "The account goes dark with no TikTok reel posted for 3 or more consecutive days.",
+      "A reel is posted that is off-brand against the @crispykitchen brand guidelines document.",
+      "A reel is posted without both a caption and hashtags.",
+      "A reel is posted during the first 2 weeks or within the first 10 videos without explicit owner approval.",
+      "A brand-risky reel is posted after the initial approval period without owner approval.",
+      "A theme continues producing reels after 3 consecutive published reels from that theme receive fewer than 1,000 views at the 48-hour mark."
+    ],
+    "constraints": [
+      "Use only the owner's TikTok account @crispykitchen, Buffer scheduler, CapCut editor, stock B-roll library, and brand guidelines document.",
+      "No paid ads, boosted posts, influencer payments, or other paid distribution.",
+      "Never post a reel without a completed caption and hashtag set.",
+      "Owner must approve every video before posting for the first 2 weeks and for at least the first 10 videos.",
+      "After the initial approval period, auto-posting is allowed only for reels that pass brand-safety checks and are not brand-risky.",
+      "All brand-risky, ambiguous, controversial, or off-guideline content must be escalated to the owner before scheduling or posting."
+    ]
+  },
+  "runtime": {
+    "mode": "company",
+    "dispatcher": {
+      "profile": "CEO dispatcher coordinates the @crispykitchen content board, assigns ideation, production, approval, scheduling, posting, and performance-analysis work to specialist workers, and enforces owner approval and side-effect boundaries before any external action."
+    },
+    "profiles": {
+      "ceo": "Owns campaign strategy, interprets owner boundaries, prioritizes themes, approves workstream sequencing, and escalates policy or brand-risk decisions.",
+      "optimizer": "Analyzes 48-hour TikTok metrics, tunes safe campaign knobs within bounds, recommends double-down/cut decisions, and adjusts cadence, theme allocation, hashtag mix size, and production batch size.",
+      "worker": "Executes assigned content operations: trend review, script and storyboard drafting, CapCut production preparation, Buffer scheduling preparation, TikTok posting preparation, proof logging, and metric collection."
+    },
+    "require_provider_policy": true,
+    "require_worker_envelopes": true,
+    "provider_policy": {
+      "allowed_systems": [
+        "TikTok account @crispykitchen",
+        "Buffer scheduler",
+        "CapCut editor",
+        "stock B-roll library",
+        "brand guidelines document"
+      ],
+      "forbidden_systems": [
+        "paid ad platforms",
+        "boosted TikTok posts",
+        "influencer payment platforms",
+        "unapproved social accounts",
+        "unlicensed media libraries"
+      ],
+      "data_access_rules": [
+        "Read TikTok performance data only for @crispykitchen.",
+        "Use the brand guidelines document as the source of truth for brand fit and risk checks.",
+        "Use stock B-roll only from the allowed stock B-roll library.",
+        "Do not use paid distribution, paid promotion, or paid creator collaborations."
+      ],
+      "posting_rules": [
+        "No TikTok post may be published without a final video file, caption, and hashtags.",
+        "Owner approval is required before posting every reel during the first 2 weeks and until 10 videos have been approved.",
+        "After the first 2 weeks and first 10 approvals, non-brand-risky reels may proceed only if they pass the brand guidelines check.",
+        "Brand-risky reels must be held for owner review."
+      ]
+    },
+    "worker_envelopes": {
+      "trend_researcher": {
+        "capabilities": [
+          "Review TikTok cooking trend signals",
+          "Map trend formats to @crispykitchen brand-safe cooking themes",
+          "Identify repeatable reel concepts"
+        ],
+        "toolsets": [
+          "TikTok account @crispykitchen read access",
+          "brand guidelines document"
+        ],
+        "allowed_side_effects": [
+          "none",
+          "internal"
+        ],
+        "required_proof": [
+          "trend source notes",
+          "theme hypothesis",
+          "brand-fit rationale"
+        ]
+      },
+      "script_storyboard_producer": {
+        "capabilities": [
+          "Draft short cooking reel scripts",
+          "Create shot-by-shot storyboards",
+          "Write captions and hashtag sets",
+          "Check scripts against brand guidelines"
+        ],
+        "toolsets": [
+          "brand guidelines document",
+          "stock B-roll library",
+          "CapCut editor planning assets"
+        ],
+        "allowed_side_effects": [
+          "none",
+          "internal"
+        ],
+        "required_proof": [
+          "script draft",
+          "storyboard",
+          "caption",
+          "hashtag set",
+          "brand checklist result"
+        ]
+      },
+      "video_editor": {
+        "capabilities": [
+          "Assemble short video assets in CapCut",
+          "Use approved stock B-roll",
+          "Export final reel files",
+          "Attach production metadata"
+        ],
+        "toolsets": [
+          "CapCut editor",
+          "stock B-roll library",
+          "brand guidelines document"
+        ],
+        "allowed_side_effects": [
+          "none",
+          "internal"
+        ],
+        "required_proof": [
+          "CapCut project reference",
+          "final video file reference",
+          "source asset list",
+          "brand-safe visual review"
+        ]
+      },
+      "scheduler_publisher": {
+        "capabilities": [
+          "Prepare Buffer schedule entries",
+          "Prepare TikTok publishing package",
+          "Verify caption and hashtags before posting",
+          "Record TikTok post URL"
+        ],
+        "toolsets": [
+          "Buffer scheduler",
+          "TikTok account @crispykitchen"
+        ],
+        "allowed_side_effects": [
+          "none",
+          "internal",
+          "external_reversible",
+          "external_irreversible"
+        ],
+        "required_proof": [
+          "owner approval or auto-clearance record",
+          "Buffer schedule reference when used",
+          "TikTok post URL",
+          "caption and hashtag verification"
+        ]
+      },
+      "performance_analyst": {
+        "capabilities": [
+          "Collect 48-hour TikTok metrics",
+          "Calculate engagement rate",
+          "Detect themes with 3 consecutive reels under 1,000 views",
+          "Recommend double-down, iterate, or cut decisions"
+        ],
+        "toolsets": [
+          "TikTok account @crispykitchen performance analytics",
+          "campaign proof log"
+        ],
+        "allowed_side_effects": [
+          "none",
+          "internal"
+        ],
+        "required_proof": [
+          "48-hour metrics snapshot",
+          "engagement-rate calculation",
+          "theme streak status",
+          "recommendation rationale"
+        ]
+      }
+    }
+  },
+  "workflow": {
+    "id": "crispykitchen_tiktok_reels_90_day_growth_system",
+    "goal_id": "crispykitchen_50k_followers_5pct_engagement_90_days",
+    "require_semantics": true,
+    "workstreams": [
+      {
+        "key": "trend_to_theme_pipeline",
+        "description": "Convert TikTok cooking trends into @crispykitchen-safe reel themes and concept backlogs."
+      },
+      {
+        "key": "script_storyboard_pipeline",
+        "description": "Produce scripts, storyboards, captions, and hashtag sets for approved reel concepts."
+      },
+      {
+        "key": "capcut_production_pipeline",
+        "description": "Create final short video files using CapCut and the allowed stock B-roll library."
+      },
+      {
+        "key": "approval_scheduling_publishing_pipeline",
+        "description": "Route videos through owner approval or auto-clearance, then schedule via Buffer or publish to @crispykitchen TikTok."
+      },
+      {
+        "key": "performance_learning_pipeline",
+        "description": "Monitor each reel for 48 hours, log metrics, stop weak themes, and double down on winners."
+      }
+    ],
+    "stages": [
+      {
+        "key": "stage_1_trend_theme_ideation",
+        "description": "Identify cooking trend opportunities and convert them into brand-safe @crispykitchen reel concepts.",
+        "triggers": [
+          {
+            "kind": "timer",
+            "detail": "Daily ideation pass to maintain enough concepts for 1 to 2 reels per day.",
+            "cadence_hours": 24
+          },
+          {
+            "kind": "metric",
+            "detail": "Trigger additional ideation when scheduled-ready backlog is too low.",
+            "metric": "ready_reel_backlog_count",
+            "comparator": "<",
+            "threshold": 4
+          }
+        ],
+        "actions": [
+          {
+            "key": "review_tiktok_cooking_trends",
+            "description": "Review TikTok cooking trend formats relevant to @crispykitchen.",
+            "side_effect_class": "none"
+          },
+          {
+            "key": "map_trends_to_crispykitchen_themes",
+            "description": "Create theme candidates that fit the cooking account and brand guidelines.",
+            "side_effect_class": "internal"
+          },
+          {
+            "key": "reject_off_brand_or_paid_distribution_ideas",
+            "description": "Remove concepts requiring paid ads, paid creators, off-brand positioning, or unapproved systems.",
+            "side_effect_class": "internal"
+          }
+        ],
+        "exit_criteria": {
+          "criteria": [
+            "At least 4 active brand-safe reel concepts are available or all viable trends have been reviewed.",
+            "Each concept includes theme, hook, recipe or cooking angle, trend rationale, and brand-fit rationale.",
+            "No concept requires paid ads or unapproved external systems."
+          ],
+          "evidence_required": [
+            "trend source notes",
+            "concept backlog entries",
+            "brand-fit rationale per concept",
+            "paid-distribution exclusion check"
+          ]
+        }
+      },
+      {
+        "key": "stage_2_script_storyboard_caption_hashtag",
+        "description": "Turn approved concepts into complete production packets.",
+        "triggers": [
+          {
+            "kind": "state_change",
+            "detail": "Begin drafting when a concept moves from candidate to approved for production.",
+            "from_state": "concept_candidate",
+            "to_state": "concept_approved"
+          },
+          {
+            "kind": "metric",
+            "detail": "Draft more packets when production-ready scripts are below cadence needs.",
+            "metric": "production_ready_script_count",
+            "comparator": "<",
+            "threshold": 3
+          }
+        ],
+        "actions": [
+          {
+            "key": "draft_short_reel_script",
+            "description": "Write a concise cooking reel script with hook, steps, payoff, and timing.",
+            "side_effect_class": "internal"
+          },
+          {
+            "key": "create_storyboard",
+            "description": "Create shot-by-shot storyboard with required B-roll or CapCut edit notes.",
+            "side_effect_class": "internal"
+          },
+          {
+            "key": "write_caption_and_hashtags",
+            "description": "Write caption and hashtag set; mark the reel incomplete if either is missing.",
+            "side_effect_class": "internal"
+          },
+          {
+            "key": "run_brand_guidelines_check",
+            "description": "Compare script, storyboard, caption, and hashtags against the @crispykitchen brand guidelines document.",
+            "side_effect_class": "none"
+          }
+        ],
+        "exit_criteria": {
+          "criteria": [
+            "Script, storyboard, caption, and hashtags are complete.",
+            "Brand guidelines check is passed or the reel is flagged brand-risky for owner review.",
+            "The production packet references only approved systems and approved stock B-roll sources."
+          ],
+          "evidence_required": [
+            "script document",
+            "storyboard document",
+            "caption text",
+            "hashtag list",
+            "brand checklist result"
+          ]
+        }
+      },
+      {
+        "key": "stage_3_capcut_production",
+        "description": "Produce the final reel video file in CapCut using approved assets.",
+        "triggers": [
+          {
+            "kind": "state_change",
+            "detail": "Start editing when a production packet is complete.",
+            "from_state": "production_packet_ready",
+            "to_state": "editing_ready"
+          }
+        ],
+        "actions": [
+          {
+            "key": "assemble_video_in_capcut",
+            "description": "Build the reel in CapCut using the storyboard, script, and approved stock B-roll.",
+            "side_effect_class": "internal"
+          },
+          {
+            "key": "export_final_reel_file",
+            "description": "Export a final short video file suitable for TikTok posting.",
+            "side_effect_class": "internal"
+          },
+          {
+            "key": "verify_video_matches_caption_and_storyboard",
+            "description": "Check that the final file matches the approved concept, script, caption, and hashtags.",
+            "side_effect_class": "none"
+          }
+        ],
+        "exit_criteria": {
+          "criteria": [
+            "Final reel file exists and is linked in the reel record.",
+            "CapCut project reference is logged.",
+            "Source B-roll assets are from the allowed stock B-roll library.",
+            "Final video has passed brand-safe visual review or is flagged brand-risky."
+          ],
+          "evidence_required": [
+            "final video file reference",
+            "CapCut project reference",
+            "source asset list",
+            "visual brand review result"
+          ]
+        }
+      },
+      {
+        "key": "stage_4_approval_or_auto_clearance",
+        "description": "Determine whether a reel needs owner approval or may auto-clear after the initial approval period.",
+        "triggers": [
+          {
+            "kind": "state_change",
+            "detail": "Approval routing starts when a final video file is ready.",
+            "from_state": "editing_complete",
+            "to_state": "approval_review_ready"
+          },
+          {
+            "kind": "manual",
+            "detail": "Owner may manually request review of any reel before scheduling or posting."
+          }
+        ],
+        "actions": [
+          {
+            "key": "check_initial_approval_window",
+            "description": "Require owner approval if the campaign is within the first 2 weeks or fewer than 10 videos have been approved.",
+            "side_effect_class": "none"
+          },
+          {
+            "key": "classify_brand_risk",
+            "description": "Classify the reel as brand-safe or brand-risky using the brand guidelines document.",
+            "side_effect_class": "none"
+          },
+          {
+            "key": "send_owner_approval_request_when_required",
+            "description": "Send the reel file, caption, hashtags, storyboard, and brand-risk notes to the owner for approval when required.",
+            "side_effect_class": "external_reversible"
+          },
+          {
+            "key": "record_owner_approval_or_auto_clearance",
+            "description": "Record explicit owner approval or auto-clearance basis before scheduling or posting.",
+            "side_effect_class": "internal"
+          }
+        ],
+        "exit_criteria": {
+          "criteria": [
+            "If within the first 2 weeks or first 10 videos, explicit owner approval is recorded.",
+            "If after the initial approval period, auto-clearance is recorded only for non-brand-risky reels.",
+            "Brand-risky reels remain blocked until owner approval is recorded.",
+            "Caption and hashtags are present before moving to scheduling."
+          ],
+          "evidence_required": [
+            "approval window calculation",
+            "approved-video count",
+            "brand-risk classification",
+            "owner approval record or auto-clearance record",
+            "caption and hashtag presence check"
+          ]
+        }
+      },
+      {
+        "key": "stage_5_buffer_schedule_and_tiktok_publish",
+        "description": "Schedule approved or auto-cleared reels in Buffer and publish to @crispykitchen TikTok on the 1 to 2 reels/day cadence.",
+        "triggers": [
+          {
+            "kind": "state_change",
+            "detail": "Scheduling starts when approval or auto-clearance is complete.",
+            "from_state": "approval_cleared",
+            "to_state": "ready_to_schedule"
+          },
+          {
+            "kind": "timer",
+            "detail": "Posting cadence check to keep @crispykitchen at 1 to 2 reels per day.",
+            "cadence_hours": 12
+          }
+        ],
+        "actions": [
+          {
+            "key": "verify_caption_hashtags_and_approval_before_external_action",
+            "description": "Block scheduling and posting unless final file, caption, hashtags, and required approval or auto-clearance are present.",
+            "side_effect_class": "none"
+          },
+          {
+            "key": "schedule_in_buffer",
+            "description": "Create or update a Buffer scheduled post for the approved @crispykitchen reel.",
+            "side_effect_class": "external_reversible"
+          },
+          {
+            "key": "publish_to_tiktok",
+            "description": "Publish the approved reel to TikTok account @crispykitchen and capture the post URL.",
+            "side_effect_class": "external_irreversible"
+          },
+          {
+            "key": "log_post_url_and_publish_record",
+            "description": "Record the TikTok post URL, posting time, caption, hashtags, final file, and theme.",
+            "side_effect_class": "internal"
+          }
+        ],
+        "exit_criteria": {
+          "criteria": [
+            "A reel is scheduled or published only after approval or valid auto-clearance.",
+            "Published reel includes caption and hashtags.",
+            "TikTok post URL is captured for every published reel.",
+            "Daily cadence remains within 1 to 2 reels unless owner intervenes."
+          ],
+          "evidence_required": [
+            "approval or auto-clearance record",
+            "Buffer schedule reference when scheduled",
+            "TikTok post URL when published",
+            "caption and hashtag verification",
+            "publish timestamp"
+          ]
+        }
+      },
+      {
+        "key": "stage_6_48_hour_performance_watch",
+        "description": "Collect 48-hour performance metrics for every published reel and classify the result.",
+        "triggers": [
+          {
+            "kind": "state_change",
+            "detail": "Start metric watch when a reel is published.",
+            "from_state": "published",
+            "to_state": "watching_48h"
+          },
+          {
+            "kind": "timer",
+            "detail": "Collect the required 48-hour TikTok performance snapshot.",
+            "cadence_hours": 48
+          }
+        ],
+        "actions": [
+          {
+            "key": "collect_48h_tiktok_metrics",
+            "description": "Read views, likes, comments, shares, saves if available, followers gained if available, and engagement rate for the reel.",
+            "side_effect_class": "none"
+          },
+          {
+            "key": "log_48h_metrics",
+            "description": "Attach the 48-hour metrics snapshot to the reel proof log.",
+            "side_effect_class": "internal"
+          },
+          {
+            "key": "classify_reel_performance",
+            "description": "Classify reel as double-down, iterate, or underperforming using views, engagement, and theme streak.",
+            "side_effect_class": "internal"
+          }
+        ],
+        "exit_criteria": {
+          "criteria": [
+            "48-hour metrics are logged for the reel.",
+            "Engagement rate is calculated.",
+            "Theme performance streak is updated.",
+            "A double-down, iterate, or cut recommendation is recorded."
+          ],
+          "evidence_required": [
+            "48-hour TikTok metrics snapshot",
+            "engagement-rate calculation",
+            "theme streak update",
+            "performance recommendation"
+          ]
+        }
+      },
+      {
+        "key": "stage_7_double_down_or_cut",
+        "description": "Reallocate production based on performance and stop weak themes.",
+        "triggers": [
+          {
+            "kind": "metric",
+            "detail": "Stop a theme when it has 3 consecutive reels below 1,000 views at 48 hours.",
+            "metric": "theme_consecutive_under_1000_view_reels",
+            "comparator": ">=",
+            "threshold": 3
+          },
+          {
+            "kind": "metric",
+            "detail": "Prioritize themes when engagement rate exceeds the campaign target.",
+            "metric": "reel_48h_engagement_rate_percent",
+            "comparator": ">=",
+            "threshold": 5
+          }
+        ],
+        "actions": [
+          {
+            "key": "stop_underperforming_theme",
+            "description": "Mark theme inactive when it has 3 consecutive reels under 1,000 views.",
+            "side_effect_class": "internal"
+          },
+          {
+            "key": "increase_backlog_for_winning_theme",
+            "description": "Create additional concept slots for themes with strong 48-hour performance.",
+            "side_effect_class": "internal"
+          },
+          {
+            "key": "update_theme_allocation",
+            "description": "Adjust future production mix toward winners and away from weak themes within safe tunable bounds.",
+            "side_effect_class": "internal"
+          }
+        ],
+        "exit_criteria": {
+          "criteria": [
+            "Themes with 3 consecutive sub-1,000-view reels are marked inactive.",
+            "Winning themes have additional concept slots assigned.",
+            "Production allocation changes are logged with rationale.",
+            "No stopped theme is used for new reel production unless the owner manually reactivates it."
+          ],
+          "evidence_required": [
+            "theme streak report",
+            "inactive theme record",
+            "winning theme rationale",
+            "updated production allocation log"
+          ]
+        }
+      }
+    ]
+  },
+  "entities": [
+    {
+      "key": "reel",
+      "type": "content_asset",
+      "states": [
+        "concept_candidate",
+        "concept_approved",
+        "production_packet_ready",
+        "editing_ready",
+        "editing_complete",
+        "approval_review_ready",
+        "approval_cleared",
+        "ready_to_schedule",
+        "scheduled",
+        "published",
+        "watching_48h",
+        "metrics_logged",
+        "cut",
+        "archived"
+      ],
+      "terminal_states": [
+        "metrics_logged",
+        "cut",
+        "archived"
+      ]
+    },
+    {
+      "key": "theme",
+      "type": "content_theme",
+      "states": [
+        "proposed",
+        "active",
+        "winning",
+        "iterating",
+        "inactive",
+        "owner_reactivated"
+      ],
+      "terminal_states": [
+        "inactive"
+      ]
+    },
+    {
+      "key": "approval_request",
+      "type": "owner_review",
+      "states": [
+        "not_required",
+        "pending_owner",
+        "approved",
+        "changes_requested",
+        "rejected",
+        "expired"
+      ],
+      "terminal_states": [
+        "not_required",
+        "approved",
+        "rejected",
+        "expired"
+      ]
+    },
+    {
+      "key": "campaign",
+      "type": "growth_campaign",
+      "states": [
+        "active",
+        "cadence_at_risk",
+        "goal_reached",
+        "failed",
+        "completed"
+      ],
+      "terminal_states": [
+        "goal_reached",
+        "failed",
+        "completed"
+      ]
+    }
+  ],
+  "event_loops": [
+    {
+      "entity": "reel",
+      "triggers": [
+        {
+          "kind": "state_change",
+          "detail": "When a reel is published, begin the 48-hour performance watch.",
+          "from_state": "published",
+          "to_state": "watching_48h"
+        },
+        {
+          "kind": "timer",
+          "detail": "Collect performance metrics 48 hours after publication.",
+          "cadence_hours": 48
+        }
+      ],
+      "terminal_states": [
+        "metrics_logged",
+        "cut",
+        "archived"
+      ],
+      "stop_conditions": [
+        "48-hour metrics have been logged and classified.",
+        "The reel has been cut or archived because it is unusable, rejected, or off-brand."
+      ]
+    },
+    {
+      "entity": "theme",
+      "triggers": [
+        {
+          "kind": "metric",
+          "detail": "Stop the theme if 3 consecutive reels from the theme are below 1,000 views at 48 hours.",
+          "metric": "theme_consecutive_under_1000_view_reels",
+          "comparator": ">=",
+          "threshold": 3
+        },
+        {
+          "kind": "metric",
+          "detail": "Promote the theme when engagement reaches or exceeds the 5% target.",
+          "metric": "theme_average_48h_engagement_rate_percent",
+          "comparator": ">=",
+          "threshold": 5
+        }
+      ],
+      "terminal_states": [
+        "inactive"
+      ],
+      "stop_conditions": [
+        "Theme is marked inactive after 3 consecutive sub-1,000-view reels.",
+        "Owner manually retires the theme."
+      ]
+    },
+    {
+      "entity": "approval_request",
+      "triggers": [
+        {
+          "kind": "inbound",
+          "detail": "Owner replies with approval, requested changes, or rejection.",
+          "channel": "owner approval channel"
+        },
+        {
+          "kind": "timer",
+          "detail": "Follow up on pending owner approvals so cadence does not go dark.",
+          "cadence_hours": 12
+        }
+      ],
+      "terminal_states": [
+        "approved",
+        "rejected",
+        "expired"
+      ],
+      "stop_conditions": [
+        "Owner approves the reel.",
+        "Owner rejects the reel.",
+        "Owner requests changes and the reel returns to editing.",
+        "Approval expires before the scheduled posting window and the reel is not posted."
+      ]
+    },
+    {
+      "entity": "campaign",
+      "triggers": [
+        {
+          "kind": "timer",
+          "detail": "Daily campaign health check for cadence, follower growth, engagement, and backlog.",
+          "cadence_hours": 24
+        },
+        {
+          "kind": "metric",
+          "detail": "Escalate when the account risks going dark for 3 consecutive days.",
+          "metric": "consecutive_days_without_post",
+          "comparator": ">=",
+          "threshold": 2
+        },
+        {
+          "kind": "metric",
+          "detail": "Mark campaign goal reached when @crispykitchen reaches 50,000 followers.",
+          "metric": "tiktok_followers",
+          "comparator": ">=",
+          "threshold": 50000
+        }
+      ],
+      "terminal_states": [
+        "goal_reached",
+        "failed",
+        "completed"
+      ],
+      "stop_conditions": [
+        "Campaign reaches 50,000 followers within 90 days.",
+        "Campaign reaches day 90 and is completed.",
+        "Campaign fails due to going dark 3 or more consecutive days or repeated boundary violations."
+      ]
+    }
+  ],
+  "approval_gates": [
+    {
+      "key": "owner_approval_first_2_weeks_and_first_10_videos",
+      "required_before": [
+        "schedule_in_buffer",
+        "publish_to_tiktok"
+      ]
+    },
+    {
+      "key": "owner_approval_brand_risky_reels",
+      "required_before": [
+        "schedule_in_buffer",
+        "publish_to_tiktok"
+      ]
+    },
+    {
+      "key": "owner_approval_external_owner_messages",
+      "required_before": [
+        "send_owner_approval_request_when_required"
+      ]
+    },
+    {
+      "key": "caption_hashtag_and_final_file_gate",
+      "required_before": [
+        "schedule_in_buffer",
+        "publish_to_tiktok"
+      ]
+    },
+    {
+      "key": "no_paid_ads_gate",
+      "required_before": [
+        "schedule_in_buffer",
+        "publish_to_tiktok"
+      ]
+    }
+  ],
+  "proof_requirements": [
+    {
+      "artifact": "reel_proof_log",
+      "required_fields": [
+        "reel_id",
+        "theme_id",
+        "final_video_file_reference",
+        "CapCut_project_reference",
+        "caption",
+        "hashtags",
+        "approval_status",
+        "auto_clearance_basis",
+        "Buffer_schedule_reference",
+        "TikTok_post_URL",
+        "publish_timestamp",
+        "48h_metrics"
+      ]
+    },
+    {
+      "artifact": "brand_guidelines_check",
+      "required_fields": [
+        "reel_id",
+        "brand_fit_result",
+        "brand_risk_flag",
+        "off_brand_notes",
+        "review_timestamp"
+      ]
+    },
+    {
+      "artifact": "owner_approval_record",
+      "required_fields": [
+        "reel_id",
+        "approval_required_reason",
+        "owner_decision",
+        "decision_timestamp",
+        "requested_changes_if_any"
+      ]
+    },
+    {
+      "artifact": "caption_hashtag_verification",
+      "required_fields": [
+        "reel_id",
+        "caption_present",
+        "hashtags_present",
+        "verification_timestamp"
+      ]
+    },
+    {
+      "artifact": "48_hour_metrics_snapshot",
+      "required_fields": [
+        "reel_id",
+        "TikTok_post_URL",
+        "views",
+        "likes",
+        "comments",
+        "shares",
+        "saves_if_available",
+        "followers_gained_if_available",
+        "engagement_rate_percent",
+        "snapshot_timestamp"
+      ]
+    },
+    {
+      "artifact": "theme_stop_report",
+      "required_fields": [
+        "theme_id",
+        "last_3_reel_ids",
+        "last_3_48h_view_counts",
+        "consecutive_under_1000_count",
+        "theme_state",
+        "stop_timestamp"
+      ]
+    }
+  ],
+  "side_effect_policy": {
+    "allowed": [
+      "none",
+      "internal"
+    ],
+    "forbidden": [
+      "financial"
+    ],
+    "approval_required": [
+      "external_reversible",
+      "external_irreversible"
+    ],
+    "owner_boundaries": [
+      "External reversible actions, including Buffer scheduling and owner approval messages, require the applicable approval gate before execution.",
+      "External irreversible actions, including publishing to TikTok @crispykitchen, require approval or valid auto-clearance and must pass the caption, hashtag, and final-file gate.",
+      "Financial side effects are forbidden because the owner specified no paid ads.",
+      "No reel may be posted without caption and hashtags.",
+      "Owner approval is mandatory for all videos before posting for the first 2 weeks and first 10 approved videos.",
+      "Brand-risky reels always require owner approval before scheduling or posting."
+    ]
+  },
+  "escalation_paths": [
+    {
+      "condition": "A reel is classified as brand-risky, ambiguous, controversial, or potentially off-brand.",
+      "to": "owner"
+    },
+    {
+      "condition": "The account has 2 consecutive days without a scheduled or published reel and risks going dark for 3 days.",
+      "to": "CEO dispatcher"
+    },
+    {
+      "condition": "Caption or hashtags are missing from a reel queued for scheduling or posting.",
+      "to": "script_storyboard_producer"
+    },
+    {
+      "condition": "A theme hits 3 consecutive reels under 1,000 views at 48 hours.",
+      "to": "optimizer"
+    },
+    {
+      "condition": "Any workflow step would require paid ads, paid promotion, or unapproved external systems.",
+      "to": "owner"
+    },
+    {
+      "condition": "Owner approval is required but not received before the posting window.",
+      "to": "CEO dispatcher"
+    }
+  ],
+  "tunables": {
+    "daily_reel_target": {
+      "default": 1,
+      "range": [
+        1,
+        2
+      ],
+      "controls": "How many @crispykitchen reels the system aims to publish per day while staying within the owner-specified cadence."
+    },
+    "approval_followup_cadence_hours": {
+      "default": 12,
+      "range": [
+        6,
+        24
+      ],
+      "controls": "How often the system follows up on pending owner approvals during approval-required periods."
+    },
+    "minimum_ready_reel_backlog_count": {
+      "default": 4,
+      "range": [
+        2,
+        8
+      ],
+      "controls": "How many approved or near-ready reels should be kept in the backlog to avoid going dark."
+    },
+    "hashtag_count": {
+      "default": 5,
+      "range": [
+        3,
+        8
+      ],
+      "controls": "Number of hashtags generated per reel caption package."
+    },
+    "theme_double_down_engagement_threshold_percent": {
+      "default": 5,
+      "range": [
+        4,
+        8
+      ],
+      "controls": "Engagement-rate threshold used to recommend producing more reels from a theme."
+    },
+    "winning_theme_production_share_percent": {
+      "default": 50,
+      "range": [
+        30,
+        70
+      ],
+      "controls": "Share of future production slots allocated to themes that outperform the engagement target."
+    },
+    "production_batch_size": {
+      "default": 3,
+      "range": [
+        1,
+        6
+      ],
+      "controls": "Number of scripts or videos prepared together in one production batch."
+    }
+  },
+  "owner_summary": {
+    "summary": "Hermes will run a 90-day @crispykitchen TikTok reels engine using TikTok, Buffer, CapCut, the stock B-roll library, and the brand guidelines document. It will target 1 to 2 reels per day, 50k followers, and 5% engagement. Every reel will include a final file, caption, hashtags, approval or auto-clearance proof, post URL, and 48-hour metrics. Owner approval is required for every video during the first 2 weeks and first 10 videos, and always for brand-risky reels. No paid ads or financial side effects are allowed. Themes with 3 consecutive reels below 1,000 views at 48 hours will be stopped.",
+    "pending_confirmation": true
+  },
+  "needed_capability_types": [
+    "read:tiktok_trends",
+    "read:tiktok_account_metrics",
+    "read:tiktok_post_metrics",
+    "read:brand_guidelines",
+    "read:stock_broll_library",
+    "write:content_backlog",
+    "write:script",
+    "write:storyboard",
+    "write:caption",
+    "write:hashtag_set",
+    "write:video_project",
+    "write:video_file",
+    "write:social_schedule",
+    "write:tiktok_post",
+    "write:owner_approval_request",
+    "write:performance_log"
+  ]
+}

@@ -100,6 +100,30 @@ def test_grow_app_and_research_render_without_error():
         assert f"/approve {slug}" in out
 
 
+def test_tiktok_summary_surfaces_publish_gate_and_cadence():
+    """The content-automation domain renders the same owner-legible shape: a
+    produce->post pipeline, a publish action that is owner-gated (irreversible),
+    a 48-hour performance watcher, and the bounded posting-cadence dial."""
+    contract = _load("tiktok_reels")
+    out = render_owner_contract_summary(contract, board="tiktok-reels")
+    # Produce -> post pipeline is named.
+    assert "*Pipeline:*" in out
+    assert "production" in out.lower()
+    assert "publish" in out.lower()
+    # The irreversible TikTok publish is owner-gated, never autonomous.
+    assert "*Needs your approval:*" in out
+    assert "publish to tiktok" in out.lower()
+    facts = contract_summary_facts(contract)
+    assert facts["autonomous_external"] == []
+    # A performance watcher with stop semantics.
+    assert "*Watches & follow-ups:*" in out
+    assert "stops when" in out.lower()
+    # Posting-cadence / backlog dials are bounded.
+    assert "auto-tune" in out.lower()
+    assert "daily reel target" in out.lower()
+    assert "/approve tiktok-reels" in out
+
+
 # ---------------------------------------------------------------------------
 # Robustness: never raise on a partial / malformed / empty contract
 # ---------------------------------------------------------------------------

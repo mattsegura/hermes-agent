@@ -32,6 +32,18 @@ def test_research_team_fixture_passes_invariants():
     assert report.ok, report.errors
 
 
+def test_tiktok_reels_fixture_passes_invariants():
+    """A real model-synthesized content-automation contract (TikTok reels). Proves
+    the grammar/gating rails hold on a domain far from the sales/recruiting corpus:
+    an irreversible publish action must be owner-gated, and every external send
+    governed by side_effect_policy."""
+    report = check_contract_invariants(_load("tiktok_reels"))
+    assert report.ok, report.errors
+    # The pipeline declares an irreversible publish that the rail forces to be gated.
+    assert report.checked.get("irreversible_actions", 0) >= 1
+    assert report.checked.get("event_loops", 0) >= 1
+
+
 def test_conversational_event_loop_without_timer_fails():
     contract = {
         "objective": {"statement": "x"},
