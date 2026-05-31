@@ -11551,6 +11551,55 @@ def _block_contract_ineligible(
     return True
 
 
+def _emit_dispatch_blocked_signal(
+    conn: sqlite3.Connection,
+    board_slug: Optional[str],
+    gate: dict[str, Any],
+) -> None:
+    """Record a deduped board-level signal when ``board_dispatch_gate`` blocks
+    a claim/promotion, so a launch-gated board is OBSERVABLE rather than a
+    silent hang.
+
+    Historically only ``board_metadata_invalid`` surfaced anything (a task-level
+    block event); the other gate-failure codes (``launch_readiness_failed``,
+    ``launch_review_missing``, ``board_not_active``) fell through to a bare
+    ``return None`` with no event and no audit trail -- so a correctly-blocked
+    board looked identical to a broken/hung one. This is the observability
+    scaffolding that must exist BEFORE the dispatch gate is tightened
+    (report->enforce), otherwise newly-blocked tasks vanish without a trace.
+
+    Unlike :func:`_block_contract_ineligible` this does NOT mutate any task:
+    the transient board-level codes resolve when the board is approved/activated,
+    so blocking individual tasks would strand them. One row is recorded per
+    distinct ``(board, sorted-blocker-codes)`` (the ``dedupe_key`` UNIQUE index
+    keeps a stuck board from spamming the ledger). Best-effort: a telemetry
+    failure never breaks the caller.
+    """
+    blockers = gate.get("blockers") or []
+    codes = sorted(
+        {
+            str(blocker.get("code"))
+            for blocker in blockers
+            if isinstance(blocker, dict) and blocker.get("code")
+        }
+    )
+    if not codes:
+        return
+    key = ",".join(codes)
+    try:
+        with write_txn(conn):
+            record_board_signal(
+                conn,
+                primitive_kind="dispatch_blocked",
+                primitive_key=key,
+                board=board_slug,
+                action={"blockers": blockers, "reason": gate.get("reason")},
+                dedupe_key=f"dispatch_blocked:{board_slug}:{key}",
+            )
+    except Exception:  # pragma: no cover - defensive telemetry guard
+        _log.warning("dispatch_blocked signal emit failed", exc_info=True)
+
+
 def _structured_completion_evidence_keys(*, metadata: Optional[dict], funnel_data: Optional[dict]) -> set[str]:
     """Evidence keys for hard done gates; intentionally ignores prose."""
     keys: set[str] = set()
@@ -13190,7 +13239,7 @@ SENSOR_SIGNAL_KINDS: frozenset[str] = frozenset(
 
 SIGNAL_PRIMITIVE_KINDS: frozenset[str] = frozenset(
     {"stage", "substate", "event_loop", "knob_action", "outcome", "approval",
-     "amendment", "steering"}
+     "amendment", "steering", "dispatch_blocked"}
     | SENSOR_SIGNAL_KINDS
 )
 
@@ -13579,6 +13628,7 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
     """
     gate = board_dispatch_gate(_connection_board(conn))
     if not gate.get("ok"):
+        _emit_dispatch_blocked_signal(conn, _connection_board(conn), gate)
         return 0
 
     promoted = 0
@@ -13645,6 +13695,7 @@ def claim_task(
     board_slug = _connection_board(conn, board)
     launch_gate = board_dispatch_gate(board_slug)
     if not launch_gate.get("ok"):
+        _emit_dispatch_blocked_signal(conn, board_slug, launch_gate)
         if any(
             isinstance(blocker, dict) and blocker.get("code") == "board_metadata_invalid"
             for blocker in launch_gate.get("blockers") or []
@@ -13792,6 +13843,7 @@ def claim_review_task(
     board_slug = _connection_board(conn, board)
     launch_gate = board_dispatch_gate(board_slug)
     if not launch_gate.get("ok"):
+        _emit_dispatch_blocked_signal(conn, board_slug, launch_gate)
         if any(
             isinstance(blocker, dict) and blocker.get("code") == "board_metadata_invalid"
             for blocker in launch_gate.get("blockers") or []
