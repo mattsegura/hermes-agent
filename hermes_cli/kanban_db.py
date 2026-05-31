@@ -90,7 +90,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from toolsets import get_toolset_names
 
@@ -1364,6 +1364,21 @@ def normalize_board_operating_contract(
         if sensors is not None:
             out["sensors"] = sensors
     return out
+
+
+_DEFAULT_INTAKE_CLARIFYING_FIELDS: tuple[str, ...] = (
+    "objective.success",
+    "objective.failure",
+    "objective.constraints",
+    "runtime.provider_policy",
+    "runtime.worker_envelopes",
+    "approval_gates",
+)
+
+
+def _default_intake_clarifying_questions() -> list[str]:
+    """Deterministic owner questions when server-side intake generation is unavailable."""
+    return launch_clarity_questions(_DEFAULT_INTAKE_CLARIFYING_FIELDS)[:6]
 
 
 _LAUNCH_QUESTION_BY_MISSING: dict[str, str] = {
@@ -2751,7 +2766,7 @@ def _launch_review_questions(
     readiness_questions = _string_list(readiness.get("questions"))[:6]
     intake_questions = _launch_intake_questions(contract)[:6]
     if _contract_uses_model_generated_intake(contract) and not intake_questions:
-        return intake_questions
+        return _default_intake_clarifying_questions()
     if missing and _contract_has_partial_launch_detail(contract):
         return targeted or readiness_questions or intake_questions
     return readiness_questions or targeted or intake_questions
@@ -3053,14 +3068,31 @@ def _maybe_run_pre_interview_research(draft: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def _apply_launch_intake_question_fallback(intake: dict[str, Any]) -> dict[str, Any]:
+    """Populate deterministic clarifying questions when server generation is unavailable."""
+    if _string_list(intake.get("generated_questions")):
+        return intake
+    fallback = _default_intake_clarifying_questions()
+    if not fallback:
+        return intake
+    updated = dict(intake)
+    updated["generated_questions"] = fallback
+    updated["questions"] = fallback[:6]
+    updated["degraded_mode"] = True
+    qg = dict(_contract_object(updated.get("question_generation")))
+    qg["mode"] = "deterministic_fallback"
+    qg["fulfilled"] = True
+    updated["question_generation"] = qg
+    return updated
+
+
 def _maybe_generate_launch_intake_questions(draft: dict[str, Any]) -> dict[str, Any]:
     """Server-side question generation when intake is clarifying and unasked.
 
-    When the auxiliary slot is unconfigured this is a no-op and the existing
-    ``model_generated`` question_generation instructions remain for the chat
-    model. When configured, the *server* generates the owner questions and
-    stashes them in ``launch_intake.generated_questions`` so the tool layer can
-    instruct the model to simply relay them.
+    When the auxiliary slot is unconfigured or the aux call fails, stashes
+    deterministic fallback questions in ``launch_intake.generated_questions``
+    so the tool layer can relay them proactively. When configured and healthy,
+    the *server* generates tailored owner questions instead.
     """
     intake = _contract_object(draft.get("launch_intake"))
     if not intake:
@@ -3070,8 +3102,12 @@ def _maybe_generate_launch_intake_questions(draft: dict[str, Any]) -> dict[str, 
     if _string_list(intake.get("generated_questions")):
         return draft
     rough_goal = _intake_rough_goal(intake)
-    if not rough_goal or not _launch_intake_aux_enabled():
+    if not rough_goal:
         return draft
+    if not _launch_intake_aux_enabled():
+        merged = dict(draft)
+        merged["launch_intake"] = _apply_launch_intake_question_fallback(dict(intake))
+        return merged
     _emit_launch_cli_progress("generating launch-intake questions (kanban_launch_intake aux)...")
     try:
         from hermes_cli import kanban_launch_intake as kli
@@ -3094,7 +3130,7 @@ def _maybe_generate_launch_intake_questions(draft: dict[str, Any]) -> dict[str, 
         qg["fulfilled"] = True
         intake["question_generation"] = qg
     else:
-        intake["degraded_mode"] = True
+        intake = _apply_launch_intake_question_fallback(intake)
     merged["launch_intake"] = intake
     return merged
 
@@ -3507,27 +3543,18 @@ def _synthesize_launch_contract_from_intake(draft: dict[str, Any]) -> dict[str, 
             str(os.environ.get("HERMES_PROFILE") or os.environ.get("HERMES_PROFILE_NAME") or "").strip()
             or "personal-assistant"
         )
-        # Bounded synthesis self-repair loop. The first attempt is a cold draft;
-        # each subsequent attempt is a *repair pass* that feeds the previous
+        # Bounded synthesis self-repair loop, now expressed via the shared
+        # ``synthesize_contract_with_repair`` helper (the SAME loop the
+        # natural-language steering path uses). The first attempt is a cold
+        # draft; each subsequent attempt is a *repair pass* that feeds the prior
         # attempt's SPECIFIC structural-invariant error strings back into the
-        # synthesizer so it can fix exactly those defects. The loop is hard-bounded
-        # by LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS, breaks immediately if the aux model
-        # degrades (unconfigured/unavailable) or raises, and only after every
+        # synthesizer so it fixes exactly those defects. Hard-bounded by
+        # LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS; stops immediately if the aux model
+        # degrades (unconfigured/unavailable) or raises; and only after every
         # attempt fails does it degrade to the deterministic universal drafter --
         # preserving the prior behaviour of recording the LAST attempt's findings
         # so the gap stays visible, never silent.
-        last_report: Optional[Any] = None
-        repair_feedback: Optional[list[str]] = None
-        for attempt in range(1, LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS + 1):
-            if attempt == 1:
-                _emit_launch_cli_progress(
-                    "synthesizing board contract (kanban_launch_intake aux)..."
-                )
-            else:
-                _emit_launch_cli_progress(
-                    f"repairing synthesized contract (attempt {attempt}/"
-                    f"{LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS})..."
-                )
+        def _synthesize(repair_feedback: Optional[list[str]]):
             try:
                 synth = kli.run_contract_synthesis(
                     rough_goal,
@@ -3538,41 +3565,47 @@ def _synthesize_launch_contract_from_intake(draft: dict[str, Any]) -> dict[str, 
                     repair_feedback=repair_feedback,
                 )
             except Exception:  # pragma: no cover - defensive
-                synth = None
+                return (None, True, "synthesis raised")
             if synth is None or getattr(synth, "degraded", False):
-                # Hard failure or aux model unconfigured/unavailable: stop
-                # immediately (no further repair calls) and degrade cleanly.
-                break
+                # Hard failure or aux model unconfigured/unavailable: degrade.
+                return (None, True, str(getattr(synth, "reason", "") or "") or "auxiliary unavailable")
             if not (synth.ok and isinstance(synth.contract, dict)):
-                # Unusable response (unparseable / missing objective+workflow).
-                # Feed the reason back as repair guidance and retry while
-                # attempts remain.
-                repair_feedback = [
-                    str(getattr(synth, "reason", "") or "")
-                    or "previous response was not a complete contract JSON"
-                ]
-                last_report = None
-                continue
+                # Unusable response (unparseable / missing objective+workflow):
+                # retry with the reason as repair guidance.
+                return (None, False, str(getattr(synth, "reason", "") or ""))
+            return (synth.contract, False, "")
+
+        def _validate(contract: dict[str, Any]):
             # Grammar enforcement: a synthesized contract must wire its reactive
-            # control plane correctly (watched things can terminate, conversational
-            # stages have a follow-up timer + >=2 exits, knobs have ranges).
-            report = check_contract_invariants(synth.contract)
-            if report.ok:
-                return _apply_synthesized_launch_contract(
-                    draft, intake, coverage, synth.contract, rough_goal, invariants=report
+            # control plane correctly (watched things can terminate,
+            # conversational stages have a follow-up timer + >=2 exits, knobs
+            # have ranges).
+            report = check_contract_invariants(contract)
+            return (report.ok, list(report.errors), report)
+
+        def _progress(attempt: int):
+            if attempt == 1:
+                _emit_launch_cli_progress(
+                    "synthesizing board contract (kanban_launch_intake aux)..."
                 )
-            last_report = report
-            repair_feedback = list(report.errors)
-            _log.info(
-                "launch_intake: synthesized contract failed invariants "
-                "(attempt %d/%d: %s)%s",
-                attempt,
-                LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS,
-                "; ".join(report.errors[:3]),
-                " — retrying with repair feedback"
-                if attempt < LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS
-                else " — degrading",
+            else:
+                _emit_launch_cli_progress(
+                    f"repairing synthesized contract (attempt {attempt}/"
+                    f"{LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS})..."
+                )
+
+        outcome = synthesize_contract_with_repair(
+            _synthesize,
+            _validate,
+            max_attempts=LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS,
+            on_attempt=_progress,
+        )
+        if outcome["ok"]:
+            return _apply_synthesized_launch_contract(
+                draft, intake, coverage, outcome["contract"], rough_goal,
+                invariants=outcome["last_report"],
             )
+        last_report = outcome["last_report"]
         if last_report is not None:
             draft = _record_launch_intake_invariant_failure(draft, last_report)
 
@@ -4764,7 +4797,7 @@ def _review_business_launch_contract_unlocked(
     )
 
     base_contract = contract
-    if base_contract is None and intake_answers is not None and existing_contract_for_intake is not None:
+    if base_contract is None and existing_contract_for_intake is not None:
         base_contract = existing_contract_for_intake
     elif base_contract is None and intake_answers is not None and board:
         normed_for_intake = _normalize_board_slug(board)
@@ -4993,6 +5026,136 @@ def _review_business_launch_contract_unlocked(
     }
 
 
+def _union_candidate_errors(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Batched validation of an ALREADY-NORMALIZED candidate contract.
+
+    Runs the reactive-grammar invariants and launch-readiness checks and returns
+    their UNION (``errors`` = invariant + readiness-hard errors; ``missing`` =
+    readiness gaps). Shared by :func:`validate_amendment_candidate` (which
+    normalizes the merged patch first) and the steering self-repair loop (which
+    already holds a normalized candidate).
+    """
+    from hermes_cli.kanban_launch_invariants import check_contract_invariants
+
+    report = check_contract_invariants(candidate)
+    invariant_errors = list(report.errors)
+    warnings = list(report.warnings)
+    readiness = validate_business_runtime_contract(candidate)
+    missing = list(readiness.get("missing") or [])
+    warnings.extend(readiness.get("warnings") or [])
+    for err in readiness.get("errors") or []:
+        if err not in invariant_errors:
+            invariant_errors.append(err)
+    return {
+        "ok": not invariant_errors and not missing,
+        "errors": invariant_errors,
+        "warnings": warnings,
+        "missing": missing,
+        "invariant_errors": invariant_errors,
+        "readiness": readiness,
+    }
+
+
+def _summarize_contract_changes(before: Any, after: Any) -> list[str]:
+    """Plain-language, deterministic diff of the owner-visible contract sections.
+
+    Surfaced by the natural-language steering path so the owner sees *what
+    changed* ("added 1 workflow stage", "tightened objective.success") without
+    any raw JSON. Best-effort and never raises.
+    """
+    out: list[str] = []
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return out
+    try:
+        b_obj = before.get("objective") if isinstance(before.get("objective"), dict) else {}
+        a_obj = after.get("objective") if isinstance(after.get("objective"), dict) else {}
+        if (b_obj or {}).get("statement") != (a_obj or {}).get("statement"):
+            out.append("revised the objective statement")
+        for field_name in ("success", "failure", "constraints"):
+            if (b_obj or {}).get(field_name) != (a_obj or {}).get(field_name):
+                out.append(f"updated objective.{field_name}")
+
+        def _stage_count(c: dict[str, Any]) -> int:
+            wf = c.get("workflow") if isinstance(c.get("workflow"), dict) else {}
+            return len([s for s in (wf or {}).get("stages") or [] if isinstance(s, dict)])
+
+        delta = _stage_count(after) - _stage_count(before)
+        if delta > 0:
+            out.append(f"added {delta} workflow stage(s)")
+        elif delta < 0:
+            out.append(f"removed {abs(delta)} workflow stage(s)")
+
+        for key in ("side_effect_policy", "approval_gates", "entities", "event_loops", "tunables"):
+            if before.get(key) != after.get(key):
+                out.append(f"changed {key}")
+    except Exception:  # pragma: no cover - defensive
+        return out
+    return out
+
+
+def synthesize_contract_with_repair(
+    synthesize: Callable[[Optional[list[str]]], tuple[Optional[dict[str, Any]], bool, str]],
+    validate: Callable[[dict[str, Any]], tuple[bool, list[str], Any]],
+    *,
+    max_attempts: int = LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS,
+    on_attempt: Optional[Callable[[int], None]] = None,
+) -> dict[str, Any]:
+    """Bounded synthesize -> validate -> repair loop.
+
+    Shared by the launch cold-draft synthesis path and the natural-language
+    steering edit path so neither hand-authors contract JSON and both
+    self-repair against the SAME validator instead of degrading on the first
+    defect.
+
+    ``synthesize(repair_feedback)`` returns ``(contract|None, degraded, reason)``:
+      * ``degraded=True``  -> aux model unavailable / hard failure: stop now.
+      * ``contract is None`` (degraded False) -> unusable response: retry while
+        attempts remain, feeding ``[reason]`` back as repair feedback.
+      * a contract dict -> hand to ``validate``.
+    ``validate(contract)`` returns ``(ok, errors, report)``. On ``ok`` the loop
+    returns the accepted contract; otherwise ``errors`` become the next attempt's
+    repair feedback and ``report`` is passed through verbatim as ``last_report``
+    (so a caller can record its native validator artifact, e.g. an
+    ``InvariantReport``).
+
+    Returns ``{ok, contract, errors, last_report, degraded, attempts}``.
+    """
+    repair_feedback: Optional[list[str]] = None
+    last_report: Any = None
+    attempt = 0
+    for attempt in range(1, max_attempts + 1):
+        if on_attempt is not None:
+            on_attempt(attempt)
+        contract, degraded, reason = synthesize(repair_feedback)
+        if degraded:
+            return {
+                "ok": False, "contract": None, "errors": [],
+                "last_report": last_report, "degraded": True, "attempts": attempt,
+            }
+        if contract is None:
+            # Unusable response: feed the reason back and retry (mirrors the
+            # historical launch loop's not-ok-synth branch, which reset the
+            # last invariant report so a trailing bad response degrades cleanly).
+            repair_feedback = [
+                str(reason or "").strip()
+                or "previous response was not a complete contract JSON"
+            ]
+            last_report = None
+            continue
+        ok, errors, report = validate(contract)
+        if ok:
+            return {
+                "ok": True, "contract": contract, "errors": [],
+                "last_report": report, "degraded": False, "attempts": attempt,
+            }
+        last_report = report
+        repair_feedback = list(errors)
+    return {
+        "ok": False, "contract": None, "errors": list(repair_feedback or []),
+        "last_report": last_report, "degraded": False, "attempts": attempt,
+    }
+
+
 def propose_board_contract_amendment(
     board: str,
     *,
@@ -5001,7 +5164,13 @@ def propose_board_contract_amendment(
     author: Optional[str] = None,
     risk: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Create a pending contract amendment without changing active runtime."""
+    """Create a pending contract amendment without changing active runtime.
+
+    This is the LOW-LEVEL / escape-hatch entry: it takes an already-formed
+    ``patch`` and stores it verbatim (deep-merged over the current contract).
+    Owner-facing edits should prefer :func:`steer_board_contract_amendment`
+    (natural-language, self-repairing). Supersede semantics apply either way.
+    """
     normed = _normalize_board_slug(board)
     if not normed:
         raise ValueError("board slug is required")
@@ -5070,8 +5239,6 @@ def validate_amendment_candidate(board: str, patch: Any) -> dict[str, Any]:
     raises for an expected malformed patch; the raising normalizers are reused
     in collect mode via ``error_sink``.
     """
-    from hermes_cli.kanban_launch_invariants import check_contract_invariants
-
     normed = _normalize_board_slug(board)
     if not normed:
         return {"ok": False, "errors": ["board slug is required"], "warnings": [], "missing": []}
@@ -5093,15 +5260,11 @@ def validate_amendment_candidate(board: str, patch: Any) -> dict[str, Any]:
     missing: list[str] = []
     readiness: dict[str, Any] = {}
     if not shape_errors:
-        report = check_contract_invariants(candidate)
-        invariant_errors = list(report.errors)
-        warnings.extend(report.warnings)
-        readiness = validate_business_runtime_contract(candidate)
-        missing = list(readiness.get("missing") or [])
-        warnings.extend(readiness.get("warnings") or [])
-        for err in readiness.get("errors") or []:
-            if err not in invariant_errors:
-                invariant_errors.append(err)
+        union = _union_candidate_errors(candidate)
+        invariant_errors = list(union["invariant_errors"])
+        warnings = list(union["warnings"])
+        missing = list(union["missing"])
+        readiness = union["readiness"]
 
     all_errors = list(shape_errors) + [e for e in invariant_errors if e not in shape_errors]
     return {
@@ -5113,6 +5276,146 @@ def validate_amendment_candidate(board: str, patch: Any) -> dict[str, Any]:
         "invariant_errors": invariant_errors,
         "readiness": readiness,
         "candidate": candidate if not shape_errors else None,
+    }
+
+
+def steer_board_contract_amendment(
+    board: str,
+    intent: str,
+    *,
+    author: Optional[str] = None,
+    risk: Optional[str] = None,
+    max_attempts: int = LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS,
+) -> dict[str, Any]:
+    """Owner-facing, natural-language contract edit (the DEFAULT edit path).
+
+    Routes the owner's free-text ``intent`` through the CEO steering model
+    (:func:`hermes_cli.kanban_launch_intake.run_ceo_turn`) inside the shared
+    bounded self-repair loop, validates each candidate with the batched
+    validator, and — once it converges on a launch-ready change — stores ONE
+    clean pending amendment via :func:`propose_board_contract_amendment` (so the
+    shipped supersede + fail-closed ``/approve`` behaviour apply unchanged). The
+    owner never hand-authors JSON and never sees schema/validator jargon.
+
+    DRIFT GUARD: the steering model is instructed to make the SMALLEST change
+    that satisfies the intent and preserve everything else, and edits flow as a
+    deep-merged ``diff`` whenever the model emits one.
+
+    Returns a plain-language result dict: ``{ok, stored, amendment, summary,
+    changes, reply, errors, degraded}``.
+    """
+    normed = _normalize_board_slug(board)
+    if not normed:
+        raise ValueError("board slug is required")
+    if not board_exists(normed):
+        raise ValueError(f"board {normed!r} does not exist")
+    intent_text = str(intent or "").strip()
+    if not intent_text:
+        raise ValueError("intent is required")
+
+    if not _launch_intake_aux_enabled():
+        return {
+            "ok": False, "stored": False, "amendment": None, "degraded": True,
+            "summary": "", "changes": [], "errors": [],
+            "reply": (
+                "Natural-language steering is unavailable right now (the steering "
+                "model is not configured). The change was not made."
+            ),
+        }
+
+    from hermes_cli import kanban_launch_intake as kli
+
+    meta = read_board_metadata(normed)
+    current = _metadata_as_business_contract(meta)
+    version = _normalize_contract_version(meta.get("contract_version"))
+    base_message = (
+        intent_text
+        + "\n\n(Make the SMALLEST change that satisfies this. Preserve every "
+        "other part of the current contract verbatim; do not restructure or drop "
+        "anything the owner did not ask to change. Prefer emitting a minimal "
+        "\"diff\".)"
+    )
+    captured: dict[str, Any] = {"patch": None, "reply": "", "rationale": ""}
+
+    def _synthesize(repair_feedback: Optional[list[str]]):
+        owner_message = base_message
+        if repair_feedback:
+            owner_message = base_message + (
+                "\n\nThe previous proposal was rejected by the contract validator "
+                "for these specific problems:\n"
+                + "\n".join(f"- {e}" for e in repair_feedback if str(e).strip())
+                + "\nReturn a corrected amendment that fixes EXACTLY these and "
+                "keeps everything else unchanged."
+            )
+        try:
+            turn = kli.run_ceo_turn(
+                mode="runtime_evolution",
+                owner_message=owner_message,
+                contract=current,
+                contract_version=version,
+            )
+        except Exception:  # pragma: no cover - defensive
+            return (None, True, "steering model raised")
+        if turn is None or getattr(turn, "degraded", False) or not getattr(turn, "ok", False):
+            return (None, True, "steering model unavailable")
+        captured["reply"] = str(getattr(turn, "reply", "") or "").strip()
+        proposal = getattr(turn, "proposal", None)
+        if proposal is None:
+            # The model chose to converse/clarify rather than propose a change.
+            return (None, False, "no concrete change proposed yet")
+        captured["rationale"] = str(getattr(proposal, "rationale", "") or "").strip()
+        diff = getattr(proposal, "diff", None)
+        proposed = getattr(proposal, "proposed_contract", None)
+        if isinstance(diff, dict) and diff:
+            patch_obj = diff
+        elif isinstance(proposed, dict) and proposed:
+            patch_obj = proposed
+        else:
+            return (None, False, "proposal carried no contract change")
+        captured["patch"] = patch_obj
+        try:
+            candidate = normalize_board_operating_contract(
+                _deep_merge_contract(current, patch_obj)
+            )
+        except ValueError as exc:
+            return (None, False, f"proposed change has a structural defect: {exc}")
+        return (candidate, False, "")
+
+    def _validate(candidate: dict[str, Any]):
+        union = _union_candidate_errors(candidate)
+        return (union["ok"], list(union["errors"]) + list(union["missing"]), union)
+
+    outcome = synthesize_contract_with_repair(
+        _synthesize, _validate, max_attempts=max_attempts
+    )
+    if not outcome["ok"]:
+        reply = captured["reply"]
+        if not reply:
+            tail = "; ".join(outcome["errors"][:3]) if outcome["errors"] else ""
+            reply = (
+                "I couldn't converge on a valid change for that"
+                + (f": {tail}" if tail else ".")
+            )
+        return {
+            "ok": False, "stored": False, "amendment": None,
+            "degraded": bool(outcome["degraded"]),
+            "summary": "", "changes": [],
+            "reply": reply, "errors": list(outcome["errors"]),
+        }
+
+    amendment = propose_board_contract_amendment(
+        normed,
+        patch=captured["patch"] or {},
+        reason=intent_text,
+        author=author,
+        risk=risk,
+    )
+    changes = _summarize_contract_changes(current, amendment.get("candidate_contract") or {})
+    summary = captured["rationale"] or captured["reply"] or "Updated the board contract."
+    return {
+        "ok": True, "stored": True, "amendment": amendment,
+        "summary": summary, "changes": changes,
+        "reply": captured["reply"], "errors": [], "degraded": False,
     }
 
 

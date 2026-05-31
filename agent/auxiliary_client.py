@@ -88,7 +88,16 @@ class _OpenAIProxy:
     __slots__ = ()
 
     def __call__(self, *args, **kwargs):
-        return _load_openai_cls()(*args, **kwargs)
+        # Inject a custom httpx client so OpenAI SDK does not pass the legacy
+        # ``proxies=`` kwarg (removed in httpx 0.28+), which otherwise breaks
+        # every auxiliary call with TypeError and forces launch intake into
+        # silent degraded mode.
+        call_kwargs = dict(kwargs)
+        if "http_client" not in call_kwargs:
+            http_client = _build_openai_http_client(str(call_kwargs.get("base_url") or ""))
+            if http_client is not None:
+                call_kwargs["http_client"] = http_client
+        return _load_openai_cls()(*args, **call_kwargs)
 
     def __instancecheck__(self, obj):
         return isinstance(obj, _load_openai_cls())
@@ -98,6 +107,36 @@ class _OpenAIProxy:
 
 
 OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
+
+
+def _build_openai_http_client(base_url: str = "") -> Optional[Any]:
+    """Build an httpx client for auxiliary OpenAI SDK calls (proxy + keepalive)."""
+    try:
+        import httpx as _httpx
+        import socket as _socket
+        from agent.process_bootstrap import _get_proxy_for_base_url
+    except Exception:
+        return None
+    try:
+        sock_opts = [(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)]
+        if hasattr(_socket, "TCP_KEEPIDLE"):
+            sock_opts.extend(
+                [
+                    (_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30),
+                    (_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 10),
+                    (_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3),
+                ]
+            )
+        elif hasattr(_socket, "TCP_KEEPALIVE"):
+            sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 30))
+        proxy = _get_proxy_for_base_url(base_url)
+        return _httpx.Client(
+            transport=_httpx.HTTPTransport(socket_options=sock_opts),
+            proxy=proxy,
+        )
+    except Exception:
+        return None
+
 
 from agent.credential_pool import load_pool
 from hermes_cli.config import get_hermes_home

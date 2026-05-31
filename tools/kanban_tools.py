@@ -623,6 +623,12 @@ def _attach_launch_intake_followup(payload: dict[str, Any]) -> None:
     questions = payload.get("questions")
     question_list = [str(q) for q in questions] if isinstance(questions, list) else []
     intake = payload.get("launch_intake")
+    if not question_list and isinstance(intake, dict):
+        for key in ("generated_questions", "questions"):
+            stored = intake.get(key)
+            if isinstance(stored, list) and stored:
+                question_list = [str(q) for q in stored if str(q).strip()]
+                break
     if isinstance(intake, dict):
         intake_state = str(intake.get("state") or "").strip().lower()
         answer_quality = intake.get("answer_quality")
@@ -1597,6 +1603,70 @@ def _handle_contract_amendment_propose(args: dict, **kw) -> str:
         return tool_error(f"kanban_contract_amendment_propose: {e}")
 
 
+def _handle_contract_steer(args: dict, **kw) -> str:
+    """Owner-facing natural-language contract edit (PREFERRED over raw patches).
+
+    Takes a plain-English ``intent`` and routes it through the steering model +
+    server-side self-repair loop, which drafts a minimal targeted diff,
+    auto-fixes validator errors, and stores ONE clean pending amendment. Returns
+    a plain-language summary of what changed — never raw schema/JSON.
+    """
+    guard = _require_orchestrator_tool(
+        "kanban_contract_steer",
+        allow_launch_intake=True,
+    )
+    if guard:
+        return guard
+    board = args.get("board")
+    intent = args.get("intent")
+    if not board:
+        return tool_error("board is required")
+    if not str(intent or "").strip():
+        return tool_error("intent is required")
+    try:
+        from hermes_cli import kanban_db as kb
+
+        result = kb.steer_board_contract_amendment(
+            board,
+            str(intent),
+            author=os.environ.get("HERMES_PROFILE") or "orchestrator",
+            risk=args.get("risk"),
+        )
+        if not result.get("ok"):
+            # Steering model unavailable, asked a clarifying question, or could
+            # not converge on a valid change. Surface the plain-language reply;
+            # nothing was stored.
+            return json.dumps(
+                {
+                    "ok": False,
+                    "status": (
+                        "steering_unavailable"
+                        if result.get("degraded")
+                        else "no_change"
+                    ),
+                    "message": result.get("reply") or "No change was made.",
+                    "errors": result.get("errors") or [],
+                },
+                ensure_ascii=False,
+            )
+        amendment = result.get("amendment") or {}
+        return _ok(
+            status="pending_amendment",
+            message=result.get("summary") or "Updated the board contract.",
+            changes=result.get("changes") or [],
+            reply=result.get("reply") or "",
+            amendment_id=amendment.get("id"),
+            next_step=(
+                f"If this preview is right, the owner approves with `/approve {board}`."
+            ),
+        )
+    except ValueError as e:
+        return tool_error(f"kanban_contract_steer: {e}")
+    except Exception as e:
+        logger.exception("kanban_contract_steer failed")
+        return tool_error(f"kanban_contract_steer: {e}")
+
+
 def _handle_contract_schema(args: dict, **kw) -> str:
     """Return the canonical board-contract schema + a valid trimmed example.
 
@@ -2554,6 +2624,9 @@ KANBAN_CONTRACT_AMENDMENT_PROPOSE_SCHEMA = {
         "invariants + readiness gaps) — fix them in ONE follow-up patch rather "
         "than re-guessing. Proposing again supersedes your prior pending draft "
         "on the same version, so only one live candidate remains. "
+        "LOW-LEVEL / ESCAPE HATCH: for owner-driven changes PREFER "
+        "`kanban_contract_steer` (natural-language, self-repairing). Use this "
+        "raw-patch tool only when you must apply a precise patch yourself. "
         "Do NOT hand-author the patch by trial and error: call "
         "`kanban_contract_schema` (or read the kanban-system-architecture "
         "contract-amendment-validator-invariants reference) FIRST to get the "

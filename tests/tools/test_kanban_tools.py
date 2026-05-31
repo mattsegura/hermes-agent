@@ -724,12 +724,16 @@ def test_business_launch_review_tool_stores_draft_and_intake_prompt(monkeypatch,
 
     assert payload["ok"] is False
     assert payload["launch_phase"] == "contract_review"
-    assert payload["questions"] == []
-    assert payload["board"]["contract_readiness"]["questions"] == []
+    assert len(payload["questions"]) >= 2
+    assert len(payload["launch_intake"].get("generated_questions") or payload["launch_intake"].get("questions") or []) >= 2
     assert payload["launch_intake"]["question_generation"]["required"] is True
     assert payload["assistant_next_action"]["must_ask_owner_now"] is True
-    assert payload["assistant_next_action"]["mode"] == "model_generated_questions"
-    assert "Ask the questions now" in payload["assistant_next_action"]["instruction"]
+    assert payload["assistant_next_action"]["mode"] in {
+        "model_generated_questions",
+        "provided_questions",
+        "relay_server_generated_questions",
+    }
+    assert "draft or approve the board contract" in payload["assistant_next_action"]["instruction"]
     assert kb.read_board_metadata("seller-draft")["launch_phase"] == "contract_review"
 
 
@@ -753,14 +757,19 @@ def test_business_launch_review_tool_uses_universal_intake(monkeypatch, tmp_path
     assert payload["ok"] is False
     assert payload["status"] == "needs_clarification"
     assert payload["launch_phase"] == "contract_review"
-    assert payload["questions"] == []
+    assert len(payload["questions"]) >= 2
     assert payload["launch_intake"]["state"] == "clarifying"
     assert payload["launch_intake"]["workflow_type"] == "agentic_workflow"
     assert payload["launch_intake"]["question_generation"]["required"] is True
-    assert payload["launch_intake"]["question_generation"]["mode"] == "model_generated"
+    assert payload["launch_intake"]["question_generation"]["mode"] in {
+        "model_generated",
+        "deterministic_fallback",
+        "server_generated",
+    }
     assert payload["assistant_next_action"]["required"] is True
     assert payload["assistant_next_action"]["must_ask_owner_now"] is True
-    assert "do not say Hermes will ask later" in payload["assistant_next_action"]["instruction"]
+    assert payload["assistant_next_action"]["questions"]
+    assert "draft or approve the board contract" in payload["assistant_next_action"]["instruction"]
     assert payload["launch_intake"]["assumptions"]
     contract = payload["contract"]
     assert "runtime" not in contract

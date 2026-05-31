@@ -166,6 +166,45 @@ def test_insufficient_assessment_blocks_synthesis(monkeypatch):
     assert "Which exact channel" in follow_ups
 
 
+def test_review_preserves_generated_questions_on_rough_goal_only(fresh_home, monkeypatch):
+    """Re-calling review with only rough_goal must not wipe server-generated questions."""
+    fx = _load_fixture("land_wholesaling")
+    _enable_server_aux(monkeypatch, fx)
+    kb.review_business_launch_contract(
+        "preserve-q", rough_goal=fx["rough_goal"], create_if_missing=True
+    )
+    first = kb.read_board_metadata("preserve-q")["business_contract"]["launch_intake"]
+    assert first["generated_questions"]
+
+    kb.review_business_launch_contract("preserve-q", rough_goal=fx["rough_goal"])
+    second = kb.read_board_metadata("preserve-q")["business_contract"]["launch_intake"]
+    assert second["generated_questions"] == first["generated_questions"]
+    assert second["questions"] == first["questions"]
+
+
+def test_degraded_question_generation_emits_fallback_questions(fresh_home, monkeypatch):
+    monkeypatch.setattr(kli, "aux_configured", lambda: True)
+    monkeypatch.setattr(
+        kli,
+        "run_question_generation",
+        lambda rough_goal, **kw: kli.QuestionGenerationResult(
+            ok=False, degraded=True, reason="auxiliary unavailable"
+        ),
+    )
+    monkeypatch.setattr(
+        kli,
+        "run_pre_interview_research",
+        lambda *a, **k: kli.PreInterviewResearchResult(ok=True, degraded=False, items=[]),
+    )
+    result = kb.review_business_launch_contract(
+        "degraded-q", rough_goal="Launch a mobile app", create_if_missing=True
+    )
+    intake = result["launch_intake"]
+    assert intake["degraded_mode"] is True
+    assert len(intake["generated_questions"]) >= 2
+    assert len(result["questions"]) >= 2
+
+
 def test_degraded_without_aux_falls_back_to_universal_drafter(fresh_home, monkeypatch):
     """No auxiliary configured -> deterministic universal drafter, marked
     degraded, and measurably weaker than a server-synthesized contract."""
