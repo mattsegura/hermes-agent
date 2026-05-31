@@ -350,6 +350,99 @@ def loop_opts_into_terminal_classes(loop: Any) -> bool:
                     return True
     return False
 
+
+# --------------------------------------------------------------------------
+# Step-9 OPT-IN predicates -- the SINGLE SOURCE OF TRUTH for "did this contract
+# opt into ANY step-9 feature?".
+#
+# THE PRINCIPLE (re-architecture): a contract that opts into NONE of the step-9
+# features must hit ZERO new code paths at EVERY layer, so it is byte-identical
+# to base 019271994 BY CONSTRUCTION. "Opts in" means the contract declares at
+# least one of:
+#   * a loop ``terminal_classes`` / ``terminal_states`` with class objects (9b),
+#   * ``side_effect_policy.strict`` truthy (9a),
+#   * a loop defer bound (``max_defers`` / aliases) (9c).
+#
+# These predicates are the ONLY definition of opt-in. Every new check/gate at
+# the intake, hash, persistence and runtime layers consults one of them, so the
+# "non-opted == base" guarantee can be reasoned about in one place.
+# --------------------------------------------------------------------------
+
+#: The EXACT loop keys the runtime reads for the 9(c) anti-zombie defer bound.
+#: Mirrors kanban_reactive_runtime.loop_max_defers so the recognized set is one
+#: source of truth across the runtime, the intake validator, and the opt-in
+#: predicate below.
+LOOP_MAX_DEFERS_KEYS: frozenset[str] = frozenset(
+    {"max_defers", "max_deferrals", "max_defer"}
+)
+
+
+def loop_opts_into_defer_bound(loop: Any) -> bool:
+    """True iff a loop DECLARES a 9(c) defer bound (``max_defers`` / aliases).
+
+    Opt-in is the PRESENCE of the key (any value), not whether the value is a
+    usable bound -- a present-but-malformed bound is still an opt-in (it reaches
+    the new intake check, which flags it). A loop with none of the keys did NOT
+    opt in and keeps the byte-identical unbounded-deferral legacy behavior.
+    """
+    if not isinstance(loop, dict):
+        return False
+    return any(key in loop for key in LOOP_MAX_DEFERS_KEYS)
+
+
+def side_effect_policy_opts_into_strict(policy: Any) -> bool:
+    """True iff a board's ``side_effect_policy`` OPTS INTO 9(a) strict default-deny.
+
+    Opt-in is the PRESENCE of a ``strict`` key (case-insensitive) with a truthy
+    value. A policy with no ``strict`` key, or ``strict: false``, did NOT opt in
+    and keeps the byte-identical legacy fall-through gate. Case-variant keys
+    (``Strict`` / ``STRICT``) count as opt-in so a capitalized declaration is
+    honored (and separately surfaced as a non-canonical near-miss at intake).
+    """
+    if not isinstance(policy, dict):
+        return False
+    for key, value in policy.items():
+        if not isinstance(key, str) or key.strip().lower() != "strict":
+            continue
+        if isinstance(value, bool):
+            if value:
+                return True
+        elif isinstance(value, str):
+            if value.strip().lower() in {"true", "1", "yes", "on"}:
+                return True
+        elif isinstance(value, (int, float)) and value:
+            return True
+    return False
+
+
+def loop_opts_into_step9(loop: Any) -> bool:
+    """True iff a single loop opts into ANY loop-level step-9 feature (9b or 9c)."""
+    if not isinstance(loop, dict):
+        return False
+    return loop_opts_into_terminal_classes(loop) or loop_opts_into_defer_bound(loop)
+
+
+def contract_opts_into_step9(root: Any) -> bool:
+    """True iff a contract opts into ANY step-9 feature at ANY layer.
+
+    This is the master gate: when it is False, NO step-9 code path runs at the
+    intake/hash/persistence/runtime layers for this contract, so the contract is
+    byte-identical to base 019271994 by construction. Checks (in cheap-first
+    order): board-level strict (9a), then any loop-level terminal-class (9b) or
+    defer-bound (9c) declaration.
+    """
+    if not isinstance(root, dict):
+        return False
+    if side_effect_policy_opts_into_strict(root.get("side_effect_policy")):
+        return True
+    loops = root.get("event_loops")
+    if isinstance(loops, (list, tuple)):
+        for loop in loops:
+            if loop_opts_into_step9(loop):
+                return True
+    return False
+
+
 # Reply-style tokens: an external party is responding to us, so the stage models
 # an ongoing conversation that must be watched. Kept tight to reply words so a
 # free-text trigger that merely contains the noun "message" or "call" (e.g.

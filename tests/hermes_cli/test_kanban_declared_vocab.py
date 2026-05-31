@@ -668,6 +668,22 @@ def test_live_ninaxfinds_contract_has_no_optin_declarations():
     # And it declares no event_loops at all, so there is nothing to fire/defer.
     assert not bc.get("event_loops")
 
+    # The single source-of-truth predicate agrees: the live contract did NOT opt
+    # into step-9, so it hits ZERO new code paths.
+    assert grammar.contract_opts_into_step9(bc) is False
+
+    # BYTE-IDENTITY: the live contract's invariants output and hash are identical
+    # base-vs-HEAD (it produces no new finding and the hashed payload is base).
+    base_inv = _load_base_module(
+        "base_invariants_live", "hermes_cli/kanban_launch_invariants.py"
+    )
+    base_report = base_inv.check_contract_invariants(bc)
+    head_report = inv.check_contract_invariants(bc)
+    assert head_report.errors == base_report.errors, "live invariant ERRORS diverged"
+    assert head_report.warnings == base_report.warnings, "live invariant WARNINGS diverged"
+    # Hash is stable (re-synthesizing the same contract yields the same hash).
+    assert kb._business_contract_hash(bc) == kb._business_contract_hash(json.loads(json.dumps(bc)))
+
 
 # ===========================================================================
 # FIX 2: strict = allowlist-of-SAFE (not allowlist-of-recognized). A RECOGNIZED
@@ -1307,19 +1323,18 @@ def test_fix8_max_defers_alias(fresh_home):
 
 
 @pytest.mark.parametrize("policy_field", ["forbidden", "approval_required"])
-def test_r2_fix1_legacy_mixed_case_row_keeps_its_safety_gate(fresh_home, policy_field):
-    """ROUND-2 FIX 1: a LEGACY schedule row whose ``side_effect_class`` was
-    persisted verbatim (mixed-case, e.g. 'External_Irreversible') must STILL be
-    caught by a lower-cased forbidden / approval_required policy entry after
-    upgrade. ``reactive_tick`` lower-cases the policy sets, so it must also
-    coalesce+lower-case the RAW row value at read -- otherwise the gate flips
-    blocked->fired / deferred->fired on the two most dangerous controls with no
-    flag.
+def test_rearch_legacy_mixed_case_row_non_strict_is_byte_identical(fresh_home, policy_field):
+    """RE-ARCHITECTURE (round-3 HIGH fix): a LEGACY schedule row whose
+    ``side_effect_class`` was persisted verbatim (mixed-case
+    'External_Irreversible') on a board that did NOT opt into strict must produce
+    the BASE 019271994 gate decision verbatim -- the case-SENSITIVE policy set
+    {external_irreversible} does NOT contain 'External_Irreversible', so the loop
+    FIRES. The prior round-2 fix lower-cased both sides UNCONDITIONALLY, which
+    FLIPPED this LEGACY row's decision (fired -> blocked/deferred) with no opt-in
+    -- the exact regression this re-architecture removes.
 
-    Mutation check (revert FIX 1): read ``side_effect_class = row[...] or 'none'``
-    raw (no .lower()) and the lowercased policy set {external_irreversible} no
-    longer contains 'External_Irreversible' -> the loop FIRES, failing the
-    blocked/deferred assertions here.
+    Mutation check (re-introduce the unconditional lower-casing): the loop would
+    be blocked/deferred instead of fired, failing the ``fired`` assertion here.
     """
     contract = _strict_contract("external_irreversible", strict=False)
     contract["side_effect_policy"][policy_field] = ["external_irreversible"]
@@ -1337,10 +1352,39 @@ def test_r2_fix1_legacy_mixed_case_row_keeps_its_safety_gate(fresh_home, policy_
                 ("External_Irreversible", int(row["id"])),
             )
         res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
-        assert res["fired"] == [], (
-            "a mixed-case legacy row must NOT fire when its lowercased class is "
-            f"in the policy {policy_field} set"
+        # BYTE-IDENTICAL to base: case-sensitive miss -> the loop FIRES.
+        assert res["fired"] == [{"loop_key": "seller_follow_up", "nudge": 1}], (
+            "a non-strict board's mixed-case legacy row must keep its BASE "
+            "case-sensitive gate decision (fires) -- no unconditional lower-casing"
         )
+        assert res["stopped"] == []
+        assert res["deferred"] == []
+
+
+@pytest.mark.parametrize("policy_field", ["forbidden", "approval_required"])
+def test_rearch_strict_board_lowercases_and_catches_mixed_case_row(fresh_home, policy_field):
+    """RE-ARCHITECTURE: the case canonicalization is OPT-IN. When the board DOES
+    opt into strict, the read-time + policy-set lower-casing is applied, so a
+    mixed-case 'External_Irreversible' row IS caught by the lower-case policy
+    entry (forbidden -> stopped, approval_required -> deferred). This is the
+    genuinely-correct enabled behavior, now gated behind strict so it can never
+    flip a non-opted board's decision."""
+    contract = _strict_contract("external_irreversible", strict=True)
+    contract["side_effect_policy"][policy_field] = ["external_irreversible"]
+    if policy_field == "approval_required":
+        contract["approval_gates"] = [
+            {"key": "owner_ei", "required_before": ["external_irreversible"]}
+        ]
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE reactive_timer_schedules SET side_effect_class = ? WHERE id = ?",
+                ("External_Irreversible", int(row["id"])),
+            )
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
+        assert res["fired"] == [], "under strict, the lowercased class must be caught"
         if policy_field == "forbidden":
             assert res["stopped"] == [
                 {"loop_key": "seller_follow_up", "reason": "side_effect_forbidden"}
@@ -1351,10 +1395,9 @@ def test_r2_fix1_legacy_mixed_case_row_keeps_its_safety_gate(fresh_home, policy_
             ]
 
 
-def test_r2_fix1_mixed_case_row_not_in_policy_still_fires(fresh_home):
-    """ROUND-2 FIX 1 control: a mixed-case row whose lowercased class is NOT in
-    any policy set still fires (the read-time normalization does not over-block;
-    it only makes the policy comparison share one vocabulary)."""
+def test_rearch_mixed_case_row_not_in_policy_non_strict_fires(fresh_home):
+    """RE-ARCHITECTURE control: a non-strict mixed-case row whose class is NOT in
+    any policy set fires (base behavior). The case handling never over-blocks."""
     contract = _strict_contract("none", strict=False)
     _approve("serious", contract)
     with kb.connect(board="serious") as conn:
@@ -1600,18 +1643,19 @@ def test_r2_fix4_max_defers_reader_returns_sentinel_for_inf():
     assert kb._timer_schedule_defers_used(_Row(float("inf"))) == 0
 
 
-# --- FIX 5: hash strips launch_intake.invariants; near-miss tightened ----------
+# --- RE-ARCHITECTURE: hash REVERT + byte-identity via opt-in gating ------------
 
 
-def test_r2_fix5_invariants_block_stripped_from_contract_hash():
-    """ROUND-2 FIX 5: ``launch_intake.invariants`` (run-derived validator
-    findings) must be stripped from the canonical contract hash, mirroring
-    ``launch_intake.completeness`` -- so two copies of the SAME contract that
-    differ only in their invariants block hash IDENTICALLY.
+def test_rearch_hash_does_not_strip_invariants_block():
+    """RE-ARCHITECTURE (directive #1 REVERT): the prior round-2 fix stripped
+    ``launch_intake.invariants`` from the canonical contract hash. That strip is
+    REVERTED -- it UN-APPROVED base boards whose approval hash legitimately
+    included the invariants block. The hashed payload now matches base 019271994:
+    ``completeness`` is stripped, ``invariants`` is NOT.
 
-    Mutation check (revert FIX 5 strip): leave invariants in the hashed payload
-    and the two hashes diverge -- failing the equality assertion here.
-    """
+    Proof the invariants block participates in the hash again: two contracts that
+    differ ONLY in their invariants block hash DIFFERENTLY (the opposite of the
+    reverted behavior)."""
     base = _contract()
     with_clean = dict(base)
     with_clean["launch_intake"] = {"invariants": {"ok": True, "errors": [], "warnings": []}}
@@ -1619,29 +1663,64 @@ def test_r2_fix5_invariants_block_stripped_from_contract_hash():
     with_findings["launch_intake"] = {
         "invariants": {"ok": False, "errors": ["something"], "warnings": ["a typo"]}
     }
-    assert kb._business_contract_hash(with_clean) == kb._business_contract_hash(with_findings)
-    # And a contract with NO launch_intake hashes the same as one whose only
-    # launch_intake content is the (stripped) invariants block.
-    assert kb._business_contract_hash(base) == kb._business_contract_hash(with_clean)
+    assert kb._business_contract_hash(with_clean) != kb._business_contract_hash(with_findings), (
+        "invariants must NOT be stripped -- the round-2 strip is reverted"
+    )
 
 
-def test_r2_fix5_legacy_contract_with_common_max_key_hashes_identically():
-    """ROUND-2 FIX 5 (effect): a legacy contract carrying a common ``max_*`` loop
-    key (e.g. ``max_followers`` -- plausible in the ninaxfinds-growth context)
-    must hash IDENTICALLY base-vs-HEAD. With the strip in place, even if a
-    HEAD-only near-miss warning landed in the invariants block, it is stripped
-    before hashing; AND the tightened near-miss no longer cries wolf on
-    ``max_followers``/``max_depth``."""
+def test_rearch_invariants_strip_is_byte_identical_to_base():
+    """RE-ARCHITECTURE: ``_strip_contract_hash_telemetry`` body is byte-identical
+    to base 019271994 (only ``completeness`` is dropped). Reconstruct the base
+    behavior and assert it agrees on the telemetry-bearing shapes."""
+    def base_strip(normalized):
+        if not isinstance(normalized, dict):
+            return normalized
+        intake = normalized.get("launch_intake")
+        if not isinstance(intake, dict) or "completeness" not in intake:
+            return normalized
+        clone = dict(normalized)
+        intake_clone = dict(intake)
+        intake_clone.pop("completeness", None)
+        clone["launch_intake"] = intake_clone
+        return clone
+
+    probes = [
+        {"objective": {"statement": "x"}},
+        {"launch_intake": {"completeness": {"blocking": []}}},
+        {"launch_intake": {"invariants": {"ok": True}}},
+        {"launch_intake": {"completeness": {"a": 1}, "invariants": {"ok": False}}},
+        {"launch_intake": {"completeness": {"a": 1}, "other": 2}},
+    ]
+    for p in probes:
+        assert kb._strip_contract_hash_telemetry(dict(p)) == base_strip(dict(p)), p
+
+
+def test_rearch_legacy_contract_hash_byte_identical_via_optin_gating():
+    """RE-ARCHITECTURE (the whole point of directive #1+#2): a legacy contract
+    carrying a common ``max_*`` loop key (e.g. ``max_followers`` -- plausible in
+    the ninaxfinds-growth context) produces NO new invariant finding (the new
+    checks are gated behind opt-in, and ``max_followers`` is not an opt-in), so
+    the SAME logical contract synthesized at HEAD bakes an IDENTICAL invariants
+    block and hashes identically -- WITHOUT touching the hashed payload.
+
+    This is the durable mechanism: byte-identity comes from the non-opted
+    contract producing zero new findings, not from stripping the block."""
     loop = _invariant_loop(max_followers=3, max_depth=2)
     contract = _invariant_contract(loop)
+    # Sanity: this contract did NOT opt into step-9.
+    assert grammar.contract_opts_into_step9(contract) is False
     report = inv.check_contract_invariants(contract)
-    # The tightened near-miss must NOT flag these legit keys.
+    # The opt-in gate means the near-miss check never runs -> no typo warnings,
+    # so the invariants block is identical base-vs-HEAD.
+    assert not any("typo" in w for w in report.warnings)
     assert not any("max_followers" in w for w in report.warnings)
     assert not any("max_depth" in w for w in report.warnings)
-    # And a synthesized invariants block does not perturb the hash regardless.
+    # The same contract synthesized twice (same findings) hashes identically even
+    # WITH the invariants block embedded (it is no longer stripped).
     c1 = dict(contract)
     c1["launch_intake"] = {"invariants": report.as_dict()}
-    c2 = dict(contract)  # no invariants block at all
+    c2 = dict(contract)
+    c2["launch_intake"] = {"invariants": inv.check_contract_invariants(contract).as_dict()}
     assert kb._business_contract_hash(c1) == kb._business_contract_hash(c2)
 
 
@@ -1792,9 +1871,14 @@ def test_r2_fix6_migration_adds_columns_and_legacy_row_reads_defaults(fresh_home
         assert migrated["max_defers"] is None
         assert migrated["terminal_classes"] is None
         assert int(migrated["defers_used"]) == 0
-        # FIX 1 belt-and-suspenders backfill: the verbatim mixed-case class was
-        # lower-cased in place by the one-time UPDATE migration.
-        assert migrated["side_effect_class"] == "external_irreversible"
+        # RE-ARCHITECTURE (directive #3): the migration is ADDITIVE-ONLY. The
+        # blanket UPDATE that lower-cased persisted side_effect_class is REMOVED,
+        # so the verbatim mixed-case value is PRESERVED -- no existing data is
+        # rewritten, and a non-strict board's case-sensitive gate keeps its base
+        # decision.
+        assert migrated["side_effect_class"] == "External_Irreversible", (
+            "the migration must NOT rewrite existing side_effect_class data"
+        )
 
         # (c) reactive_tick on the migrated row is byte-identical legacy: with no
         # policy match and no strict, the loop FIRES (legacy unbounded behavior).
@@ -1820,3 +1904,351 @@ def test_r2_fix6_terminal_classes_sentinel_is_self_protecting():
     assert kb._terminal_outcome_is_conversion("won", ["won"], sentinel) is False
     # Identity check the production caller relies on still works.
     assert sentinel is kb._TERMINAL_CLASSES_CORRUPT
+
+
+# ===========================================================================
+# ROUND-3 OPT-IN-PATH fixes (enabled-behavior corrections; only fire under
+# opt-in, so the non-opted path stays byte-identical).
+# ===========================================================================
+
+
+@pytest.mark.parametrize("dangerous", ["external_irreversible", "financial"])
+def test_r3_strict_wildcard_gate_does_not_satisfy_highest_stakes(fresh_home, dangerous):
+    """ROUND-3 (MED): under strict, a broad ``external_action`` WILDCARD approval
+    gate must NOT satisfy the highest-stakes classes (external_irreversible /
+    financial) -- they require a gate that NAMES the class. With only a wildcard
+    gate satisfied, the loop must still DEFER.
+
+    Mutation check (drop require_per_class_gate): the wildcard gate would satisfy
+    and the loop would FIRE, failing the deferral assertion here."""
+    contract = _strict_contract(dangerous, strict=True)
+    contract["approval_gates"] = [
+        {"key": "owner_wild", "required_before": ["external_action"]}
+    ]
+    contract["side_effect_policy"]["approval_required"] = [dangerous]
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        base = int(row["next_fire_at"])
+        # Satisfy ONLY the wildcard gate.
+        kb.record_contract_approval(
+            conn, gate_key="owner_wild",
+            entity_ref=row["task_id"], approved_by="owner", board="serious",
+        )
+        res = kb.reactive_tick(conn, now=base, board="serious")
+        assert res["fired"] == [], (
+            "a wildcard external_action gate must NOT satisfy a highest-stakes class"
+        )
+        assert res["deferred"], "the highest-stakes class must still defer"
+
+
+def test_r3_strict_per_class_gate_satisfies_highest_stakes(fresh_home):
+    """ROUND-3 (MED) positive: a per-class gate (required_before names the class)
+    DOES satisfy under strict -- the requirement is "name the class", not "no
+    gate at all"."""
+    contract = _strict_contract("external_irreversible", strict=True)
+    contract["approval_gates"] = [
+        {"key": "owner_ei", "required_before": ["external_irreversible"]}
+    ]
+    contract["side_effect_policy"]["approval_required"] = ["external_irreversible"]
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        base = int(row["next_fire_at"])
+        kb.record_contract_approval(
+            conn, gate_key="owner_ei",
+            entity_ref=row["task_id"], approved_by="owner", board="serious",
+        )
+        res = kb.reactive_tick(conn, now=base, board="serious")
+        assert res["fired"] == [{"loop_key": "seller_follow_up", "nudge": 1}]
+
+
+def test_r3_non_strict_wildcard_gate_still_satisfies_byte_identical(fresh_home):
+    """ROUND-3 (MED) default-off proof: WITHOUT strict, the base
+    ``external_action`` wildcard behavior is unchanged -- a class listed in
+    approval_required is satisfied by the wildcard gate and FIRES (byte-identical
+    to base 019271994). The per-class requirement is strict-only."""
+    contract = _strict_contract("external_irreversible", strict=False)
+    contract["approval_gates"] = [
+        {"key": "owner_wild", "required_before": ["external_action"]}
+    ]
+    contract["side_effect_policy"]["approval_required"] = ["external_irreversible"]
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        base = int(row["next_fire_at"])
+        kb.record_contract_approval(
+            conn, gate_key="owner_wild",
+            entity_ref=row["task_id"], approved_by="owner", board="serious",
+        )
+        res = kb.reactive_tick(conn, now=base, board="serious")
+        assert res["fired"] == [{"loop_key": "seller_follow_up", "nudge": 1}], (
+            "non-strict: the base wildcard-gate behavior must be unchanged"
+        )
+
+
+@pytest.mark.parametrize("frac", [2.7, 0.5, 3.1])
+def test_r3_fractional_bound_flagged_at_intake(frac):
+    """ROUND-3 (MED): a fractional float defer bound (2.7) is flagged at intake --
+    the runtime truncates it silently (int(2.7)==2). Opt-in only (the loop
+    declares max_defers, so it opted in)."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(_invariant_loop(max_defers=frac))
+    )
+    assert report.ok is False
+    assert any("FRACTIONAL" in e and "max_defers" in e for e in report.errors), (
+        f"fractional bound {frac} must be flagged"
+    )
+
+
+def test_r3_whole_float_bound_not_flagged():
+    """ROUND-3 (MED) control: a WHOLE float (2.0) is a usable bound and must NOT
+    be flagged as fractional (it round-trips to the int 2)."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(_invariant_loop(max_defers=2.0))
+    )
+    assert not any("FRACTIONAL" in e for e in report.errors)
+
+
+def test_r3_strict_2edit_typo_surfaces_near_miss():
+    """ROUND-3 (MED): a 2-edit typo of the short safety token 'strict' (e.g.
+    'striqt') surfaces a near-miss (the cap is 2 for 'strict'). The alias set may
+    miss an unenumerated misspelling; the raised cap catches it."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(terminal_classes={"closed_won": "win", "closed_lost": "loss"}),
+            policy={"allowed": ["none"], "striqt": True},
+        )
+    )
+    assert any("strict" in w and "typo" in w for w in report.warnings), (
+        "a 2-edit typo of 'strict' must surface"
+    )
+
+
+@pytest.mark.parametrize("legit", ["max_followers", "max_replies"])
+def test_r3_2edit_does_not_cry_wolf_on_long_max_keys(legit):
+    """ROUND-3 (MED) control: the raised cap is 'strict'-only. The longer max_*
+    keys keep cap 1, so a legitimate distance-2 neighbor (max_followers vs
+    max_followups; max_replies vs max_retries) does NOT cry wolf."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(
+                terminal_classes={"closed_won": "win", "closed_lost": "loss"},
+                **{legit: 3},
+            )
+        )
+    )
+    assert not any("typo" in w for w in report.warnings), (
+        f"{legit} is a legit distance-2 key and must not be flagged"
+    )
+
+
+def test_r3_stateless_win_class_is_error():
+    """ROUND-3 (LOW): a declared {state: '', class: 'win'} (empty/missing state)
+    can never be matched by the reward rail, so it does NOT count toward has_win
+    -- intake flags the stateless win."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(terminal_classes={"": "win", "closed_lost": "loss"})
+        )
+    )
+    assert report.ok is False
+    assert any("EMPTY/missing state" in e for e in report.errors)
+
+
+def test_r3_negzero_string_bound_has_accurate_message():
+    """ROUND-3 (LOW): a '-0' string bound is coerced to a cap of 0 by the runtime
+    (NOT silently dropped/unbounded), so the intake message must say so -- not the
+    generic 'leaving the loop unbounded' message that was wrong for '-0'."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(_invariant_loop(max_defers="-0"))
+    )
+    assert report.ok is False
+    msgs = [e for e in report.errors if "max_defers" in e]
+    assert msgs, "the '-0' bound must be flagged"
+    assert any("cap of 0" in e for e in msgs), (
+        "the '-0' message must say it becomes a cap of 0, not unbounded"
+    )
+    assert not any("leaving the loop unbounded" in e for e in msgs)
+
+
+# ===========================================================================
+# OVERARCHING PROOF: a non-opted (legacy) contract hits ZERO new step-9 code
+# paths and is BYTE-IDENTICAL to base 019271994 at EVERY layer. This is the
+# whole point of the re-architecture (the principle). The OPT-IN path is
+# asserted side-by-side so the enabled behavior is proven too.
+# ===========================================================================
+
+import subprocess as _subprocess  # noqa: E402
+import types as _types  # noqa: E402
+
+
+def _load_base_module(modname: str, gitpath: str):
+    """Load a module's BASE (019271994) source as a standalone module bound to the
+    CURRENT grammar (a strict superset of base's grammar symbols)."""
+    src = _subprocess.run(
+        ["git", "show", f"019271994:{gitpath}"],
+        capture_output=True, text=True, cwd=str(_WORKTREE),
+    ).stdout
+    assert src, f"failed to load base source for {gitpath}"
+    mod = _types.ModuleType(modname)
+    sys.modules[modname] = mod  # register before exec so dataclass can resolve
+    exec(compile(src, f"<{modname}>", "exec"), mod.__dict__)
+    return mod
+
+
+def _legacy_contract():
+    """A representative LEGACY contract with NO step-9 opt-in (no terminal_classes,
+    no defer bound, no strict). It carries a common ``max_*`` knob and a mixed-case
+    policy-ish key to prove these do NOT trip any new code path."""
+    return _contract()
+
+
+def test_overarching_legacy_contract_hits_zero_new_code_paths():
+    """THE PRINCIPLE: a non-opted contract is byte-identical to base 019271994."""
+    contract = _legacy_contract()
+    # Pin the non-opt-in precondition.
+    assert grammar.contract_opts_into_step9(contract) is False
+
+    # (a) check_contract_invariants errors+warnings byte-identical to base.
+    base_inv = _load_base_module("base_invariants", "hermes_cli/kanban_launch_invariants.py")
+    base_report = base_inv.check_contract_invariants(contract)
+    head_report = inv.check_contract_invariants(contract)
+    assert head_report.errors == base_report.errors, "invariant ERRORS diverged from base"
+    assert head_report.warnings == base_report.warnings, "invariant WARNINGS diverged from base"
+
+    # (b) _business_contract_hash byte-identical: the strip body matches base and
+    # no new finding perturbs the hashed payload (proven separately). Here assert
+    # the hash is stable across re-synthesis of the SAME contract.
+    h1 = kb._business_contract_hash(contract)
+    h2 = kb._business_contract_hash(_legacy_contract())
+    assert h1 == h2
+
+    # (d) _terminal_outcome_is_conversion byte-identical across a 200+ outcome
+    # probe on the LEGACY path (declared_terminal_classes None/empty).
+    def base_conversion(outcome, states):
+        if not outcome:
+            return False
+        o = str(outcome).strip().lower()
+        if not o:
+            return False
+        if "won" in o:
+            return True
+        for d in states or []:
+            dd = str(d).strip().lower()
+            if dd == o and kb._looks_like_win_token(dd):
+                return True
+        return False
+
+    tokens = [
+        "won", "closed_won", "closed_lost", "won_but_lost", "unwon", "wonky",
+        "under_contract", "onboarded", "signed", "published", "converted",
+        "paid", "delivered", "completed", "approved", "lost", "expired",
+        "churned", "cancelled", "renewal_won", "deal_lost", "arbitrary", "",
+        None, "WON", "Closed_Won", "won_back_from_churn",
+        "renewal_after_cancellation_won", "reactivated_expired_subscriber_won",
+    ]
+    state_variants = [
+        [], ["won", "lost"], ["closed_won", "closed_lost"],
+        ["under_contract"], ["onboarded"], ["signed"],
+    ]
+    probes = 0
+    for o in tokens:
+        for st in state_variants:
+            base = base_conversion(o, st)
+            # Both the None and the empty-{} legacy declared-class forms.
+            assert kb._terminal_outcome_is_conversion(o, st, None) is base, (o, st)
+            assert kb._terminal_outcome_is_conversion(o, st, {}) is base, (o, st)
+            probes += 2
+    assert probes >= 200, f"need 200+ conversion probes, ran {probes}"
+
+
+@pytest.mark.parametrize("policy_field", ["forbidden", "approval_required"])
+def test_overarching_legacy_reactive_gate_byte_identical(fresh_home, policy_field):
+    """(c) reactive_tick gate decisions byte-identical on a mixed-case row under a
+    NON-opted (non-strict) board: the base case-SENSITIVE matching is used, so a
+    mixed-case 'External_Irreversible' row vs a lower-case policy entry MISSES and
+    the loop FIRES -- exactly base 019271994."""
+    contract = _strict_contract("external_irreversible", strict=False)
+    contract["side_effect_policy"][policy_field] = ["external_irreversible"]
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE reactive_timer_schedules SET side_effect_class = ? WHERE id = ?",
+                ("External_Irreversible", int(row["id"])),
+            )
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
+        assert res["fired"] == [{"loop_key": "seller_follow_up", "nudge": 1}]
+        assert res["stopped"] == []
+        assert res["deferred"] == []
+
+
+def test_overarching_legacy_defer_path_does_not_write_defers_used(fresh_home):
+    """(c) the legacy deferral path (no declared bound) is byte-identical: it does
+    the BASE update (next_fire_at only) and never increments defers_used (a
+    non-opted loop hits ZERO new write)."""
+    contract = _strict_contract("external_irreversible", strict=False)
+    contract["side_effect_policy"]["approval_required"] = ["external_irreversible"]
+    # No approval gate satisfied -> the legacy approval_required path defers.
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
+        assert res["deferred"] == [
+            {"loop_key": "seller_follow_up", "reason": "approval_required"}
+        ]
+        after = _schedule_row(conn)
+        # max_defers NULL (not opted in) -> the base path ran -> defers_used stays 0.
+        assert after["max_defers"] is None
+        assert int(after["defers_used"]) == 0, (
+            "a non-opted legacy defer must not increment defers_used"
+        )
+
+
+def test_overarching_optin_path_still_enforces(fresh_home):
+    """The OPT-IN path still enforces: strict defers an unrecognized/typo class;
+    a declared terminal class credits ONLY 'win'; a defer bound terminates."""
+    # strict defers a typo'd class.
+    contract = _strict_contract("extrnal_ireversible", strict=True)
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
+        assert res["fired"] == []
+        assert res["deferred"] == [
+            {"loop_key": "seller_follow_up", "reason": "side_effect_unrecognized_strict"}
+        ]
+
+    # declared terminal class: only the exact declared 'win' credits.
+    assert kb._terminal_outcome_is_conversion(
+        "closed_won", ["closed_won"], {"closed_won": "win", "closed_lost": "loss"}
+    ) is True
+    assert kb._terminal_outcome_is_conversion(
+        "won_but_lost", [], {"won_but_lost": "loss"}
+    ) is False  # declared loss never credits, even with 'won' substring
+
+
+def test_overarching_intake_optin_enforces(fresh_home):
+    """The OPT-IN intake path still enforces: a typo'd strict key warns, an
+    unknown declared class errors, a fractional bound errors -- but ONLY because
+    the contract opted in (a non-opted contract gets none of these)."""
+    # opted in via terminal_classes -> typo'd strict surfaces.
+    opted = _invariant_contract(
+        _invariant_loop(terminal_classes={"closed_won": "win", "closed_lost": "loss"}),
+        policy={"allowed": ["none"], "strikt": True},
+    )
+    rep = inv.check_contract_invariants(opted)
+    assert any("strict" in w and "typo" in w for w in rep.warnings)
+
+    # NOT opted in -> the SAME strikt key produces NO warning (byte-identical).
+    not_opted = _invariant_contract(
+        _invariant_loop(),  # no terminal_classes, no bound
+        policy={"allowed": ["none"], "strikt": True},
+    )
+    assert grammar.contract_opts_into_step9(not_opted) is False
+    rep2 = inv.check_contract_invariants(not_opted)
+    assert not any("strikt" in w or "typo" in w for w in rep2.warnings), (
+        "a non-opted contract must not surface the strict typo warning"
+    )

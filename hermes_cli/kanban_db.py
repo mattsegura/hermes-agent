@@ -711,40 +711,27 @@ def _strip_contract_hash_telemetry(normalized: Any) -> Any:
     enforcement flags off, which can invalidate approval tokens or bump the
     contract_version on a no-op upgrade. We drop it here so the hash ignores it.
 
-    FIX 5 (round-2): ``launch_intake.invariants`` (the
-    ``check_contract_invariants(...).as_dict()`` report persisted by
-    ``_apply_synthesized_launch_contract`` / ``_record_launch_intake_invariant_failure``)
-    is the SAME class of run-derived telemetry -- it is validator FINDINGS, not
-    semantic contract content. It was left in the hashed payload, so when this
-    change set added new HEAD-only findings (e.g. a near-miss warning on a legacy
-    contract carrying a common ``max_*`` key), the SAME logical contract
-    synthesized at HEAD baked a different invariants block and hashed differently
-    base-vs-HEAD. Mirror the completeness exclusion and drop it too, so the
-    canonical hash reflects only semantic contract content. (Verified: the hash is
-    consumed only for approval-token binding / version comparison -- no consumer
-    reads ``launch_intake.invariants`` BACK OUT of the hashed payload; the live
-    report is recomputed on demand, never read from the frozen hash input.)
+    STEP-9 RE-ARCHITECTURE NOTE: a prior round-2 fix ALSO stripped
+    ``launch_intake.invariants`` from the hashed payload. That change is REVERTED
+    here. The reason it seemed necessary -- new HEAD-only invariant findings on a
+    legacy contract changing the hash -- DISAPPEARS once the step-9 intake checks
+    are gated behind opt-in: a non-opted contract produces NO new invariant
+    findings, so its ``launch_intake.invariants`` block is identical base-vs-HEAD
+    and the hash is unchanged WITHOUT touching the hashed payload. Stripping
+    invariants was itself harmful: it UN-APPROVED base boards whose approval hash
+    legitimately included the invariants block. The hashed payload is therefore
+    byte-identical to base 019271994 (only ``completeness`` is stripped, exactly
+    as base did).
     """
     if not isinstance(normalized, dict):
         return normalized
     intake = normalized.get("launch_intake")
-    if not isinstance(intake, dict):
-        return normalized
-    if "completeness" not in intake and "invariants" not in intake:
+    if not isinstance(intake, dict) or "completeness" not in intake:
         return normalized
     clone = dict(normalized)
     intake_clone = dict(intake)
     intake_clone.pop("completeness", None)
-    intake_clone.pop("invariants", None)
-    # If stripping the telemetry left an EMPTY launch_intake, drop the key
-    # entirely so a contract whose ONLY launch_intake content was telemetry
-    # hashes identically to a contract with no launch_intake block at all (the
-    # canonical hash must reflect only semantic content, not the presence of an
-    # emptied telemetry container).
-    if intake_clone:
-        clone["launch_intake"] = intake_clone
-    else:
-        clone.pop("launch_intake", None)
+    clone["launch_intake"] = intake_clone
     return clone
 
 
@@ -11102,22 +11089,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "reactive_timer_schedules", "defers_used",
                 "defers_used INTEGER NOT NULL DEFAULT 0",
             )
-        # FIX 1 (round-2) belt-and-suspenders: one-time backfill that lower-cases
-        # any LEGACY reactive_timer_schedules.side_effect_class persisted verbatim
-        # (mixed-case) by base code. The load-bearing fix is the read-time
-        # normalization in reactive_tick; this migration makes the persisted
-        # column ALSO match the lower-cased forbidden/approval_required policy
-        # vocabulary so the two sides agree even for a consumer that reads the
-        # column directly. Idempotent: lower(lower(x)) == lower(x). Scoped to rows
-        # whose stored value is not already its own lower-case (no-op for the
-        # already-canonical fresh-compile rows and for NULL).
-        if "side_effect_class" in sched_cols:
-            conn.execute(
-                "UPDATE reactive_timer_schedules "
-                "SET side_effect_class = lower(side_effect_class) "
-                "WHERE side_effect_class IS NOT NULL "
-                "AND side_effect_class <> lower(side_effect_class)"
-            )
+        # STEP-9 RE-ARCHITECTURE NOTE: a prior round-2 fix ran a blanket UPDATE
+        # here that lower-cased every persisted ``side_effect_class``. That data
+        # rewrite is REMOVED. It changed the gate decision for LEGACY mixed-case
+        # rows under a board that did NOT opt into strict (a non-opt-in board's
+        # case-SENSITIVE forbidden/approval matching must see the row VERBATIM, as
+        # base 019271994 persisted it). The case canonicalization now happens
+        # ONLY at READ time, ONLY under strict opt-in (see ``reactive_tick``), so a
+        # non-opted board is byte-identical and no existing row is ever rewritten.
+        # The three additive columns above are NULL/0 on every legacy row and are
+        # treated as "not opted in" by every reader, so adding them is inert.
 
     # board_signals gained a ``dedupe_key`` column (exactly-once reward
     # attribution). Legacy rows get NULL (no dedupe key -> never collapsed),
@@ -17300,21 +17281,36 @@ def _upsert_timer_schedule(
     now: int,
     terminal_classes=None,
     max_defers: Optional[int] = None,
+    strict_side_effects: bool = False,
 ) -> None:
     """Idempotently register a timer schedule for a loop (UNIQUE board+loop+entity).
 
     ``terminal_classes`` (9b) and ``max_defers`` (9c) are OPT-IN: a loop that does
     not declare them leaves both NULL, which is byte-identical to a legacy row
-    (corrected-substring reward + unbounded deferral). Only a loop that declares a
+    (legacy-substring reward + unbounded deferral). Only a loop that declares a
     closed-vocabulary terminal class / a defer bound persists a non-NULL value.
 
-    FIX 3 (round-2): ``terminal_classes`` may be (a) ``None`` -> NULL column
-    (not opted in / legacy), (b) a ``{state: class}`` dict -> the JSON map, or
-    (c) the ``_reactive.TERMINAL_CLASSES_DROPPED_SENTINEL`` string -> a loop that
-    opted in but whose declaration was wholly dropped. Case (c) persists a
-    DISTINCT non-map marker (:data:`_TERMINAL_CLASSES_DROPPED_DB_MARKER`) so the
-    read-back fails CLOSED instead of reverting to the substring path.
+    ``side_effect_class`` persistence (STEP-9 OPT-IN GATE): when the board does
+    NOT opt into 9(a) strict, the class is persisted via ``_normalize_funnel_text``
+    EXACTLY as base 019271994 did (case PRESERVED) -- so a non-opted board's
+    persisted row is byte-identical and its case-sensitive reactive gate decision
+    is unchanged. Only under strict does persistence lower-case the class (so it
+    matches the also-lowercased policy vocabulary at the strict gate). This is the
+    persistence side of the read-time gate in ``reactive_tick``.
+
+    ``terminal_classes`` may be (a) ``None`` -> NULL column (not opted in /
+    legacy), (b) a ``{state: class}`` dict -> the JSON map, or (c) the
+    ``_reactive.TERMINAL_CLASSES_DROPPED_SENTINEL`` string -> a loop that opted in
+    but whose declaration was wholly dropped. Case (c) persists a DISTINCT non-map
+    marker (:data:`_TERMINAL_CLASSES_DROPPED_DB_MARKER`) so the read-back fails
+    CLOSED instead of reverting to the substring path.
     """
+    # STEP-9 OPT-IN GATE: case-preserving base persistence unless strict opt-in.
+    persisted_side_effect_class = (
+        _canonical_side_effect_class(side_effect_class)
+        if strict_side_effects
+        else _normalize_funnel_text(side_effect_class)
+    )
     with write_txn(conn):
         conn.execute(
             """
@@ -17336,11 +17332,7 @@ def _upsert_timer_schedule(
                 int(cadence_seconds),
                 now + int(cadence_seconds),
                 int(max_nudges) if max_nudges is not None else None,
-                # FIX 3: lower-case at persistence so recognition + the
-                # case-sensitive forbidden/approval_required membership checks
-                # share one canonical vocabulary (External_Irreversible ->
-                # external_irreversible). NULL/sentinel handling is unchanged.
-                _canonical_side_effect_class(side_effect_class),
+                persisted_side_effect_class,
                 _json_text_or_none(action),
                 json.dumps(terminal_states, ensure_ascii=False) if terminal_states else None,
                 _serialize_terminal_classes_for_persist(terminal_classes),
@@ -17493,6 +17485,12 @@ def _compile_one_reactive_loop(
         # legacy reward path).
         terminal_classes = _reactive.loop_terminal_classes_for_compile(loop)
         max_defers = _reactive.loop_max_defers(loop)
+        # STEP-9 OPT-IN GATE: persistence canonicalizes the side_effect_class case
+        # ONLY when the board opts into strict (9a). A non-opted board persists the
+        # class case-PRESERVED (base 019271994 behavior) so its row is byte-identical.
+        strict_side_effects = _side_effect_strict_enabled(
+            _contract_object(contract.get("side_effect_policy"))
+        )
         side_effect_class = str(
             loop.get("side_effect_class")
             or spec.get("side_effect_class")
@@ -17530,6 +17528,7 @@ def _compile_one_reactive_loop(
                 terminal_states=terminal_states,
                 terminal_classes=terminal_classes,
                 max_defers=max_defers,
+                strict_side_effects=strict_side_effects,
                 stop_conditions=stop_conditions,
                 action={
                     "kind": "timer_follow_up",
@@ -17697,12 +17696,33 @@ def _side_effect_class_is_external(side_effect_class: Optional[str]) -> bool:
         }
 
 
+#: STEP-9 (MED, round-3): the HIGHEST-STAKES side-effect classes. Under strict,
+#: a broad ``external_action`` wildcard approval gate is NOT enough to satisfy
+#: one of these -- the contract must declare a gate that names the SPECIFIC class
+#: (or the per-class fallback ``side_effect:<class>`` key). A blanket
+#: "approve all external actions" gate cannot stand in for the explicit owner
+#: acknowledgement these two classes demand.
+_PER_CLASS_GATE_REQUIRED_CLASSES: frozenset[str] = frozenset(
+    {"external_irreversible", "financial"}
+)
+
+
 def _reactive_side_effect_approved(
     contract: dict,
     side_effect_class: str,
     satisfied_gate_keys: set[str],
+    *,
+    require_per_class_gate: bool = False,
 ) -> bool:
-    """Return True if a reactive side effect of this class has board approval."""
+    """Return True if a reactive side effect of this class has board approval.
+
+    ``require_per_class_gate`` (STEP-9 MED, strict opt-in only): when True (set by
+    the strict gate for a highest-stakes class), a gate that only matches via the
+    broad ``external_action`` wildcard does NOT count -- the gate's
+    ``required_before`` must name the SPECIFIC class. Default False preserves the
+    base 019271994 behavior verbatim (wildcard OR per-class both satisfy), so the
+    legacy/non-opted path is unchanged.
+    """
     approval_gates = _contract_list(contract.get("approval_gates"))
     applicable: list[str] = []
     for gate in approval_gates:
@@ -17712,7 +17732,14 @@ def _reactive_side_effect_approved(
         if not gate_key:
             continue
         required_before = set(_string_list(gate.get("required_before")))
-        if side_effect_class in required_before or "external_action" in required_before:
+        names_class = side_effect_class in required_before
+        wildcard = "external_action" in required_before
+        if require_per_class_gate:
+            # Highest-stakes class under strict: only a gate that NAMES the class
+            # counts; the broad external_action wildcard is insufficient.
+            if names_class:
+                applicable.append(gate_key)
+        elif names_class or wildcard:
             applicable.append(gate_key)
     required_keys = applicable or [f"side_effect:{side_effect_class}"]
     return all(key in satisfied_gate_keys for key in required_keys)
@@ -18326,19 +18353,28 @@ def reactive_tick(
         return result
     contract = _metadata_as_business_contract(read_board_metadata(board_slug))
     policy = _contract_object(contract.get("side_effect_policy"))
-    # FIX 3: normalize the policy sets to the SAME canonical lower case the
-    # persisted side_effect_class now uses, so forbidden/approval_required
-    # membership and the closed-vocabulary recognition check share one
-    # vocabulary. Without this an 'External_Irreversible' loop read as recognized
-    # (recognition lower-cases) yet escaped a lower-case forbidden/approval entry.
-    forbidden = {s.strip().lower() for s in _string_list(policy.get("forbidden"))}
-    approval_required = {
-        s.strip().lower() for s in _string_list(policy.get("approval_required"))
-    }
     # 9(a): DEFAULT-DENY enforcement is OPT-IN per board (declared on the
     # contract). When unset (every legacy board incl. ninaxfinds) this is False
-    # and the gate is byte-identical to today's legacy fall-through.
+    # and the WHOLE gate below is byte-identical to base 019271994's legacy
+    # fall-through (case-SENSITIVE policy sets + case-SENSITIVE row read).
     strict_side_effects = _side_effect_strict_enabled(policy)
+    # STEP-9 OPT-IN GATE (the re-architecture principle): the case-FOLDING of the
+    # policy sets AND of the persisted ``side_effect_class`` read is applied ONLY
+    # under strict opt-in. A board NOT in strict mode uses the ORIGINAL base
+    # case-SENSITIVE matching verbatim -- so a LEGACY mixed-case row
+    # ('External_Irreversible') keeps its base gate decision EXACTLY (no
+    # blocked->fired / deferred->fired flip on upgrade). Under strict, the closed
+    # vocabulary is case-insensitive by definition, so canonicalizing both sides
+    # is correct and loses no authorial intent.
+    if strict_side_effects:
+        forbidden = {s.strip().lower() for s in _string_list(policy.get("forbidden"))}
+        approval_required = {
+            s.strip().lower() for s in _string_list(policy.get("approval_required"))
+        }
+    else:
+        # BASE behavior verbatim: case-sensitive sets, no normalization.
+        forbidden = set(_string_list(policy.get("forbidden")))
+        approval_required = set(_string_list(policy.get("approval_required")))
     fired = 0
     for row in rows:
         if max_fires is not None and fired >= max_fires:
@@ -18361,25 +18397,21 @@ def reactive_tick(
         # A NULL/absent class coalesces to the benign ``none`` -- this is the
         # established persistence convention (``_normalize_funnel_text`` collapses
         # a declared "none" to NULL), so an absent class is NOT treated as
-        # suspicious (that would defer every legitimate read-only loop). The hole
-        # strict mode closes is a NON-EMPTY typo/near-miss class that is not a
-        # member of the closed vocabulary -- the coalesced value below is what the
-        # recognition check sees, so NULL -> "none" -> recognized -> fires
-        # (byte-identical), while "extrnal_ireversible" -> unrecognized -> defers.
+        # suspicious.
         #
-        # FIX 1 (round-2): coalesce+strip+LOWER-CASE the persisted row value so the
-        # raw-row side and the lowercased forbidden/approval_required policy sets
-        # (built above) share ONE vocabulary regardless of WHEN the row was
-        # persisted. Fresh-compile rows persist via _canonical_side_effect_class
-        # (already lower-cased), but a LEGACY row compiled at base persisted the
-        # class verbatim (mixed-case, e.g. 'External_Irreversible'). Without this
-        # lower-case the lowercased policy set {external_irreversible} no longer
-        # contains the raw 'External_Irreversible', silently flipping the two most
-        # dangerous safety gates blocked->fired / deferred->fired on upgrade with
-        # no flag and no contract change. The one-time migration below
-        # (_migrate_lowercase_reactive_side_effect_class) is belt-and-suspenders;
-        # this read-time normalization is the load-bearing fix.
-        side_effect_class = (row["side_effect_class"] or "none").strip().lower()
+        # STEP-9 OPT-IN GATE: under strict, coalesce+strip+LOWER-CASE the row
+        # value so the raw-row side and the (also-lowercased) policy sets share
+        # ONE canonical vocabulary regardless of WHEN the row was persisted -- a
+        # LEGACY mixed-case row ('External_Irreversible') is then correctly
+        # matched against a lower-case forbidden/approval entry. When NOT strict
+        # this read is the BASE expression verbatim (``row[...] or "none"``, no
+        # normalization), so a legacy mixed-case row's gate decision is
+        # byte-identical to base 019271994 -- the lower-casing can no longer flip
+        # a LEGACY row's decision on upgrade.
+        if strict_side_effects:
+            side_effect_class = (row["side_effect_class"] or "none").strip().lower()
+        else:
+            side_effect_class = row["side_effect_class"] or "none"
         if side_effect_class in forbidden:
             _close_timer_schedule(
                 conn, row, reason="side_effect_forbidden", now=now,
@@ -18428,10 +18460,21 @@ def reactive_tick(
             # defers under strict mode -- fail-closed by construction. A recognized
             # external class CAN be approved (a satisfied approval gate covers it);
             # absent that it defers (approval-required-by-default under strict).
+            #
+            # STEP-9 (MED, round-3): under strict, the HIGHEST-STAKES classes
+            # (external_irreversible / financial) require a gate that NAMES the
+            # class -- a broad ``external_action`` wildcard gate is insufficient
+            # for them. require_per_class_gate is set ONLY under strict for those
+            # classes, so the legacy/non-opted path (wildcard satisfies) is intact.
+            require_per_class_gate = (
+                strict_side_effects
+                and side_effect_class in _PER_CLASS_GATE_REQUIRED_CLASSES
+            )
             approved = (
                 not strict_unrecognized
                 and _reactive_side_effect_approved(
-                    contract, side_effect_class, satisfied
+                    contract, side_effect_class, satisfied,
+                    require_per_class_gate=require_per_class_gate,
                 )
             )
             if not approved:
@@ -20704,11 +20747,26 @@ def _defer_timer_schedule(
     ``True`` when the schedule was deferred (still active) and ``False`` when the
     bound was hit and the loop was terminated.
 
-    DEFAULT byte-identical: ``max_defers`` is NULL/absent on every legacy row, so
-    the bound is unbounded and the function always defers and returns ``True`` --
-    exactly today's behavior. Only a board that SETS ``max_defers`` gets the cap.
+    STEP-9 OPT-IN GATE (the re-architecture principle): when NO defer bound is
+    declared (``max_defers`` NULL/absent on every legacy row -> reader returns
+    ``None``), this function runs the BASE update verbatim (only ``next_fire_at``
+    + ``updated_at``, NO ``defers_used`` write) and returns ``True`` -- exactly
+    base 019271994. The bound check + the ``defers_used`` counter increment run
+    ONLY when a board actually DECLARED a bound (the column is non-NULL or the
+    fail-closed corrupt sentinel), so a non-opted loop hits ZERO new write.
     """
     max_defers = _timer_schedule_max_defers(row)
+    # NO declared bound -> the BASE deferral verbatim (unbounded, no new write).
+    # This is the legacy/unopted path and is byte-identical to base 019271994.
+    if max_defers is None:
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE reactive_timer_schedules SET next_fire_at = ?, updated_at = ? "
+                "WHERE id = ?",
+                (now + int(row["cadence_seconds"]), now, int(row["id"])),
+            )
+        return True
+    # A bound WAS declared (opt-in). Apply the 9(c) anti-zombie cap.
     used = _timer_schedule_defers_used(row)
     # FIX 5 fail-CLOSED: a PRESENT-but-corrupt max_defers column must NOT be read
     # as "unbounded" (which would let the loop defer forever -- the anti-zombie
@@ -20726,7 +20784,7 @@ def _defer_timer_schedule(
     # This call is the (used+1)-th defer. Under a declared bound, terminate once
     # the attempted defer count exceeds the bound (max_defers=2 -> the 3rd defer
     # terminates; defers 1 and 2 still happen).
-    if max_defers is not None and (used + 1) > max_defers:
+    if (used + 1) > max_defers:
         _close_timer_schedule(
             conn, row, reason="deferral_exhausted", now=now,
             board=_connection_board(conn, board), entity=entity,

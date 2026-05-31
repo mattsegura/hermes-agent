@@ -32,9 +32,14 @@ from hermes_cli.kanban_launch_grammar import (
     has_timer as _grammar_has_timer,
     is_external_side_effect_class as _grammar_is_external_side_effect,
     is_known_side_effect_class as _grammar_is_known_side_effect,
+    contract_opts_into_step9 as _grammar_contract_opts_into_step9,
     loop_declared_terminal_classes as _grammar_loop_terminal_classes,
+    loop_opts_into_defer_bound as _grammar_loop_opts_into_defer_bound,
+    loop_opts_into_step9 as _grammar_loop_opts_into_step9,
+    loop_opts_into_terminal_classes as _grammar_loop_opts_into_terminal_classes,
     normalize_side_effect_class as _grammar_normalize_side_effect,
     normalize_sensor_kind as _grammar_normalize_sensor_kind,
+    side_effect_policy_opts_into_strict as _grammar_policy_opts_into_strict,
     trigger_kind as _grammar_trigger_kind,
 )
 
@@ -340,12 +345,25 @@ def _check_loop_terminal_classes(
     if not declared:
         return  # did not opt in -> legacy path, unaffected
     has_win = False
+    win_missing_state = False
     classed_states: set[str] = set()
     for state, raw in declared:
         canon = str(raw or "").strip().lower()
-        classed_states.add(str(state or "").strip().lower())
+        state_norm = str(state or "").strip().lower()
+        # The yielders substitute a placeholder ('(unnamed)') for a missing state;
+        # treat that and a literally-empty state as NO usable state.
+        state_present = bool(state_norm) and state_norm != "(unnamed)"
+        classed_states.add(state_norm)
         if canon == "win":
-            has_win = True
+            # STEP-9 (LOW, round-3): a declared 'win' with an EMPTY/missing state
+            # can never be matched by the reward rail (the outcome is compared to
+            # the declared state by exact name), so it does NOT count toward
+            # has_win -- otherwise an opted-in loop with {"": "win"} would pass the
+            # no-win check yet still credit zero forever.
+            if state_present:
+                has_win = True
+            else:
+                win_missing_state = True
         if canon not in TERMINAL_OUTCOME_CLASSES:
             report.errors.append(
                 f"event loop '{name}' terminal state '{state}' declares unknown "
@@ -356,12 +374,20 @@ def _check_loop_terminal_classes(
     # FIX 7(a): an opted-in loop with no declared 'win' can never credit a
     # conversion -- surface it as an error so the silent zero-credit is caught.
     if not has_win:
-        report.errors.append(
-            f"event loop '{name}' declares terminal_classes but NONE is a 'win' -- "
-            f"an opted-in loop credits a conversion ONLY from a declared 'win' "
-            f"(no substring fallback), so it would earn zero conversion reward "
-            f"forever. Declare the loop's win terminal as class 'win'."
-        )
+        if win_missing_state:
+            report.errors.append(
+                f"event loop '{name}' declares a 'win' terminal class with an "
+                f"EMPTY/missing state -- the reward rail matches a win by its declared "
+                f"state name, so a stateless 'win' can never credit. Declare the win "
+                f"terminal's state name."
+            )
+        else:
+            report.errors.append(
+                f"event loop '{name}' declares terminal_classes but NONE is a 'win' -- "
+                f"an opted-in loop credits a conversion ONLY from a declared 'win' "
+                f"(no substring fallback), so it would earn zero conversion reward "
+                f"forever. Declare the loop's win terminal as class 'win'."
+            )
     # FIX 7(a) coverage: a declared terminal_state with no class in a
     # partially-declared map silently credits nothing (the legacy fallback is
     # bypassed once the loop opts in). Warn so the gap surfaces.
@@ -481,20 +507,29 @@ def _near_miss(key: str, recognized: frozenset[str]) -> Optional[str]:
         aliases = _KNOWN_KEY_ALIASES.get(r)
         if aliases is not None and k in aliases:
             return r
-    # 2) A SINGLE-edit typo of a recognized key (edit distance == 1). The closed
-    # alias set above already covers the common multi-char typos/aliases, so the
-    # distance fallback is deliberately capped at 1: this catches a one-char
-    # dropped/added/substituted typo (``strct`` for ``strict``) WITHOUT matching
-    # an unrelated knob that merely sits two edits away (``max_followers`` is
-    # distance-2 from ``max_followups``; ``max_replies`` is distance-2 from
-    # ``max_retries`` -- both are legitimate keys and must NOT cry wolf). We also
-    # require the SAME first character to avoid matching a different word.
+    # 2) A bounded-edit-distance typo of a recognized key. The closed alias set
+    # above already covers the common multi-char typos/aliases, so the distance
+    # fallback is tight and PER-KEY:
+    #
+    #   * ``strict`` is a SHORT safety token (6 chars) with NO legitimate
+    #     2-edit neighbor in any contract vocabulary, so STEP-9 (MED, round-3)
+    #     raises its cap to 2: a 2-edit typo (``striqt`` / ``strikct``) that the
+    #     alias set misses still surfaces, and a silently-inert default-deny
+    #     opt-in is never missed because of an unenumerated misspelling.
+    #   * the longer ``max_*`` keys KEEP cap 1: they have legitimate 2-edit
+    #     neighbors (``max_followers`` is distance-2 from ``max_followups``;
+    #     ``max_replies`` is distance-2 from ``max_retries``) that must NOT cry
+    #     wolf.
+    #
+    # The SAME-first-character guard stays so a near-miss never matches a
+    # different word.
     best: Optional[tuple[int, str]] = None
     for r in recognized:
         if not r or not k or r[0] != k[0]:
             continue
-        d = _edit_distance(k, r, cap=1)
-        if d == 1 and (best is None or d < best[0]):
+        cap = 2 if r == "strict" else 1
+        d = _edit_distance(k, r, cap=cap)
+        if 1 <= d <= cap and (best is None or d < best[0]):
             best = (d, r)
     return best[1] if best is not None else None
 
@@ -555,6 +590,10 @@ def _check_loop_bound_values(
     integer -1 that was already flagged.
     """
     import math as _math
+    # STEP-9 (LOW, round-3): import the RUNTIME coercion so intake and runtime
+    # agree on the '-0' edge (the runtime accepts it as 0). Runtime is a leaf that
+    # imports only the grammar, so this cannot create a circular import.
+    from hermes_cli.kanban_reactive_runtime import _coerce_int as _runtime_coerce_int
 
     def _flag_if_bad(keys: frozenset[str], label: str) -> None:
         for key in keys:
@@ -562,9 +601,19 @@ def _check_loop_bound_values(
                 continue
             val = loop.get(key)
             bad = False
+            fractional = False
+            negzero = False
             if isinstance(val, bool):
                 bad = True
             elif isinstance(val, float) and not _math.isfinite(val):
+                bad = True
+            elif isinstance(val, float) and not val.is_integer():
+                # STEP-9 (MED, round-3): a fractional float bound (e.g. 2.7) is
+                # silently TRUNCATED by the runtime (``int(2.7) == 2``) -- the
+                # author's 2.7 becomes a cap of 2 with no error. Flag it at intake
+                # (opt-in only) rather than silently truncating. A negative
+                # fractional is caught here too.
+                fractional = True
                 bad = True
             elif isinstance(val, (int, float)):
                 bad = val < 0
@@ -576,14 +625,39 @@ def _check_loop_bound_values(
                 # '³'/'①' (runtime crash class), '٣' (non-ASCII), and the negative
                 # '-1'/'-5' strings, agreeing with the integer-(-1) flag above.
                 bad = _coerce_nonneg_int(val) is None
+                # STEP-9 (LOW, round-3): the '-0' family. The runtime's _coerce_int
+                # ACCEPTS '-0' (it lstrips '-' before isdigit, then int('-0')==0),
+                # so the runtime treats it as a VALID cap of 0 -- it is NOT "silently
+                # dropped, leaving the loop unbounded". _coerce_nonneg_int rejects it
+                # (its isdigit() sees the '-'), so intake still flags it, but the
+                # generic "dropped/unbounded" message is WRONG. Detect the
+                # negative-zero string (runtime coerces it to exactly 0) and emit an
+                # accurate message instead.
+                if bad and _runtime_coerce_int(val) == 0:
+                    negzero = True
             else:
                 bad = val is not None
             if bad:
-                report.errors.append(
-                    f"event loop '{name}' declares {label} {key}={val!r} which is not "
-                    f"a usable non-negative integer bound -- a malformed bound is "
-                    f"silently dropped at runtime, leaving the loop unbounded."
-                )
+                if fractional:
+                    report.errors.append(
+                        f"event loop '{name}' declares {label} {key}={val!r} which is a "
+                        f"FRACTIONAL bound -- the runtime silently TRUNCATES it to "
+                        f"{int(val)} (a different cap than the {val!r} you declared). "
+                        f"Declare a whole non-negative integer bound."
+                    )
+                elif negzero:
+                    report.errors.append(
+                        f"event loop '{name}' declares {label} {key}={val!r} which the "
+                        f"runtime coerces to a cap of 0 (terminate on the first attempt) "
+                        f"-- not unbounded. Declare a canonical non-negative integer "
+                        f"(use 0, not {val!r})."
+                    )
+                else:
+                    report.errors.append(
+                        f"event loop '{name}' declares {label} {key}={val!r} which is not "
+                        f"a usable non-negative integer bound -- a malformed bound is "
+                        f"silently dropped at runtime, leaving the loop unbounded."
+                    )
 
     _flag_if_bad(_RECOGNIZED_MAX_DEFERS_KEYS, "defer bound")
     _flag_if_bad(_RECOGNIZED_MAX_NUDGES_KEYS, "nudge cap")
@@ -660,16 +734,25 @@ def _check_event_loops(root: dict[str, Any], report: InvariantReport) -> None:
                     f"event loop '{name}' declares no terminal_states or stop_conditions -- "
                     f"it can never stop watching."
                 )
-        # 9(b) DECLARE-DON'T-INFER: when a loop OPTS IN to declared terminal
-        # classes, every declared class MUST be a member of the closed
-        # vocabulary. A fat-fingered class (e.g. "wonn" / "victory") would
-        # otherwise be silently dropped and the loop would fall back to the
-        # substring reward path -- so it must surface at intake, not run blind.
-        _check_loop_terminal_classes(name, loop, report)
-        # FIX 6 / FIX 7(d): a malformed defer/nudge bound, or a typo'd opt-in
-        # safety key, must surface at intake instead of silently going inert.
-        _check_loop_bound_values(name, loop, report)
-        _check_safety_optin_keys(name, loop, report)
+        # STEP-9 OPT-IN GATE (the re-architecture principle): all step-9 loop
+        # invariant checks run ONLY for a loop that opted in (declared a terminal
+        # class or a defer bound). A loop that opted into NEITHER hits ZERO new
+        # code paths here, so its errors/warnings are byte-identical to base
+        # 019271994 BY CONSTRUCTION -- no new findings can perturb the report or
+        # (via the persisted invariants block) the contract hash.
+        if _grammar_loop_opts_into_step9(loop):
+            # 9(b) DECLARE-DON'T-INFER: when a loop OPTS IN to declared terminal
+            # classes, every declared class MUST be a member of the closed
+            # vocabulary. A fat-fingered class (e.g. "wonn" / "victory") would
+            # otherwise be silently dropped and the loop would fall back to the
+            # substring reward path -- so it must surface at intake.
+            _check_loop_terminal_classes(name, loop, report)
+            # FIX 6 / FIX 7(d): a malformed defer/nudge bound, or a typo'd opt-in
+            # safety key, must surface at intake instead of silently going inert.
+            # Gated by opt-in so a legacy loop carrying an UNRELATED ``max_*`` key
+            # (e.g. ``max_followers`` / ``max_nudges``) produces no new finding.
+            _check_loop_bound_values(name, loop, report)
+            _check_safety_optin_keys(name, loop, report)
         if _grammar_has_inbound(triggers):
             if not _grammar_has_timer(triggers):
                 report.errors.append(
@@ -866,6 +949,12 @@ def _check_side_effect_classes(root: dict[str, Any], report: InvariantReport) ->
     or ``forbidden``. ``none`` is benign and exempt from (b)/(c).
     """
     declared_policy, gated_policy = _policy_declared_classes(root)
+    # STEP-9 OPT-IN GATE: the FIX-7(c) sentinel rejection below is a NEW finding
+    # (it changes the ERROR MESSAGE base produced for a ''/'null'/'-' class from
+    # the generic "unknown side_effect_class" to a sentinel-specific message). It
+    # runs ONLY for a contract that opted into step-9, so a pure-legacy contract
+    # gets the BASE "unknown side_effect_class" error verbatim -- byte-identical.
+    optin = _grammar_contract_opts_into_step9(root)
     checked = 0
     for where, raw in _iter_declared_side_effect_classes(root):
         checked += 1
@@ -876,8 +965,9 @@ def _check_side_effect_classes(root: dict[str, Any], report: InvariantReport) ->
         # 'none' at runtime -- so an author who meant a real side effect gets an
         # ungoverned, never-deferred loop. Reject it at intake so the authorial
         # intent is not silently dropped. ('none' is the explicit benign value
-        # and is handled below.)
-        if isinstance(raw, str):
+        # and is handled below.) Opt-in only: a non-opted contract falls through
+        # to the base "unknown side_effect_class" error for these sentinels.
+        if optin and isinstance(raw, str):
             sentinel = raw.strip().lower()
             if sentinel in {"", "null", "-"}:
                 report.errors.append(
@@ -1248,7 +1338,16 @@ def check_contract_invariants(contract: Any) -> InvariantReport:
     _check_event_loops(root, report)
     _check_tunables(root, report)
     _check_side_effect_classes(root, report)
-    _check_side_effect_policy_keys(root, report)
+    # STEP-9 OPT-IN GATE: the side_effect_policy near-miss check (a typo'd
+    # ``strict`` opt-in) is a NEW finding. It runs ONLY for a contract that opted
+    # into step-9 elsewhere (a loop terminal-class or defer-bound declaration),
+    # so a pure-legacy contract -- including one that happens to carry a
+    # ``strict_mode``-shaped policy key with no other step-9 declaration -- hits
+    # ZERO new code paths and is byte-identical to base 019271994. A contract
+    # that DID opt into step-9 but typo'd its strict key is clearly trying to use
+    # the feature, so surfacing the inert typo is correct there.
+    if _grammar_contract_opts_into_step9(root):
+        _check_side_effect_policy_keys(root, report)
     _check_timer_cadence(root, report)
     _check_irreversible_gating(root, report)
     _check_knob_references(root, report)
