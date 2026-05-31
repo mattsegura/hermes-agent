@@ -1163,6 +1163,28 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_stats.add_argument("--json", action="store_true")
 
+    # --- status (all-boards read-only operability dashboard) ---
+    p_status = sub.add_parser(
+        "status",
+        help="Read-only all-boards dashboard (phase, gate why-blocked, "
+             "active-but-blocked flag, governance posture)",
+    )
+    p_status.add_argument("--all", action="store_true",
+                          help="Include archived boards")
+    p_status.add_argument("--json", action="store_true",
+                          help="Emit machine-readable JSON instead of the table")
+
+    # --- scoreboard (read-only attainment grading vs objective.success) ---
+    p_scoreboard = sub.add_parser(
+        "scoreboard",
+        help="Read-only attainment grading vs the board's objective.success "
+             "(typed criteria + PENDING for external data sources)",
+    )
+    p_scoreboard.add_argument("board_slug", nargs="?", default=None,
+                              help="Board to grade (default: current board)")
+    p_scoreboard.add_argument("--json", action="store_true",
+                              help="Emit machine-readable JSON")
+
     # --- funnel ---
     p_funnel = sub.add_parser(
         "funnel",
@@ -1614,6 +1636,8 @@ def _kanban_command_dispatch(args: argparse.Namespace, action: str) -> int:
         "daemon":   _cmd_daemon,
         "watch":    _cmd_watch,
         "stats":    _cmd_stats,
+        "status":   _cmd_status,
+        "scoreboard": _cmd_scoreboard,
         "funnel":   _cmd_funnel,
         "funnel-set": _cmd_funnel_set,
         "log":      _cmd_log,
@@ -4531,6 +4555,69 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_status(args: argparse.Namespace) -> int:
+    """Read-only all-boards operability dashboard.
+
+    Reachable from Telegram via ``/kanban status`` (the gateway pipes /kanban
+    through run_slash). Renders the compact, phone-friendly dashboard from the
+    canonical engine renderer in :mod:`hermes_cli.kanban_scoreboard`; the render
+    logic reuses the engine's own ``board_dispatch_gate`` / ``list_boards`` and
+    a shared-lock read-only sqlite read. Never writes.
+    """
+    from hermes_cli import kanban_scoreboard as ksb
+
+    include_archived = bool(getattr(args, "all", False))
+    rows = ksb.assemble_status_rows(include_archived=include_archived)
+    if getattr(args, "json", False):
+        governance = ksb._governance_posture()
+        print(json.dumps(
+            {
+                "read_only": True,
+                "governance": governance,
+                "summary": {
+                    "boards": len(rows),
+                    "blocked": sum(1 for r in rows if r["gate_ok"] is False),
+                    "active_but_blocked": [
+                        r["slug"] for r in rows if r["active_but_blocked"]
+                    ],
+                },
+                "boards": rows,
+            },
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        ))
+        return 0
+    print(ksb.render_status(rows))
+    return 0
+
+
+def _cmd_scoreboard(args: argparse.Namespace) -> int:
+    """Read-only attainment grading vs a board's objective.success.
+
+    Reachable from Telegram via ``/kanban scoreboard [board]``. Resolves the
+    board from the positional arg, then the ``--board`` flag pin, then the
+    current board. Renders from the canonical engine renderer; never writes.
+    """
+    from hermes_cli import kanban_scoreboard as ksb
+
+    slug = getattr(args, "board_slug", None)
+    if not slug:
+        # Fall back to the --board pin / current-board resolution.
+        slug = getattr(args, "board", None) or kb.get_current_board()
+    try:
+        slug = kb._normalize_board_slug(slug) or kb.DEFAULT_BOARD
+    except ValueError as exc:
+        print(f"kanban scoreboard: {exc}", file=sys.stderr)
+        return 2
+    result = ksb.score_board(slug)
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
+    print(ksb.render_scoreboard(result))
+    return 0
+
+
 def _cmd_funnel(args: argparse.Namespace) -> int:
     limit_cards = getattr(args, "limit_cards", 20)
     if limit_cards is not None and limit_cards < 0:
@@ -5150,6 +5237,14 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 
 _SLASH_KANBAN_HELP = """\
 **/kanban** — manage the shared task board.
+
+Board lifecycle cheat-sheet (launch a board → run it → watch it):
+  `status`                        All-boards dashboard: phase, why-blocked, active-but-blocked
+  `scoreboard [board]`            Attainment vs the board's success contract
+  `boards contract status <slug>` Launch readiness for one board (what's still missing)
+  `boards credentials submit`     Provide the credentials a board's launch needs
+  `steer <subcommand>`            Talk to the CEO mid-run (open / send / list / show / close)
+  `/approve <board>`              OWNER launch: activate a drafted, ready board
 
 Common subcommands:
   `list` (alias `ls`)   List tasks on the current board

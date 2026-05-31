@@ -975,6 +975,28 @@ class TestTelegramMenuCommands:
         ):
             assert name in names
 
+    def test_kanban_survives_thirty_command_cap(self, tmp_path, monkeypatch):
+        """`/kanban` (the board launch/steer/status surface) must survive the
+        ~30-slot Telegram menu cap so its subcommands autocomplete on the phone.
+
+        FAILS WITHOUT the Batch A Step 2 menu-priority edit: `kanban` is not in
+        ``_TELEGRAM_MENU_PRIORITY`` and falls outside the 30-command cap.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        menu, _hidden = telegram_menu_commands(max_commands=30)
+        names = [name for name, _desc in menu]
+        assert "kanban" in names
+
+    def test_approve_description_mentions_board_launch(self):
+        """The /approve menu entry must advertise `/approve <board>` board-launch
+        so the owner can discover the launch verb from the Telegram menu.
+        """
+        from hermes_cli.commands import resolve_command
+
+        approve = resolve_command("approve")
+        assert approve is not None
+        assert "board" in approve.description.lower()
+
     def test_includes_plugin_commands_via_lazy_discovery(self, tmp_path, monkeypatch):
         """Telegram menu generation should discover plugin slash commands on first access."""
         from unittest.mock import patch

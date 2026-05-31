@@ -344,6 +344,73 @@ async def test_approve_already_active_board_is_noop(fresh_home):
 
 
 @pytest.mark.asyncio
+async def test_approve_active_but_blocked_surfaces_blocker_not_false_success(fresh_home):
+    """ACTIVE-BUT-BLOCKED dead-end fix (the ninaxfinds-growth trap).
+
+    A board can be phase=active yet still gate-BLOCKED (e.g. an incomplete
+    managed contract -> launch_readiness_failed), which strands its tasks. The
+    old `/approve` early-return claimed "already active — nothing to approve"
+    without consulting the gate. This regression pins that the handler now
+    consults board_dispatch_gate(): an active-but-blocked board returns the
+    blocker reasons (in plain owner language) PLUS the concrete next step, and
+    explicitly does NOT return the false "already active" success string.
+
+    FAILS WITHOUT the fix (the early return fires before the gate is consulted,
+    so the output is "already active — nothing to approve").
+    """
+    # Manufacture the ninaxfinds-growth state: a managed board whose contract is
+    # incomplete (-> readiness fails) that has nonetheless been forced into
+    # launch_phase=active. board_dispatch_gate() reports ok=False with a
+    # launch_readiness_failed blocker carrying the missing-field tokens.
+    kb.review_business_launch_contract(
+        "stuck-board",
+        contract={"objective": {"statement": "do something vague"}},
+        create_if_missing=True,
+    )
+    kb.write_board_metadata("stuck-board", launch_phase="active")
+    # Precondition: this really is the active-but-blocked trap.
+    gate = kb.board_dispatch_gate("stuck-board")
+    assert kb.normalize_board_launch_phase(gate.get("launch_phase")) == "active"
+    assert gate.get("ok") is False
+    assert any(
+        (b.get("code") if isinstance(b, dict) else b) == "launch_readiness_failed"
+        for b in gate.get("blockers") or []
+    )
+
+    runner = _make_runner()
+    out = await runner._handle_approve_command(_make_event("/approve stuck-board"))
+
+    # The false success is gone…
+    assert "already active — nothing to approve" not in out
+    assert "nothing to approve" not in out.lower()
+    # …replaced by the blocked signal + plain-language blocker reasons…
+    assert "blocked" in out.lower()
+    assert "contract is incomplete" in out.lower()
+    # …and the concrete next step (re-run /approve after finishing the contract).
+    assert "/approve stuck-board" in out
+    # READ-ONLY: surfacing the blocker must not mutate the board's phase.
+    meta_after = kb.read_board_metadata("stuck-board")
+    assert kb.normalize_board_launch_phase(meta_after.get("launch_phase")) == "active"
+
+
+@pytest.mark.asyncio
+async def test_approve_active_and_ok_board_still_reports_already_active(fresh_home):
+    """The genuinely active-and-OK path is unchanged: still 'already active'.
+
+    Guards against the active-but-blocked fix accidentally swallowing the happy
+    path — an approved, launch-ready, active board with an OK gate must still
+    return the normal success no-op.
+    """
+    _draft_board("land-wholesaling")
+    runner = _make_runner()
+    await runner._handle_approve_command(_make_event("/approve land-wholesaling"))
+    # Sanity: the freshly-approved board's gate is OK.
+    assert kb.board_dispatch_gate("land-wholesaling").get("ok") is True
+    out = await runner._handle_approve_command(_make_event("/approve land-wholesaling"))
+    assert "already active" in out.lower()
+
+
+@pytest.mark.asyncio
 async def test_bare_approve_surfaces_pending_boards(fresh_home):
     """`/approve` with no pending tool approval lists boards awaiting launch."""
     _draft_board("land-wholesaling")

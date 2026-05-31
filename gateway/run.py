@@ -14471,6 +14471,39 @@ class GatewayRunner:
         except Exception:
             return ""
 
+    @staticmethod
+    def _owner_facing_gate_reasons(kb, gate: dict) -> str:
+        """Render a board_dispatch_gate() result's blockers as plain owner prose.
+
+        Reuses the engine's owner_facing_error_sentences vocabulary so the
+        owner sees "what I still need to know" sentences rather than raw
+        validator keys. Pulls the readiness ``missing``/``errors`` lists out of
+        each blocker (these carry the launch-readiness field tokens), and falls
+        back to the gate's ``reason``/blocker codes when no field tokens exist.
+        Read-only: it only formats the dict it was handed.
+        """
+        raw_tokens: list = []
+        for blocker in gate.get("blockers") or []:
+            if not isinstance(blocker, dict):
+                continue
+            raw_tokens.extend(blocker.get("missing") or [])
+            raw_tokens.extend(blocker.get("errors") or [])
+        try:
+            sentences = kb.owner_facing_error_sentences(raw_tokens)
+        except Exception:
+            sentences = []
+        if sentences:
+            return "; ".join(sentences)
+        reason = gate.get("reason")
+        if reason:
+            return str(reason)
+        codes = [
+            str(b.get("code"))
+            for b in (gate.get("blockers") or [])
+            if isinstance(b, dict) and b.get("code")
+        ]
+        return ", ".join(codes) if codes else "launch readiness incomplete"
+
     async def _handle_board_launch_approval(
         self, board_arg: str, event: MessageEvent
     ) -> str:
@@ -14507,6 +14540,26 @@ class GatewayRunner:
             meta = kb.read_board_metadata(slug)
             phase = str(meta.get("launch_phase") or "").strip().lower()
             if phase == "active":
+                # ACTIVE-BUT-BLOCKED dead-end (edge-case fix): a board can be
+                # phase=active yet still gated (e.g. launch_readiness_failed),
+                # which leaves its tasks idle. The old early-return claimed
+                # "already active — nothing to approve" without consulting the
+                # gate, so the owner had no idea the board was stuck. Consult
+                # board_dispatch_gate(slug); if it is NOT ok, surface the
+                # blocker reasons (in plain owner language) plus the concrete
+                # next step instead of the false success string. A genuinely
+                # active-and-OK board still returns the normal success.
+                try:
+                    gate = kb.board_dispatch_gate(slug)
+                except Exception:
+                    gate = None
+                if isinstance(gate, dict) and gate.get("ok") is False:
+                    reasons = self._owner_facing_gate_reasons(kb, gate)
+                    return (
+                        f"⚠️ Board `{slug}` is active but blocked: {reasons}. "
+                        "Its contract is incomplete — ask me to finish the "
+                        f"contract, then `/approve {slug}` again."
+                    )
                 return f"✅ Board `{slug}` is already active — nothing to approve."
         except Exception as exc:
             return f"⛔ Could not read board `{slug}`: {exc}"

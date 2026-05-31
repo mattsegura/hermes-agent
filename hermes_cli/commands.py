@@ -92,8 +92,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("snapshot", "Create or restore state snapshots of Hermes config/state", "Session",
                cli_only=True, aliases=("snap",), args_hint="[create|restore <id>|prune]"),
     CommandDef("stop", "Kill all running background processes", "Session"),
-    CommandDef("approve", "Approve a pending dangerous command", "Session",
-               gateway_only=True, args_hint="[session|always]"),
+    CommandDef("approve", "Approve a pending dangerous command, or `/approve <board>` to launch a drafted board", "Session",
+               gateway_only=True, args_hint="[session|always|<board>]"),
     CommandDef("deny", "Deny a pending dangerous command", "Session",
                gateway_only=True),
     CommandDef("background", "Run a prompt in the background", "Session",
@@ -180,7 +180,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("init", "boards", "create", "list", "ls", "show", "assign",
                             "reclaim", "reassign", "diagnostics", "diag", "link", "unlink",
                             "claim", "comment", "complete", "edit", "block", "unblock",
-                            "archive", "tail", "dispatch", "stats", "notify-subscribe",
+                            "archive", "tail", "dispatch", "stats", "status", "scoreboard",
+                            "steer", "notify-subscribe",
                             "notify-list", "notify-unsubscribe", "log", "runs",
                             "heartbeat", "assignees", "context", "specify", "gc")),
     CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
@@ -519,6 +520,10 @@ _TELEGRAM_MENU_PRIORITY = (
     "resume",
     "sessions",
     "model",
+    # Board lifecycle — `/kanban` is the launch/steer/status surface; it must
+    # survive the ~30-slot Telegram menu cap so the board controls (status,
+    # scoreboard, contract, credentials, steer) autocomplete on the phone.
+    "kanban",
     # Maintenance / diagnostics — the ones that prompted this priority list.
     "debug",
     "restart",
