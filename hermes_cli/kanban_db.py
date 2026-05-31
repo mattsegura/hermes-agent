@@ -710,16 +710,41 @@ def _strip_contract_hash_telemetry(normalized: Any) -> Any:
     degraded-path contract would hash DIFFERENTLY head-vs-base even with all
     enforcement flags off, which can invalidate approval tokens or bump the
     contract_version on a no-op upgrade. We drop it here so the hash ignores it.
+
+    FIX 5 (round-2): ``launch_intake.invariants`` (the
+    ``check_contract_invariants(...).as_dict()`` report persisted by
+    ``_apply_synthesized_launch_contract`` / ``_record_launch_intake_invariant_failure``)
+    is the SAME class of run-derived telemetry -- it is validator FINDINGS, not
+    semantic contract content. It was left in the hashed payload, so when this
+    change set added new HEAD-only findings (e.g. a near-miss warning on a legacy
+    contract carrying a common ``max_*`` key), the SAME logical contract
+    synthesized at HEAD baked a different invariants block and hashed differently
+    base-vs-HEAD. Mirror the completeness exclusion and drop it too, so the
+    canonical hash reflects only semantic contract content. (Verified: the hash is
+    consumed only for approval-token binding / version comparison -- no consumer
+    reads ``launch_intake.invariants`` BACK OUT of the hashed payload; the live
+    report is recomputed on demand, never read from the frozen hash input.)
     """
     if not isinstance(normalized, dict):
         return normalized
     intake = normalized.get("launch_intake")
-    if not isinstance(intake, dict) or "completeness" not in intake:
+    if not isinstance(intake, dict):
+        return normalized
+    if "completeness" not in intake and "invariants" not in intake:
         return normalized
     clone = dict(normalized)
     intake_clone = dict(intake)
     intake_clone.pop("completeness", None)
-    clone["launch_intake"] = intake_clone
+    intake_clone.pop("invariants", None)
+    # If stripping the telemetry left an EMPTY launch_intake, drop the key
+    # entirely so a contract whose ONLY launch_intake content was telemetry
+    # hashes identically to a contract with no launch_intake block at all (the
+    # canonical hash must reflect only semantic content, not the presence of an
+    # emptied telemetry container).
+    if intake_clone:
+        clone["launch_intake"] = intake_clone
+    else:
+        clone.pop("launch_intake", None)
     return clone
 
 
@@ -11077,6 +11102,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 conn, "reactive_timer_schedules", "defers_used",
                 "defers_used INTEGER NOT NULL DEFAULT 0",
             )
+        # FIX 1 (round-2) belt-and-suspenders: one-time backfill that lower-cases
+        # any LEGACY reactive_timer_schedules.side_effect_class persisted verbatim
+        # (mixed-case) by base code. The load-bearing fix is the read-time
+        # normalization in reactive_tick; this migration makes the persisted
+        # column ALSO match the lower-cased forbidden/approval_required policy
+        # vocabulary so the two sides agree even for a consumer that reads the
+        # column directly. Idempotent: lower(lower(x)) == lower(x). Scoped to rows
+        # whose stored value is not already its own lower-case (no-op for the
+        # already-canonical fresh-compile rows and for NULL).
+        if "side_effect_class" in sched_cols:
+            conn.execute(
+                "UPDATE reactive_timer_schedules "
+                "SET side_effect_class = lower(side_effect_class) "
+                "WHERE side_effect_class IS NOT NULL "
+                "AND side_effect_class <> lower(side_effect_class)"
+            )
 
     # board_signals gained a ``dedupe_key`` column (exactly-once reward
     # attribution). Legacy rows get NULL (no dedupe key -> never collapsed),
@@ -17215,6 +17256,32 @@ def _loop_watch_trigger(loop: dict, loop_key: str, entity_ref: str) -> dict[str,
     }
 
 
+def _serialize_terminal_classes_for_persist(terminal_classes) -> Optional[str]:
+    """Serialize the compile-side terminal_classes value for the DB column.
+
+    FIX 3 (round-2): accepts the three compile outcomes from
+    ``_reactive.loop_terminal_classes_for_compile``:
+
+    * ``None`` / empty -> NULL (not opted in / legacy).
+    * the dropped-declaration sentinel string -> the distinct DB marker so the
+      read-back fails CLOSED (NOT a JSON-encoded string, so it can never be
+      mistaken for a valid map).
+    * a ``{state: class}`` dict -> its JSON object.
+    """
+    if terminal_classes is None:
+        return None
+    if isinstance(terminal_classes, str):
+        # The only legitimate string here is the dropped-declaration sentinel.
+        if terminal_classes == _reactive.TERMINAL_CLASSES_DROPPED_SENTINEL:
+            return _TERMINAL_CLASSES_DROPPED_DB_MARKER
+        # Any other bare string is unexpected; fail CLOSED by persisting the
+        # marker rather than a value that might parse as legacy/empty.
+        return _TERMINAL_CLASSES_DROPPED_DB_MARKER
+    if not terminal_classes:
+        return None
+    return json.dumps(terminal_classes, ensure_ascii=False)
+
+
 def _upsert_timer_schedule(
     conn: sqlite3.Connection,
     *,
@@ -17231,7 +17298,7 @@ def _upsert_timer_schedule(
     stop_conditions: list[str],
     action: Optional[dict],
     now: int,
-    terminal_classes: Optional[dict[str, str]] = None,
+    terminal_classes=None,
     max_defers: Optional[int] = None,
 ) -> None:
     """Idempotently register a timer schedule for a loop (UNIQUE board+loop+entity).
@@ -17240,6 +17307,13 @@ def _upsert_timer_schedule(
     not declare them leaves both NULL, which is byte-identical to a legacy row
     (corrected-substring reward + unbounded deferral). Only a loop that declares a
     closed-vocabulary terminal class / a defer bound persists a non-NULL value.
+
+    FIX 3 (round-2): ``terminal_classes`` may be (a) ``None`` -> NULL column
+    (not opted in / legacy), (b) a ``{state: class}`` dict -> the JSON map, or
+    (c) the ``_reactive.TERMINAL_CLASSES_DROPPED_SENTINEL`` string -> a loop that
+    opted in but whose declaration was wholly dropped. Case (c) persists a
+    DISTINCT non-map marker (:data:`_TERMINAL_CLASSES_DROPPED_DB_MARKER`) so the
+    read-back fails CLOSED instead of reverting to the substring path.
     """
     with write_txn(conn):
         conn.execute(
@@ -17269,7 +17343,7 @@ def _upsert_timer_schedule(
                 _canonical_side_effect_class(side_effect_class),
                 _json_text_or_none(action),
                 json.dumps(terminal_states, ensure_ascii=False) if terminal_states else None,
-                json.dumps(terminal_classes, ensure_ascii=False) if terminal_classes else None,
+                _serialize_terminal_classes_for_persist(terminal_classes),
                 json.dumps(stop_conditions, ensure_ascii=False) if stop_conditions else None,
                 now,
                 now,
@@ -17409,7 +17483,15 @@ def _compile_one_reactive_loop(
         # 9(b)/9(c) opt-in: a loop may DECLARE a closed-vocabulary terminal class
         # map and/or a defer bound. Both are empty/None for legacy loops, so the
         # schedule row is byte-identical to today unless the contract opts in.
-        terminal_classes = _reactive.loop_declared_terminal_classes(loop) or None
+        #
+        # FIX 3 (round-2): use loop_terminal_classes_for_compile, which fails
+        # CLOSED when a loop OPTED IN (carried a class declaration) but every
+        # declared class was unknown/dropped by the grammar -- it returns the
+        # TERMINAL_CLASSES_DROPPED_SENTINEL string instead of an empty map, so the
+        # read-back never silently reverts to the 'won' substring path. A
+        # legacy/non-opted-in loop still returns None (NULL column, byte-identical
+        # legacy reward path).
+        terminal_classes = _reactive.loop_terminal_classes_for_compile(loop)
         max_defers = _reactive.loop_max_defers(loop)
         side_effect_class = str(
             loop.get("side_effect_class")
@@ -17549,10 +17631,24 @@ def _side_effect_strict_enabled(policy: dict) -> bool:
     global flag): ``side_effect_policy.strict: true``. DEFAULT-OFF -- an absent /
     falsey field means the legacy fall-through gate, byte-identical to today. A
     board only gets fail-closed enforcement when it explicitly declares it.
+
+    FIX 5 (round-2): canonicalize the policy KEY case before reading ``strict``.
+    A case-variant opt-in (``Strict: true`` / ``STRICT: true``) previously
+    resolved to ``False`` (enforcement silently OFF) AND escaped the typo warning
+    (the near-miss check lower-cases the key first, so ``'Strict'.lower()=='strict'``
+    looked recognized and was skipped). An operator who capitalized the opt-in
+    believed DEFAULT-DENY was on while the board ran the legacy fall-through with
+    ZERO protection. Lower-casing the keys here mirrors the class-value
+    canonicalization (``_canonical_side_effect_class``) so a capitalized opt-in
+    is honored as declared. If multiple case-variants of the same key collide,
+    ANY truthy one enables strict (fail-CLOSED toward protection).
     """
     if not isinstance(policy, dict):
         return False
-    return _coerce_bool(policy.get("strict"))
+    for key, value in policy.items():
+        if isinstance(key, str) and key.strip().lower() == "strict" and _coerce_bool(value):
+            return True
+    return False
 
 
 def _side_effect_class_is_recognized(side_effect_class: Optional[str]) -> bool:
@@ -17676,13 +17772,42 @@ def _timer_schedule_terminal_states(row: Any) -> list[str]:
         return []
 
 
-#: Sentinel returned by :func:`_timer_schedule_terminal_classes` when the
-#: ``terminal_classes`` column is PRESENT (non-NULL) but UNPARSEABLE / not a JSON
-#: object. FIX 5: a corrupt declared map must NOT degrade to "never opted in"
-#: (which would fall through to the legacy 'won'-substring path and wrongly
-#: credit a declared NEUTRAL/LOSS terminal). It is a distinct fail-CLOSED state:
-#: the reward rail credits 0.0 (non-conversion) and emits a loud error signal.
-_TERMINAL_CLASSES_CORRUPT: dict[str, str] = {}
+class _TerminalClassesCorrupt:
+    """FIX 6 (round-2) self-protecting fail-CLOSED marker.
+
+    Returned by :func:`_timer_schedule_terminal_classes` when the
+    ``terminal_classes`` column is PRESENT (non-NULL) but UNPARSEABLE / not a JSON
+    object, OR carries the FIX-3 dropped-declaration marker. FIX 5: a corrupt /
+    dropped declared map must NOT degrade to "never opted in" (which would fall
+    through to the legacy 'won'-substring path and wrongly credit a declared
+    NEUTRAL/LOSS terminal). It is a distinct fail-CLOSED state: the reward rail
+    credits 0.0 (non-conversion) and emits a loud error signal.
+
+    Previously the sentinel was an empty ``dict`` ({}), which is FALSY -- so a
+    future caller that passed it straight into ``_terminal_outcome_is_conversion``
+    (whose declared-path gate is ``if declared_terminal_classes:``) would fall
+    THROUGH to the substring path and fail OPEN. The posture held ONLY because the
+    single caller did an explicit ``is`` identity check first. This distinct
+    NON-DICT marker is recognized self-protectingly INSIDE
+    ``_terminal_outcome_is_conversion`` (an ``isinstance`` check), so a forgotten
+    identity check at any future call site can no longer silently fall through.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "_TERMINAL_CLASSES_CORRUPT"
+
+
+#: Singleton fail-CLOSED marker (see :class:`_TerminalClassesCorrupt`). A distinct
+#: non-dict, identity-checkable AND isinstance-recognizable object.
+_TERMINAL_CLASSES_CORRUPT = _TerminalClassesCorrupt()
+
+#: FIX 3 (round-2): the DB value persisted for a loop that opted into terminal
+#: classes but whose whole declaration was dropped (no valid class survived).
+#: A distinct non-JSON-object string so the read-back routes to the fail-CLOSED
+#: sentinel above. Mirrors _reactive.TERMINAL_CLASSES_DROPPED_SENTINEL.
+_TERMINAL_CLASSES_DROPPED_DB_MARKER: str = "__terminal_classes_dropped__"
 
 
 def _timer_schedule_terminal_classes(row: Any) -> dict[str, str]:
@@ -17695,11 +17820,13 @@ def _timer_schedule_terminal_classes(row: Any) -> dict[str, str]:
       loop did not opt in, so the caller keeps the byte-identical legacy
       substring reward path.
     * **Valid declaration.** Returns the ``{state: class}`` map.
-    * **Present-but-broken (non-NULL but unparseable / not a JSON object).**
-      Returns the :data:`_TERMINAL_CLASSES_CORRUPT` sentinel (identity-checked by
-      the caller) so the reward rail fails CLOSED -- credits 0.0 and surfaces an
-      error -- rather than silently falling back to the substring guess the loop
-      opted in precisely to suppress.
+    * **Present-but-broken (non-NULL but unparseable / not a JSON object), OR the
+      FIX-3 dropped-declaration marker.** Returns the
+      :data:`_TERMINAL_CLASSES_CORRUPT` sentinel (a distinct non-dict object,
+      recognized self-protectingly inside ``_terminal_outcome_is_conversion``) so
+      the reward rail fails CLOSED -- credits 0.0 and surfaces an error -- rather
+      than silently falling back to the substring guess the loop opted in
+      precisely to suppress.
     """
     try:
         raw = row["terminal_classes"] if "terminal_classes" in row.keys() else None
@@ -17708,6 +17835,10 @@ def _timer_schedule_terminal_classes(row: Any) -> dict[str, str]:
     # NULL / absent -> genuinely no declaration -> legacy path.
     if raw is None:
         return {}
+    # FIX 3 (round-2): the dropped-declaration marker (a loop that opted in but
+    # whose whole class declaration was unknown/dropped at compile). Fail CLOSED.
+    if isinstance(raw, str) and raw.strip() == _TERMINAL_CLASSES_DROPPED_DB_MARKER:
+        return _TERMINAL_CLASSES_CORRUPT
     # A non-NULL but EMPTY string is degenerate; treat it as no declaration
     # (there is nothing to parse and no class to honor) -- it cannot mis-credit a
     # declared neutral/loss because no class was declared.
@@ -17819,6 +17950,14 @@ def _terminal_outcome_is_conversion(
       declared path above), where the decision comes from a closed vocabulary
       and never from a free-text substring denylist.
     """
+    # FIX 6 (round-2) self-protecting fail-CLOSED: a corrupt / dropped declared
+    # map is the distinct ``_TerminalClassesCorrupt`` marker, recognized HERE by
+    # isinstance (not only by a caller's identity check). It can NEVER credit a
+    # conversion regardless of the outcome string -- even before the empty-string
+    # guards below -- so a forgotten identity check at any future call site fails
+    # CLOSED instead of falling through to the substring path.
+    if isinstance(declared_terminal_classes, _TerminalClassesCorrupt):
+        return False
     if not terminal_outcome:
         return False
     outcome = str(terminal_outcome).strip().lower()
@@ -18227,7 +18366,20 @@ def reactive_tick(
         # member of the closed vocabulary -- the coalesced value below is what the
         # recognition check sees, so NULL -> "none" -> recognized -> fires
         # (byte-identical), while "extrnal_ireversible" -> unrecognized -> defers.
-        side_effect_class = row["side_effect_class"] or "none"
+        #
+        # FIX 1 (round-2): coalesce+strip+LOWER-CASE the persisted row value so the
+        # raw-row side and the lowercased forbidden/approval_required policy sets
+        # (built above) share ONE vocabulary regardless of WHEN the row was
+        # persisted. Fresh-compile rows persist via _canonical_side_effect_class
+        # (already lower-cased), but a LEGACY row compiled at base persisted the
+        # class verbatim (mixed-case, e.g. 'External_Irreversible'). Without this
+        # lower-case the lowercased policy set {external_irreversible} no longer
+        # contains the raw 'External_Irreversible', silently flipping the two most
+        # dangerous safety gates blocked->fired / deferred->fired on upgrade with
+        # no flag and no contract change. The one-time migration below
+        # (_migrate_lowercase_reactive_side_effect_class) is belt-and-suspenders;
+        # this read-time normalization is the load-bearing fix.
+        side_effect_class = (row["side_effect_class"] or "none").strip().lower()
         if side_effect_class in forbidden:
             _close_timer_schedule(
                 conn, row, reason="side_effect_forbidden", now=now,
@@ -20509,8 +20661,14 @@ def _timer_schedule_max_defers(row: Any) -> Optional[int] | str:
         return None
     try:
         n = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         # Present-but-uncoercible: FIX 5 fail-CLOSED sentinel.
+        # FIX 4 (round-2): SQLite INTEGER affinity can return a Python float for a
+        # REAL-stored value, so a column holding +/-inf raises OverflowError (NOT
+        # TypeError/ValueError) from int(). Catching it here routes the non-finite
+        # value to the _MAX_DEFERS_CORRUPT sentinel (fail CLOSED / terminate) so it
+        # cannot propagate out of _defer_timer_schedule and crash the ENTIRE tick
+        # (reactive_tick's per-row loop has no per-row guard).
         return _MAX_DEFERS_CORRUPT
     return n if n >= 0 else None
 
@@ -20522,8 +20680,11 @@ def _timer_schedule_defers_used(row: Any) -> int:
     except Exception:
         raw = None
     try:
+        # FIX 4 (round-2): catch OverflowError alongside TypeError/ValueError so a
+        # non-finite (inf) float read back from a REAL-affinity column degrades to
+        # 0 instead of crashing the tick (mirrors _timer_schedule_max_defers).
         return int(raw) if raw is not None else 0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 

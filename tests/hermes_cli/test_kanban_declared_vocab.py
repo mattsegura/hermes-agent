@@ -374,11 +374,27 @@ def test_9b_legacy_loop_is_byte_identical_to_base(
 def test_fix1_legacy_path_byte_identical_to_base_unit():
     """FIX 1 unit proof: ``_terminal_outcome_is_conversion`` on the LEGACY path
     (``declared_terminal_classes`` None/empty) is byte-identical to base
-    019271994, whose legacy branch was literally ``if "won" in outcome: return
-    True`` (unconditional, run before the declared_terminal_states loop).
+    019271994.
 
-    Mutation check: any loss-denylist gate on the legacy branch makes a
-    'won'-embedding loss/win-back outcome diverge from base, failing here.
+    Base behavior (git show 019271994:hermes_cli/kanban_db.py):
+      (b) ``if "won" in outcome: return True``  -- UNCONDITIONAL substring shortcut
+      (c) for a declared terminal_state == outcome that ``_looks_like_win_token``
+          deems a win, return True.
+
+    FIX 6 (round-2) test repair: path (c) of the base used the REAL
+    ``_looks_like_win_token`` (-> ``launch_completeness._looks_like_win``), which
+    credits NON-'won' win tokens (under_contract / onboarded / signed / ...). The
+    prior reconstruction gated path (c) on ``"won" in dd`` instead, so it never
+    exercised the non-'won' win-token branch and a mutation of path (c) to
+    ``"won" in d`` passed unnoticed. We now reconstruct base path (c) with the
+    REAL helper AND add non-'won' win-token probes with matching declared states
+    so the byte-identity claim actually pins path (c).
+
+    Mutation check (path b): any loss-denylist gate on the legacy substring branch
+    makes a 'won'-embedding loss/win-back outcome diverge from base, failing here.
+    Mutation check (path c): replacing ``_looks_like_win_token(d)`` with
+    ``"won" in d`` flips the non-'won' win-token probes (under_contract/onboarded/
+    signed) from True to False, failing here.
     """
 
     def base_conversion(outcome, states):
@@ -390,19 +406,18 @@ def test_fix1_legacy_path_byte_identical_to_base_unit():
             return False
         if "won" in o:                      # base path (b): UNCONDITIONAL
             return True
-        loss = (
-            "lost", "loss", "closed_lost", "unsigned", "incomplete",
-            "not_completed", "not_complete", "disapprov", "disqualif",
-            "reject", "declin", "cancel", "abandon", "churn", "expired",
-            "dead", "failed", "fail", "withdrawn", "bounced",
-        )
+        # base path (c): the outcome matches a declared terminal_state AND that
+        # state reads as a win-class token via the REAL detector (the SAME helper
+        # the shipped reward rail and the win_signal_rail spec bind to).
         for d in states or []:
             dd = str(d).strip().lower()
-            if dd == o and not any(t in dd for t in loss) and "won" in dd:
+            if dd == o and kb._looks_like_win_token(dd):
                 return True
         return False
 
-    probes = [
+    # 'won'-embedding probes (path b) + NON-'won' win tokens (path c) with their
+    # own matching declared states so the win-token branch is actually exercised.
+    won_probes = [
         "won", "closed_won", "closed_lost", "won_but_lost", "won_lost",
         "won_then_lost", "won_then_cancelled", "deal_won_but_churned",
         "won_account_expired", "won_back_from_churn",
@@ -411,11 +426,33 @@ def test_fix1_legacy_path_byte_identical_to_base_unit():
         "unwon", "wonky", "renewal_won", "arbitrary", "", None,
     ]
     state_variants = [[], ["won", "lost"], ["closed_won", "closed_lost"]]
-    for o in probes:
+    for o in won_probes:
         for st in state_variants:
             base = base_conversion(o, st)
             assert kb._terminal_outcome_is_conversion(o, st, None) is base, (o, st)
             assert kb._terminal_outcome_is_conversion(o, st, {}) is base, (o, st)
+
+    # Non-'won' win tokens that path (c) credits at base ONLY when the outcome
+    # equals a DECLARED terminal_state (so the substring shortcut (b) is bypassed).
+    # These pin the win-token branch the prior reconstruction never exercised.
+    win_token_probes = [
+        "under_contract", "onboarded", "signed", "published",
+        "converted", "paid", "delivered", "completed", "approved",
+    ]
+    for o in win_token_probes:
+        # declared as a terminal_state (path c reachable) -> credits at base.
+        base_declared = base_conversion(o, [o])
+        assert kb._terminal_outcome_is_conversion(o, [o], None) is base_declared, o
+        assert kb._terminal_outcome_is_conversion(o, [o], {}) is base_declared, o
+        assert base_declared is True, (
+            f"sanity: {o!r} must be a win token via the real detector"
+        )
+        # NOT declared (path c unreachable) -> no 'won' substring -> no credit.
+        base_undeclared = base_conversion(o, [])
+        assert kb._terminal_outcome_is_conversion(o, [], None) is base_undeclared, o
+        assert base_undeclared is False, (
+            f"sanity: {o!r} must NOT credit when it is not a declared terminal"
+        )
 
 
 @pytest.mark.parametrize(
@@ -1259,3 +1296,527 @@ def test_fix8_max_defers_alias(fresh_home):
                 break
             t += cadence
         assert terminated
+
+
+# ===========================================================================
+# ROUND-2 RED-TEAM FIXES (regression tests: each fails-without / passes-with).
+# ===========================================================================
+
+
+# --- FIX 1: mixed-case persisted side_effect_class vs lowercased policy --------
+
+
+@pytest.mark.parametrize("policy_field", ["forbidden", "approval_required"])
+def test_r2_fix1_legacy_mixed_case_row_keeps_its_safety_gate(fresh_home, policy_field):
+    """ROUND-2 FIX 1: a LEGACY schedule row whose ``side_effect_class`` was
+    persisted verbatim (mixed-case, e.g. 'External_Irreversible') must STILL be
+    caught by a lower-cased forbidden / approval_required policy entry after
+    upgrade. ``reactive_tick`` lower-cases the policy sets, so it must also
+    coalesce+lower-case the RAW row value at read -- otherwise the gate flips
+    blocked->fired / deferred->fired on the two most dangerous controls with no
+    flag.
+
+    Mutation check (revert FIX 1): read ``side_effect_class = row[...] or 'none'``
+    raw (no .lower()) and the lowercased policy set {external_irreversible} no
+    longer contains 'External_Irreversible' -> the loop FIRES, failing the
+    blocked/deferred assertions here.
+    """
+    contract = _strict_contract("external_irreversible", strict=False)
+    contract["side_effect_policy"][policy_field] = ["external_irreversible"]
+    if policy_field == "approval_required":
+        contract["approval_gates"] = [
+            {"key": "owner_ei", "required_before": ["external_irreversible"]}
+        ]
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        # Simulate a row persisted by PRE-upgrade code: verbatim mixed-case class.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE reactive_timer_schedules SET side_effect_class = ? WHERE id = ?",
+                ("External_Irreversible", int(row["id"])),
+            )
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
+        assert res["fired"] == [], (
+            "a mixed-case legacy row must NOT fire when its lowercased class is "
+            f"in the policy {policy_field} set"
+        )
+        if policy_field == "forbidden":
+            assert res["stopped"] == [
+                {"loop_key": "seller_follow_up", "reason": "side_effect_forbidden"}
+            ]
+        else:
+            assert res["deferred"] == [
+                {"loop_key": "seller_follow_up", "reason": "approval_required"}
+            ]
+
+
+def test_r2_fix1_mixed_case_row_not_in_policy_still_fires(fresh_home):
+    """ROUND-2 FIX 1 control: a mixed-case row whose lowercased class is NOT in
+    any policy set still fires (the read-time normalization does not over-block;
+    it only makes the policy comparison share one vocabulary)."""
+    contract = _strict_contract("none", strict=False)
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE reactive_timer_schedules SET side_effect_class = ? WHERE id = ?",
+                ("Internal", int(row["id"])),  # mixed-case, benign, not in policy
+            )
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
+        assert res["fired"] == [{"loop_key": "seller_follow_up", "nudge": 1}]
+
+
+# --- FIX 2: unicode-digit / negative-string bounds -----------------------------
+
+
+@pytest.mark.parametrize("bad", ["³", "①", "²"])  # superscript-3, circled-1, superscript-2
+def test_r2_fix2_isdigit_true_int_false_does_not_crash(bad):
+    """ROUND-2 FIX 2: a string where ``str.isdigit()`` is True but ``int()``
+    raises (superscript/circled digits) must NOT crash ``_coerce_int`` (which the
+    per-loop compile would swallow, silently dropping the watcher). It returns
+    None (treated as no usable bound).
+
+    Mutation check (revert FIX 2): the old ``...isdigit()`` gate admits these and
+    the unguarded ``int()`` raises ValueError -- this assertion would surface the
+    crash instead of None.
+    """
+    assert rt._coerce_int(bad) is None
+    assert rt.loop_max_defers({"max_defers": bad}) is None
+    assert rt.loop_max_nudges({"max_nudges": bad}) is None
+
+
+def test_r2_fix2_arabic_indic_digit_not_silently_coerced():
+    """ROUND-2 FIX 2: '٣' (Arabic-Indic 3) -- which int() DOES parse to 3 --
+    must NOT be silently accepted as a bound (the gate is ASCII-narrowed)."""
+    assert rt._coerce_int("٣") is None
+    assert rt.loop_max_defers({"max_defers": "٣"}) is None
+
+
+def test_r2_fix2_loop_not_silently_dropped_on_unicode_digit_bound(fresh_home):
+    """ROUND-2 FIX 2 (effect): a loop declaring ``max_defers: '³'`` must NOT
+    silently vanish at compile -- the board still registers the timer schedule
+    (treated as no bound), AND intake flags the malformed bound.
+
+    Mutation check (revert FIX 2): the compile path raises on int('³'), the
+    per-loop compile swallows it, and 0 schedule rows exist -> the row-count
+    assertion fails.
+    """
+    loop = {
+        "key": "seller_follow_up",
+        "type": "seller_follow_up",
+        "entity": "conversation_thread",
+        "triggers": [{"kind": "timer", "detail": "x", "cadence_hours": 72}],
+        "terminal_states": ["won", "lost"],
+        "max_nudges": 5,
+        "max_defers": "³",
+    }
+    contract = _contract(event_loops=[loop])
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        rows = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchall()
+        assert len(rows) == 1, "the loop must still compile (not silently dropped)"
+        assert rows[0]["max_defers"] is None  # not a usable bound -> unbounded
+    report = inv.check_contract_invariants(contract)
+    assert any("max_defers" in e and "non-negative integer bound" in e
+               for e in report.errors), "intake must flag max_defers='³'"
+
+
+@pytest.mark.parametrize("neg", ["-1", "-5"])
+def test_r2_fix2_negative_string_bound_flagged_at_intake(neg):
+    """ROUND-2 FIX 2 (folds in the LOW): a NEGATIVE string bound ('-1') must be
+    flagged at intake like the integer -1 already is -- the runtime coerces it to
+    a negative int then drops the cap (unbounded), so intake must not bless it.
+
+    Mutation check (revert FIX 2 intake narrowing): the old
+    ``not val.strip().lstrip('-').isdigit()`` returns False for '-1' (treats it as
+    OK), so no error is emitted -- this assertion fails.
+    """
+    report = inv.check_contract_invariants(
+        _invariant_contract(_invariant_loop(max_defers=neg))
+    )
+    assert any("max_defers" in e and "non-negative integer bound" in e
+               for e in report.errors), f"intake must flag max_defers={neg!r}"
+    # And the runtime really does drop the cap (the divergence the flag closes).
+    assert rt.loop_max_defers({"max_defers": neg}) is None
+
+
+def test_r2_fix2_intake_and_runtime_agree_on_unicode_digit():
+    """ROUND-2 FIX 2: intake and runtime now agree -- '³' is flagged at intake
+    AND coerces to None at runtime (neither silently accepts nor crashes)."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(_invariant_loop(max_defers="³"))
+    )
+    assert any("max_defers" in e for e in report.errors)
+    assert rt.loop_max_defers({"max_defers": "³"}) is None
+    assert inv._coerce_nonneg_int("³") is None
+    assert inv._coerce_nonneg_int("٣") is None  # Arabic-Indic also narrowed
+
+
+# --- FIX 3: opted-in but dropped declaration fails CLOSED (no substring) --------
+
+
+def test_r2_fix3_opted_in_dropped_class_fails_closed_no_substring(fresh_home):
+    """ROUND-2 FIX 3: an OPTED-IN loop whose declared win class is unknown and
+    dropped by the grammar (``terminal_classes={closed_won:'victory'}``) must NOT
+    silently revert to the legacy 'won'-substring path. The compile persists the
+    dropped-declaration marker, the reward rail fails CLOSED (credit 0.0), and a
+    loud error signal is emitted -- it must not credit a 'won'-embedding outcome.
+
+    Mutation check (revert FIX 3): compile persists NULL terminal_classes (the
+    dropped map looks like 'never opted in'), the reward rail uses the substring
+    path, and a 'closed_won' outcome credits 1.0 -- failing the no-credit
+    assertion here.
+    """
+    _approve(
+        "serious",
+        _declared_class_contract(
+            terminal_states=["closed_won"],
+            terminal_classes={"closed_won": "victory"},  # unknown class -> dropped
+        ),
+    )
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        # FIX 3: the WHOLE declaration was dropped (no class survived), so compile
+        # persists the fail-closed marker, NOT NULL (which would read as 'never
+        # opted in' -> substring path).
+        assert row["terminal_classes"] == kb._TERMINAL_CLASSES_DROPPED_DB_MARKER
+        # 'closed_won' embeds 'won' -- the substring path WOULD credit it. The
+        # fail-closed path must NOT.
+        outcomes = _resolve_and_close(conn, "closed_won")
+        assert not _credited(outcomes), (
+            "an opted-in loop with a dropped win class must fail CLOSED, not "
+            "credit via the substring fallback"
+        )
+        errs = conn.execute(
+            "SELECT COUNT(*) AS n FROM board_signals WHERE board = ? AND "
+            "primitive_kind = 'dispatch_blocked' AND reward_kind = 'error'",
+            ("serious",),
+        ).fetchone()
+        assert int(errs["n"]) >= 1, "a dropped declaration must emit a loud error signal"
+
+
+def test_r2_fix3_partial_survival_win_dropped_does_not_credit_via_substring(fresh_home):
+    """ROUND-2 FIX 3 (partial survival): a loop where the WIN class is dropped
+    (unknown 'victory') but a LOSS class survives keeps a NON-EMPTY declared map,
+    so the substring path is already suppressed -- a 'won'-embedding outcome does
+    NOT credit a conversion (the declared path returns False for a non-'win'
+    state). This documents that even the partial-drop case never reverts to the
+    substring guess.
+    """
+    _approve(
+        "serious",
+        _declared_class_contract(
+            terminal_states=["closed_won", "closed_lost"],
+            terminal_classes={"closed_won": "victory", "closed_lost": "loss"},
+        ),
+    )
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        # A valid loss survived -> non-empty map persisted (substring suppressed).
+        assert json.loads(row["terminal_classes"]) == {"closed_lost": "loss"}
+        # 'closed_won' is not a declared 'win' -> no conversion credit (no
+        # substring fallback even though it embeds 'won').
+        assert not _credited(_resolve_and_close(conn, "closed_won"))
+
+
+def test_r2_fix3_non_opted_in_loop_is_byte_identical_legacy(fresh_home):
+    """ROUND-2 FIX 3 control: a NULL (non-opted-in) loop is byte-identical legacy
+    -- compile persists NULL terminal_classes and the substring path credits a
+    'won' outcome. The fail-closed marker fires ONLY for an opted-in-but-dropped
+    loop, never for a legacy loop."""
+    _approve("serious", _contract())  # legacy loop, no terminal_classes
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        assert row["terminal_classes"] is None
+        assert _credited(_resolve_and_close(conn, "won"))
+
+
+def test_r2_fix3_compile_helper_classifies_the_three_cases():
+    """ROUND-2 FIX 3 unit: ``loop_terminal_classes_for_compile`` returns None (not
+    opted in), the map (valid opt-in), or the dropped sentinel (opted-in but no
+    class survived)."""
+    assert rt.loop_terminal_classes_for_compile({"entity": "x"}) is None
+    assert rt.loop_terminal_classes_for_compile(
+        {"terminal_classes": {"closed_won": "win"}}
+    ) == {"closed_won": "win"}
+    assert rt.loop_terminal_classes_for_compile(
+        {"terminal_classes": {"closed_won": "victory"}}
+    ) == rt.TERMINAL_CLASSES_DROPPED_SENTINEL
+    # A mixed declaration (one valid class) is NOT fail-closed: the valid map wins.
+    assert rt.loop_terminal_classes_for_compile(
+        {"terminal_classes": {"closed_won": "win", "bad": "victory"}}
+    ) == {"closed_won": "win"}
+    assert grammar.loop_opts_into_terminal_classes(
+        {"terminal_classes": {"closed_won": "victory"}}
+    ) is True
+    assert grammar.loop_opts_into_terminal_classes({"entity": "x"}) is False
+
+
+# --- FIX 4: non-finite (inf) max_defers column fails CLOSED, not crash ----------
+
+
+def test_r2_fix4_inf_max_defers_column_does_not_crash_tick(fresh_home):
+    """ROUND-2 FIX 4: a ``max_defers`` column holding +inf (a REAL-affinity value
+    SQLite can return as a Python float) must fail CLOSED (terminate) instead of
+    raising OverflowError out of ``int()`` and crashing the WHOLE tick.
+
+    Mutation check (revert FIX 4): ``_timer_schedule_max_defers`` catches only
+    (TypeError, ValueError); ``int(float('inf'))`` raises OverflowError, which
+    propagates through ``_defer_timer_schedule`` into the unguarded per-row loop
+    and crashes reactive_tick -- the ``reactive_tick`` call below would raise.
+    """
+    _approve("serious", _deferring_contract(max_defers=1))
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE reactive_timer_schedules SET max_defers = ? WHERE id = ?",
+                (float("inf"), int(row["id"])),
+            )
+        # The tick must not crash; the corrupt-sentinel path fails closed.
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
+        assert res["stopped"] == [
+            {"loop_key": "seller_follow_up", "reason": "deferral_exhausted"}
+        ]
+        assert int(_schedule_row(conn)["active"]) == 0
+
+
+def test_r2_fix4_max_defers_reader_returns_sentinel_for_inf():
+    """ROUND-2 FIX 4 unit: ``_timer_schedule_max_defers`` returns the corrupt
+    sentinel (not an exception) for an inf column value."""
+    class _Row:
+        def __init__(self, v):
+            self._v = v
+        def keys(self):
+            return ["max_defers"]
+        def __getitem__(self, k):
+            return self._v if k == "max_defers" else None
+    assert kb._timer_schedule_max_defers(_Row(float("inf"))) == kb._MAX_DEFERS_CORRUPT
+    assert kb._timer_schedule_max_defers(_Row(float("-inf"))) == kb._MAX_DEFERS_CORRUPT
+    assert kb._timer_schedule_defers_used(_Row(float("inf"))) == 0
+
+
+# --- FIX 5: hash strips launch_intake.invariants; near-miss tightened ----------
+
+
+def test_r2_fix5_invariants_block_stripped_from_contract_hash():
+    """ROUND-2 FIX 5: ``launch_intake.invariants`` (run-derived validator
+    findings) must be stripped from the canonical contract hash, mirroring
+    ``launch_intake.completeness`` -- so two copies of the SAME contract that
+    differ only in their invariants block hash IDENTICALLY.
+
+    Mutation check (revert FIX 5 strip): leave invariants in the hashed payload
+    and the two hashes diverge -- failing the equality assertion here.
+    """
+    base = _contract()
+    with_clean = dict(base)
+    with_clean["launch_intake"] = {"invariants": {"ok": True, "errors": [], "warnings": []}}
+    with_findings = dict(base)
+    with_findings["launch_intake"] = {
+        "invariants": {"ok": False, "errors": ["something"], "warnings": ["a typo"]}
+    }
+    assert kb._business_contract_hash(with_clean) == kb._business_contract_hash(with_findings)
+    # And a contract with NO launch_intake hashes the same as one whose only
+    # launch_intake content is the (stripped) invariants block.
+    assert kb._business_contract_hash(base) == kb._business_contract_hash(with_clean)
+
+
+def test_r2_fix5_legacy_contract_with_common_max_key_hashes_identically():
+    """ROUND-2 FIX 5 (effect): a legacy contract carrying a common ``max_*`` loop
+    key (e.g. ``max_followers`` -- plausible in the ninaxfinds-growth context)
+    must hash IDENTICALLY base-vs-HEAD. With the strip in place, even if a
+    HEAD-only near-miss warning landed in the invariants block, it is stripped
+    before hashing; AND the tightened near-miss no longer cries wolf on
+    ``max_followers``/``max_depth``."""
+    loop = _invariant_loop(max_followers=3, max_depth=2)
+    contract = _invariant_contract(loop)
+    report = inv.check_contract_invariants(contract)
+    # The tightened near-miss must NOT flag these legit keys.
+    assert not any("max_followers" in w for w in report.warnings)
+    assert not any("max_depth" in w for w in report.warnings)
+    # And a synthesized invariants block does not perturb the hash regardless.
+    c1 = dict(contract)
+    c1["launch_intake"] = {"invariants": report.as_dict()}
+    c2 = dict(contract)  # no invariants block at all
+    assert kb._business_contract_hash(c1) == kb._business_contract_hash(c2)
+
+
+def test_r2_fix5_strict_case_variant_surfaces_near_miss_and_is_honored(fresh_home):
+    """ROUND-2 FIX 5: a CASE-VARIANT strict opt-in ('Strict') is (a) HONORED at
+    runtime (the key case is canonicalized) and (b) surfaced as a near-miss at
+    intake -- previously it was silently inert AND escaped the warning.
+
+    Mutation check (revert the case canonicalization): ``Strict`` resolves to
+    strict=False and the unrecognized-class loop FIRES instead of deferring."""
+    # (a) intake surfaces it.
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(terminal_classes={"closed_won": "win", "closed_lost": "loss"}),
+            policy={"allowed": ["none"], "Strict": True},
+        )
+    )
+    assert any("strict" in w.lower() for w in report.warnings), (
+        "a case-variant 'Strict' must surface at intake"
+    )
+    # (b) runtime honors it (strict enforcement is ON for a capitalized opt-in).
+    assert kb._side_effect_strict_enabled({"Strict": True}) is True
+    assert kb._side_effect_strict_enabled({"STRICT": True}) is True
+    assert kb._side_effect_strict_enabled({"strict": True}) is True
+    assert kb._side_effect_strict_enabled({"strict": False}) is False
+    # Effect: a capitalized opt-in really enforces (unrecognized class defers).
+    contract = _strict_contract("extrnal_ireversible", strict=False)
+    contract["side_effect_policy"]["Strict"] = True  # capitalized opt-in
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
+        assert res["fired"] == [], "a capitalized 'Strict' opt-in must enforce"
+        assert res["deferred"] == [
+            {"loop_key": "seller_follow_up", "reason": "side_effect_unrecognized_strict"}
+        ]
+
+
+def test_r2_fix5_strikt_typo_surfaces_near_miss():
+    """ROUND-2 FIX 5: a real typo 'strikt' surfaces a near-miss (the old detector
+    missed it)."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(terminal_classes={"closed_won": "win", "closed_lost": "loss"}),
+            policy={"allowed": ["none"], "strikt": True},
+        )
+    )
+    assert any("strict" in w and "typo" in w for w in report.warnings)
+
+
+@pytest.mark.parametrize("benign", ["max_depth", "max_delay", "max_followers", "max_results"])
+def test_r2_fix5_near_miss_does_not_cry_wolf_on_legit_keys(benign):
+    """ROUND-2 FIX 5: the tightened near-miss must NOT flag legitimate unrelated
+    loop keys (no false-positive 'typo' warning).
+
+    Mutation check (revert to the startswith(r[:6]) rule): these keys would each
+    produce a spurious 'looks like a typo' warning -- failing this assertion."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(_invariant_loop(**{benign: 3}))
+    )
+    assert not any("typo" in w for w in report.warnings), (
+        f"{benign} must not be flagged as a near-miss typo"
+    )
+
+
+# --- FIX 6: migration effect-level test + self-protecting sentinel --------------
+
+
+def test_r2_fix6_migration_adds_columns_and_legacy_row_reads_defaults(fresh_home):
+    """ROUND-2 FIX 6: a PRE-step-9 ``reactive_timer_schedules`` table (without the
+    3 new columns) must, after board init/migration, (a) gain the columns, (b)
+    read a legacy row as max_defers=NULL / terminal_classes=NULL / defers_used=0,
+    and (c) reactive_tick on the migrated mixed-case row is byte-identical to a
+    legacy unbounded substring loop (covers BOTH the migration AND FIX 1).
+
+    Every other test uses the fresh CREATE-TABLE DDL, so the additive ALTER path
+    was previously unexercised. This drives it directly.
+    """
+    # Start a real board so the rest of the schema/migration deps exist, then
+    # DROP and re-create reactive_timer_schedules WITHOUT the 3 new columns to
+    # simulate a pre-step-9 table, insert a legacy mixed-case row, and re-run the
+    # additive migration.
+    _approve("serious", _strict_contract("none", strict=False))
+    with kb.connect(board="serious") as conn:
+        with kb.write_txn(conn):
+            conn.execute("DROP TABLE reactive_timer_schedules")
+            # Pre-step-9 shape: no terminal_classes / max_defers / defers_used.
+            conn.execute(
+                """
+                CREATE TABLE reactive_timer_schedules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    board TEXT NOT NULL,
+                    loop_key TEXT NOT NULL,
+                    entity_id TEXT,
+                    task_id TEXT,
+                    trigger_type TEXT,
+                    trigger_key TEXT,
+                    cadence_seconds INTEGER NOT NULL,
+                    next_fire_at INTEGER NOT NULL,
+                    nudges_used INTEGER NOT NULL DEFAULT 0,
+                    max_nudges INTEGER,
+                    side_effect_class TEXT,
+                    action TEXT,
+                    terminal_states TEXT,
+                    stop_conditions TEXT,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    last_fired_at INTEGER,
+                    stop_reason TEXT
+                )
+                """
+            )
+            # A legacy row with a VERBATIM mixed-case side_effect_class.
+            conn.execute(
+                """
+                INSERT INTO reactive_timer_schedules
+                    (board, loop_key, cadence_seconds, next_fire_at, nudges_used,
+                     max_nudges, side_effect_class, terminal_states, active,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, 0, 5, ?, ?, 1, 0, 0)
+                """,
+                (
+                    "serious", "legacy_loop", 72 * 3600, 1_000,
+                    "External_Irreversible",
+                    json.dumps(["won", "lost"]),
+                ),
+            )
+        # Sanity: the new columns are absent BEFORE migration.
+        pre_cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(reactive_timer_schedules)")}
+        assert "terminal_classes" not in pre_cols
+        assert "max_defers" not in pre_cols
+        assert "defers_used" not in pre_cols
+
+        # Run the additive migration directly.
+        kb._migrate_add_optional_columns(conn)
+
+        post_cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(reactive_timer_schedules)")}
+        assert {"terminal_classes", "max_defers", "defers_used"} <= post_cols, (
+            "the migration must add the 3 new columns"
+        )
+        migrated = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE loop_key = 'legacy_loop'"
+        ).fetchone()
+        # (b) legacy defaults.
+        assert migrated["max_defers"] is None
+        assert migrated["terminal_classes"] is None
+        assert int(migrated["defers_used"]) == 0
+        # FIX 1 belt-and-suspenders backfill: the verbatim mixed-case class was
+        # lower-cased in place by the one-time UPDATE migration.
+        assert migrated["side_effect_class"] == "external_irreversible"
+
+        # (c) reactive_tick on the migrated row is byte-identical legacy: with no
+        # policy match and no strict, the loop FIRES (legacy unbounded behavior).
+        res = kb.reactive_tick(conn, now=int(migrated["next_fire_at"]), board="serious")
+        assert {"loop_key": "legacy_loop", "nudge": 1} in res["fired"]
+
+
+def test_r2_fix6_terminal_classes_sentinel_is_self_protecting():
+    """ROUND-2 FIX 6: the corrupt/dropped sentinel is a DISTINCT non-dict marker
+    recognized INSIDE ``_terminal_outcome_is_conversion`` (isinstance), so a
+    direct call -- forgetting the caller's identity check -- still fails CLOSED.
+
+    Mutation check (revert to the empty-dict {} sentinel): an empty dict is FALSY,
+    so ``if declared_terminal_classes:`` is skipped and the call falls through to
+    the substring path -- ``_terminal_outcome_is_conversion('closed_won', [],
+    sentinel)`` would return True (fail OPEN), failing this assertion.
+    """
+    sentinel = kb._TERMINAL_CLASSES_CORRUPT
+    assert isinstance(sentinel, kb._TerminalClassesCorrupt)
+    # A direct call with the sentinel fails CLOSED for ANY outcome, even a
+    # 'won'-embedding one that the substring path would credit.
+    assert kb._terminal_outcome_is_conversion("closed_won", [], sentinel) is False
+    assert kb._terminal_outcome_is_conversion("won", ["won"], sentinel) is False
+    # Identity check the production caller relies on still works.
+    assert sentinel is kb._TERMINAL_CLASSES_CORRUPT

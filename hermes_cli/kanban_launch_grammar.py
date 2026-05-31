@@ -319,6 +319,37 @@ def loop_declared_terminal_classes(loop: Any) -> dict[str, str]:
                 out[s] = c
     return out
 
+
+def loop_opts_into_terminal_classes(loop: Any) -> bool:
+    """True iff a loop DECLARED a terminal-outcome class (opted into 9b).
+
+    FIX 3 (round-2): opt-in is the PRESENCE of a class declaration, not whether
+    the declared classes are valid. ``loop_declared_terminal_classes`` silently
+    DROPS an unknown class (a fat-fingered ``victory`` instead of ``win``), so an
+    opted-in-but-malformed loop yields an EMPTY map indistinguishable from a loop
+    that never opted in -- which the reward rail would treat as the legacy
+    substring path (fail-OPEN). This predicate lets the caller detect that case:
+    if the loop opted in (this is True) but ``loop_declared_terminal_classes`` is
+    empty / carries no ``win``, the declaration was dropped and the loop must fail
+    CLOSED instead of reverting to substring inference.
+
+    Opt-in = a non-empty ``terminal_classes`` map, OR a ``terminal_states`` /
+    ``terminal_state`` list item that carries a ``class`` / ``kind`` KEY (even if
+    its value is unknown/empty -- a present-but-bad class is still an opt-in).
+    """
+    if not isinstance(loop, dict):
+        return False
+    classes_map = loop.get("terminal_classes")
+    if isinstance(classes_map, dict) and len(classes_map) > 0:
+        return True
+    for src in ("terminal_states", "terminal_state"):
+        items = loop.get(src)
+        if isinstance(items, (list, tuple)):
+            for item in items:
+                if isinstance(item, dict) and ("class" in item or "kind" in item):
+                    return True
+    return False
+
 # Reply-style tokens: an external party is responding to us, so the stage models
 # an ongoing conversation that must be watched. Kept tight to reply words so a
 # free-text trigger that merely contains the noun "message" or "call" (e.g.

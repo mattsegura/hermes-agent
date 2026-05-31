@@ -34,7 +34,18 @@ from typing import Any, Optional
 # imports), so this cannot introduce a circular import.
 from hermes_cli.kanban_launch_grammar import (
     loop_declared_terminal_classes as _grammar_loop_declared_terminal_classes,
+    loop_opts_into_terminal_classes as _grammar_loop_opts_into_terminal_classes,
 )
+
+#: FIX 3 (round-2) compile-time fail-CLOSED marker. ``loop_terminal_classes_for_compile``
+#: returns this (a distinct str sentinel, NOT a dict and NOT None) when a loop
+#: OPTED IN to declared terminal classes but its declaration carried NO surviving
+#: ``win`` class (every declared class was unknown and dropped by the grammar).
+#: Such a loop must NOT silently revert to the legacy 'won'-substring reward path
+#: -- the compile path persists this marker so the read-back / reward rail fails
+#: CLOSED (credits 0.0, non-conversion) and emits a loud error, instead of
+#: crediting on a substring guess the loop opted in precisely to suppress.
+TERMINAL_CLASSES_DROPPED_SENTINEL: str = "__terminal_classes_dropped__"
 
 # --------------------------------------------------------------------------
 # Untrusted-inbound sanitization boundary.
@@ -313,8 +324,26 @@ def _coerce_int(value: Any) -> Optional[int]:
         return int(value)
     if isinstance(value, int):
         return int(value)
-    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
-        return int(value.strip())
+    if isinstance(value, str):
+        # FIX 2 (round-2): str.isdigit() is True for unicode chars that int()
+        # REJECTS (superscript '³', circled '①'), so the old gate
+        # ``value.strip().lstrip('-').isdigit()`` admitted a string that then
+        # crashed the unguarded ``int(...)`` -- the per-loop compile swallowed
+        # that (``except Exception``), SILENTLY dropping the whole watcher (board
+        # activated with 0 schedules for that loop). It also ACCEPTED other
+        # unicode-digit forms int() does parse ('٣' Arabic-Indic 3 -> 3),
+        # silently coercing a non-ASCII bound. Narrow the gate to ASCII digits so
+        # only a plain ASCII integer string is a usable bound, AND wrap int() in
+        # try/except as belt-and-suspenders so no isdigit()-True/int()-False edge
+        # can ever crash this primitive again. The matching narrowing lives in
+        # invariants._coerce_nonneg_int / _check_loop_bound_values so intake and
+        # runtime agree on what is a usable bound.
+        stripped = value.strip()
+        if stripped.lstrip("-").isascii() and stripped.lstrip("-").isdigit():
+            try:
+                return int(stripped)
+            except (ValueError, OverflowError):
+                return None
     return None
 
 
@@ -382,6 +411,44 @@ def loop_declared_terminal_classes(loop: dict) -> dict[str, str]:
     ``kanban_launch_invariants`` does for ``TERMINAL_OUTCOME_CLASSES``.
     """
     return _grammar_loop_declared_terminal_classes(loop)
+
+
+def loop_terminal_classes_for_compile(loop: dict):
+    """Resolve what to PERSIST in a schedule row's ``terminal_classes`` column.
+
+    FIX 3 (round-2) fail-CLOSED at compile. Three outcomes:
+
+    * **Not opted in** -> ``None``. The loop declared no class; the schedule row
+      keeps a NULL column and the reward rail uses the byte-identical legacy
+      substring path. (Unchanged from base for every legacy loop.)
+    * **Opted in, declaration survives** -> the ``{state: class}`` map. The reward
+      rail is governed ONLY by the declared closed-vocabulary map.
+    * **Opted in, but the WHOLE declaration was dropped** -> the
+      :data:`TERMINAL_CLASSES_DROPPED_SENTINEL`. The loop DID opt in (it carried a
+      class declaration), but every declared class was unknown/dropped by the
+      grammar (e.g. ``terminal_classes={closed_won: 'victory'}``), so the declared
+      map is empty -- there is no valid ``win`` to credit. Persisting this
+      sentinel makes the read-back fail CLOSED (credit 0.0 + loud error) rather
+      than silently reverting to the 'won' substring path the loop opted in to
+      suppress. The matching intake invariant (``_check_loop_terminal_classes``)
+      already ERRORS on this shape; this is the runtime belt that holds even on a
+      path that reaches compile without the intake gate (the default-off
+      completeness posture).
+
+    Note: a loop that opts in WITH at least one valid class still returns the
+    (filtered) map -- any sibling unknown classes are dropped as before, but the
+    loop is not fail-closed because the declared map is non-empty (the substring
+    path is already suppressed). The fail-closed marker fires ONLY when the loop
+    opted in yet NOTHING valid survived.
+    """
+    declared = _grammar_loop_declared_terminal_classes(loop)
+    if declared:
+        return declared
+    # Empty declared map: either the loop never opted in (legacy, -> None) or it
+    # opted in but every class was dropped (fail CLOSED).
+    if _grammar_loop_opts_into_terminal_classes(loop):
+        return TERMINAL_CLASSES_DROPPED_SENTINEL
+    return None
 
 
 def loop_max_defers(loop: dict) -> Optional[int]:

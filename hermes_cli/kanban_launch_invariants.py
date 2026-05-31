@@ -246,8 +246,18 @@ def _coerce_nonneg_int(value: Any) -> Optional[int]:
         return value if value >= 0 else None
     if isinstance(value, float) and value.is_integer():
         return int(value) if value >= 0 else None
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
+    if isinstance(value, str):
+        # FIX 2 (round-2): mirror kanban_reactive_runtime._coerce_int -- str
+        # .isdigit() admits unicode chars int() rejects ('³','①') and accepts
+        # non-ASCII digit forms int() does parse ('٣' -> 3), so intake and the
+        # runtime disagreed on what counts as a usable bound. Narrow to ASCII
+        # digits and wrap int() so this stays a non-negative-int coercion only.
+        stripped = value.strip()
+        if stripped.isascii() and stripped.isdigit():
+            try:
+                return int(stripped)
+            except (ValueError, OverflowError):
+                return None
     return None
 
 
@@ -380,25 +390,113 @@ _RECOGNIZED_MAX_NUDGES_KEYS: frozenset[str] = frozenset(
 )
 
 
+def _edit_distance(a: str, b: str, *, cap: int) -> int:
+    """Levenshtein distance between ``a`` and ``b``, short-circuited at ``cap``+1.
+
+    Returns ``cap + 1`` as soon as the distance is known to exceed ``cap`` so the
+    near-miss test below stays cheap and is a TRUE bounded-edit-distance check
+    (not a substring/shared-prefix guess, which over- and under-matched).
+    """
+    if a == b:
+        return 0
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        row_min = i
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            v = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            cur.append(v)
+            if v < row_min:
+                row_min = v
+        if row_min > cap:
+            return cap + 1
+        prev = cur
+    return prev[-1]
+
+
+#: FIX 5 (round-2): a small CLOSED set of KNOWN aliases/typos for each safety
+#: opt-in key. Declare-don't-infer: instead of guessing intent from a substring
+#: similarity score (which simultaneously matched unrelated ``max_depth`` /
+#: ``max_followers`` and MISSED real typos like ``strikt``), we enumerate the
+#: handful of plausible misspellings/aliases for each recognized key. A key is a
+#: near-miss only if it is in this set OR within a tight edit distance of a
+#: recognized key -- never merely because it shares a 6-char prefix.
+_KNOWN_KEY_ALIASES: dict[str, frozenset[str]] = {
+    "strict": frozenset({
+        "strict", "strikt", "stict", "stirct", "stricct", "stricr",
+        "strict_mode", "strictmode", "strict_enabled", "strict_enforcement",
+        "is_strict", "enforce_strict", "strictly", "strcit", "default_deny",
+        "default_deny_mode",
+    }),
+    "max_defers": frozenset({
+        "max_defers", "max_deferals", "max_deferrals", "max_deferals_",
+        "max_defer", "maxdefers", "max_deffers", "max_defferals", "defer_max",
+        "defers_max", "max_deferral", "deferral_cap", "defer_cap", "max_defrs",
+    }),
+    "max_deferrals": frozenset({
+        "max_deferrals", "max_deferals", "max_defers", "max_deferral",
+        "maxdeferrals", "deferral_cap",
+    }),
+    "max_defer": frozenset({"max_defer", "max_defers", "max_deferals"}),
+    "max_nudges": frozenset({
+        "max_nudges", "max_nudge", "maxnudges", "max_nudgs", "nudge_max",
+        "nudges_max", "max_nudg", "nudge_cap", "max_nudges_",
+    }),
+    "max_follow_ups": frozenset({
+        "max_follow_ups", "max_followups", "max_follow_up", "max_followup",
+        "maxfollowups", "max_follwups", "max_followp",
+    }),
+    "max_followups": frozenset({
+        "max_followups", "max_follow_ups", "max_followup", "max_follow_up",
+    }),
+    "max_retries": frozenset({
+        "max_retries", "max_retry", "max_retrys", "maxretries", "max_reties",
+        "max_retires", "retry_max", "retries_max", "retry_cap",
+    }),
+}
+
+
 def _near_miss(key: str, recognized: frozenset[str]) -> Optional[str]:
     """Return the recognized key a near-miss ``key`` most likely meant, else None.
 
-    A "near miss" is an UNRECOGNIZED key that is a small edit away from a
-    recognized one (a shared prefix or a one/two character difference). Used to
-    surface a typo'd safety opt-in (``strict_mode`` for ``strict``,
-    ``max_deferals`` for ``max_defers``) instead of leaving it silently inert.
+    FIX 5 (round-2): a "near miss" is an UNRECOGNIZED key that is EITHER a known
+    alias/typo of a recognized key (a CLOSED, enumerated set) OR within a tight
+    bounded edit distance of it. The previous ``startswith(r[:6])`` /
+    substring-containment rule was an infer-from-strings heuristic that was both
+    over-inclusive (legit unrelated keys ``max_depth`` / ``max_delay`` /
+    ``max_followers`` / ``district`` cried wolf) and under-inclusive (real typos
+    ``strikt`` produced nothing). This declare-don't-infer form catches a typo'd
+    safety opt-in (``strict_mode``/``Strict``/``strikt`` for ``strict``,
+    ``max_deferals`` for ``max_defers``) without flagging genuinely unrelated
+    knobs.
     """
     k = key.strip().lower()
     if not k or k in recognized:
         return None
+    # 1) Exact membership of a recognized key's CLOSED alias/typo set.
     for r in recognized:
-        # Shared meaningful prefix (max_defer... / strict...) or a tiny edit
-        # distance: a near-miss the operator almost certainly intended.
-        if k.startswith(r[:6]) or r.startswith(k[:6]) or abs(len(k) - len(r)) <= 2 and (
-            k.replace("_", "") in r.replace("_", "") or r.replace("_", "") in k.replace("_", "")
-        ):
+        aliases = _KNOWN_KEY_ALIASES.get(r)
+        if aliases is not None and k in aliases:
             return r
-    return None
+    # 2) A SINGLE-edit typo of a recognized key (edit distance == 1). The closed
+    # alias set above already covers the common multi-char typos/aliases, so the
+    # distance fallback is deliberately capped at 1: this catches a one-char
+    # dropped/added/substituted typo (``strct`` for ``strict``) WITHOUT matching
+    # an unrelated knob that merely sits two edits away (``max_followers`` is
+    # distance-2 from ``max_followups``; ``max_replies`` is distance-2 from
+    # ``max_retries`` -- both are legitimate keys and must NOT cry wolf). We also
+    # require the SAME first character to avoid matching a different word.
+    best: Optional[tuple[int, str]] = None
+    for r in recognized:
+        if not r or not k or r[0] != k[0]:
+            continue
+        d = _edit_distance(k, r, cap=1)
+        if d == 1 and (best is None or d < best[0]):
+            best = (d, r)
+    return best[1] if best is not None else None
 
 
 def _check_safety_optin_keys(
@@ -443,6 +541,18 @@ def _check_loop_bound_values(
     swallowed it, the board activated with 0 schedules). ``_coerce_int`` now
     guards non-finite floats, so the loop still compiles -- but a malformed bound
     is still a bug, so flag it at intake instead of silently ignoring it.
+
+    FIX 2 (round-2): the string branch must agree with the runtime
+    (``kanban_reactive_runtime._coerce_int``). The old gate
+    ``not val.strip().lstrip('-').isdigit()`` (a) passed unicode-digit chars int()
+    rejects ('³','①') -- blind to the exact input that crashes/silently-drops the
+    watcher at compile -- and (b) passed a NEGATIVE string like '-1' (because
+    ``'-1'.lstrip('-')=='1'.isdigit()`` is True) even though the runtime coerces
+    '-1' to int -1 then requires n>=0, silently dropping the cap (unbounded). A
+    string bound is now BAD unless it round-trips through the same ASCII-narrowed,
+    non-negative coercion the runtime uses -- so '³'/'①' (crash class), '٣'
+    (non-ASCII coercion), and '-1'/'-5' (negative) are all flagged, matching the
+    integer -1 that was already flagged.
     """
     import math as _math
 
@@ -459,7 +569,13 @@ def _check_loop_bound_values(
             elif isinstance(val, (int, float)):
                 bad = val < 0
             elif isinstance(val, str):
-                bad = not val.strip().lstrip("-").isdigit()
+                # A string bound is usable only if it is the SAME thing the
+                # runtime accepts: an ASCII non-negative integer. _coerce_nonneg_int
+                # already encodes that (ASCII-narrowed, int()-guarded, >=0), so a
+                # str that does not coerce to a non-negative int is bad. This flags
+                # '³'/'①' (runtime crash class), '٣' (non-ASCII), and the negative
+                # '-1'/'-5' strings, agreeing with the integer-(-1) flag above.
+                bad = _coerce_nonneg_int(val) is None
             else:
                 bad = val is not None
             if bad:
@@ -478,9 +594,19 @@ def _check_side_effect_policy_keys(
 ) -> None:
     """FIX 7(d): warn on a typo'd ``side_effect_policy.strict`` opt-in.
 
-    ``_side_effect_strict_enabled`` reads EXACTLY ``policy['strict']``. A
-    near-miss key (``strict_mode``) is silently ignored, leaving DEFAULT-DENY
-    enforcement off while the operator believes it is on. Surface the near-miss.
+    A near-miss key (``strict_mode`` / ``strikt``) that the runtime does not read
+    leaves DEFAULT-DENY enforcement off while the operator believes it is on.
+    Surface the near-miss at intake.
+
+    FIX 5 (round-2): also surface a CASE-VARIANT of ``strict`` (``Strict`` /
+    ``STRICT``). The runtime now canonicalizes the key case
+    (``_side_effect_strict_enabled`` lower-cases policy keys), so a capitalized
+    opt-in IS honored -- but a case-variant is still a non-canonical declaration
+    worth flagging so the contract is written in the canonical lower-case form,
+    and a reviewer is never left wondering whether a capitalized key took effect.
+    The previous detector lower-cased the key BEFORE the recognized-set check, so
+    ``'Strict'.lower()=='strict'`` looked recognized and was skipped (no warning) --
+    masking exactly the typo class this check exists to surface.
     """
     policy = _as_dict(root.get("side_effect_policy"))
     _RECOGNIZED_POLICY_KEYS = frozenset(
@@ -488,6 +614,15 @@ def _check_side_effect_policy_keys(
     )
     for key in policy.keys():
         if not isinstance(key, str) or key in _RECOGNIZED_POLICY_KEYS:
+            continue
+        lowered = key.strip().lower()
+        # A pure case-variant of an exact recognized key (e.g. 'Strict').
+        if lowered == "strict":
+            report.warnings.append(
+                f"side_effect_policy declares {key!r} which is a CASE-VARIANT of the "
+                f"DEFAULT-DENY opt-in 'strict'. It is honored (the runtime canonicalizes "
+                f"the key case), but declare it as lower-case 'strict' for clarity."
+            )
             continue
         if _near_miss(key, frozenset({"strict"})):
             report.warnings.append(
