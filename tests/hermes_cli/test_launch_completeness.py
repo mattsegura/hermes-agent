@@ -290,3 +290,200 @@ def test_structural_invariant_errors_are_hard_in_both_modes():
     bad = _base()  # action side_effect_class 'internal' undeclared in side_effect_policy
     assert not assess(bad)["ok"]
     assert not assess(bad, enforce=True)["ok"]
+
+
+# --------------------------------------------------------------------------- #
+# G4 PART 1: typed objective.success entries are first-class scoreable
+# --------------------------------------------------------------------------- #
+
+def _typed_success_entry(**overrides) -> dict:
+    """A well-formed typed success entry (metric+comparator+target+data_source)."""
+    entry = {"metric": "mrr", "comparator": ">=", "target": 12000, "data_source": "Stripe"}
+    entry.update(overrides)
+    return entry
+
+
+def test_typed_success_wellformed_is_scoreable_no_warn():
+    """A typed entry declaring all required keys is machine-gradeable -> the
+    success_scoreability dimension must NOT warn (no prose regex needed)."""
+    c = _base()
+    c["objective"]["success"] = [_typed_success_entry()]
+    r = assess(c)
+    assert not _has(r["warnings"], "success_scoreability"), r["warnings"]
+    assert r["dimensions"]["success_scoreability"]["findings"] == [], r["dimensions"]["success_scoreability"]
+
+
+def test_typed_success_with_optional_baseline_is_scoreable():
+    """The optional ``baseline`` does not affect scoreability."""
+    c = _base()
+    c["objective"]["success"] = [_typed_success_entry(baseline=4000)]
+    r = assess(c)
+    assert not _has(r["warnings"], "success_scoreability"), r["warnings"]
+
+
+def test_typed_success_missing_keys_warns_and_names_them():
+    """A typed entry missing required keys is NOT scoreable; the finding must name
+    exactly which required keys are absent."""
+    c = _base()
+    c["objective"]["success"] = [{"metric": "mrr", "comparator": ">="}]  # no target/data_source
+    r = assess(c)
+    assert _has(r["warnings"], "success_scoreability"), r["warnings"]
+    finding = " ".join(r["dimensions"]["success_scoreability"]["findings"])
+    assert "target" in finding and "data_source" in finding, finding
+    assert "missing required key" in finding, finding
+
+
+def test_typed_success_missing_keys_promoted_in_enforce_mode():
+    """Under enforce, a malformed typed entry becomes a hard error (fail closed)."""
+    c = _base()
+    c["objective"]["success"] = [{"metric": "mrr"}]  # only metric -> not scoreable
+    report = assess(c)
+    enforced = assess(copy.deepcopy(c), enforce=True)
+    assert _has(report["warnings"], "success_scoreability"), report["warnings"]
+    assert not enforced["ok"], "enforce must fail closed on a malformed typed success"
+    assert _has(enforced["errors"], "success_scoreability"), enforced["errors"]
+
+
+def test_mixed_prose_and_typed_success_each_judged_on_its_own():
+    """A list mixing a measurable prose string and a well-formed typed entry is
+    fully scoreable; swapping the prose for vacuous text warns on the prose only."""
+    c = _base()
+    c["objective"]["success"] = ["MRR to $12k by day 7", _typed_success_entry(metric="subs")]
+    assert not _has(assess(c)["warnings"], "success_scoreability"), assess(c)["warnings"]
+    c["objective"]["success"] = ["do a great job", _typed_success_entry(metric="subs")]
+    assert _has(assess(c)["warnings"], "success_scoreability"), assess(c)["warnings"]
+
+
+def test_string_success_behavior_unchanged():
+    """Byte-compatibility guard: a measurable prose string is still scoreable and a
+    vacuous prose string still warns -- the existing regex path is untouched."""
+    measurable = _base()  # success already 'MRR to $12k by day 7'
+    assert not _has(assess(measurable)["warnings"], "success_scoreability")
+    vacuous = _base(); vacuous["objective"]["success"] = ["close some deals"]
+    assert _has(assess(vacuous)["warnings"], "success_scoreability")
+
+
+def test_typed_success_normalize_roundtrips_strings_byte_identically():
+    """The kanban_db normalizer keeps STRING entries byte-identical (the golden
+    contract guarantee) while preserving a well-formed typed dict entry."""
+    from hermes_cli.kanban_db import normalize_objective_metadata
+
+    strings = ["MRR to $12k by day 7", "close some deals"]
+    out = normalize_objective_metadata({"statement": "x", "success": list(strings)})
+    assert out["success"] == strings  # exact same shape, strings stay strings
+
+    typed = normalize_objective_metadata({
+        "statement": "x",
+        "success": [{"metric": "mrr", "comparator": "at_least", "target": 12000, "data_source": "Stripe"}],
+    })
+    entry = typed["success"][0]
+    assert isinstance(entry, dict)
+    assert entry["comparator"] == ">="  # at_least alias folded to symbol
+    assert entry["metric"] == "mrr" and entry["target"] == 12000 and entry["data_source"] == "Stripe"
+
+
+def test_typed_success_malformed_dict_does_not_raise_and_is_kept():
+    """A malformed typed dict (missing required keys) normalizes WITHOUT raising and
+    is kept as a dict so the spec can flag it (it is not silently dropped)."""
+    from hermes_cli.kanban_db import normalize_objective_metadata
+
+    out = normalize_objective_metadata({"statement": "x", "success": [{"metric": "mrr"}]})
+    assert out["success"] == [{"metric": "mrr"}]
+
+
+# --------------------------------------------------------------------------- #
+# G4 PART 2: side_effect_class default-DENY (missing blocks; 'none' is valid)
+# --------------------------------------------------------------------------- #
+
+def _action_missing_class() -> dict:
+    c = _base()
+    c["workflow"]["stages"][0]["actions"].append({"key": "send_sms", "label": "text the seller"})
+    return c
+
+
+def _action_none_class() -> dict:
+    c = _base()
+    c["workflow"]["stages"][0]["actions"].append({"key": "read_db", "side_effect_class": "none"})
+    return c
+
+
+def test_missing_side_effect_class_is_a_finding():
+    """An action with NO side_effect_class produces a side_effect_class_coverage finding."""
+    r = assess(_action_missing_class())
+    assert _has(r["warnings"], "side_effect_class_coverage"), r["warnings"]
+
+
+def test_none_side_effect_class_is_valid_not_a_finding():
+    """side_effect_class == 'none' is a VALID declared read-only class -> no finding."""
+    r = assess(_action_none_class())
+    findings = " ".join(r["dimensions"]["side_effect_class_coverage"]["findings"])
+    assert "read_db" not in findings, findings
+
+
+def test_missing_side_effect_class_is_default_deny_under_enforce():
+    """Default-DENY: under enforce the missing-class finding becomes a hard error
+    (the existing enforce path achieves default-deny -- no gate rewiring needed)."""
+    c = _action_missing_class()
+    enforced = assess(copy.deepcopy(c), enforce=True)
+    assert not enforced["ok"], "missing side_effect_class must fail closed under enforce"
+    assert _has(enforced["errors"], "side_effect_class_coverage"), enforced["errors"]
+
+
+# --------------------------------------------------------------------------- #
+# H5: answer_coverage report-mode rail (no-op without inputs; never enforced by default)
+# --------------------------------------------------------------------------- #
+
+def test_answer_coverage_is_in_dimensions_tuple():
+    from hermes_cli.launch_completeness import DIMENSIONS
+
+    assert "answer_coverage" in DIMENSIONS
+
+
+def test_answer_coverage_noop_on_clean_contract():
+    """The clean contract carries no embedded intake corpus -> answer_coverage is a
+    strict no-op (present, empty, never warns) and does not regress ok."""
+    r = assess(_clean())
+    assert r["dimensions"]["answer_coverage"]["findings"] == [], r["dimensions"]["answer_coverage"]
+    assert not _has(r["warnings"], "answer_coverage"), r["warnings"]
+    assert r["ok"], r["errors"]
+
+
+def test_answer_coverage_noop_under_enforce_on_clean_contract():
+    """Even if an owner adds answer_coverage to the enforce set, a contract without
+    coverage inputs must not be blocked (no inputs -> no finding -> no error)."""
+    r = assess(_clean(), enforce=True)
+    assert r["dimensions"]["answer_coverage"]["findings"] == []
+    assert r["ok"], r["errors"]
+
+
+@pytest.mark.parametrize("fixture", ["grow_app_one_week.contract.json", "land_wholesaling.contract.json"])
+def test_answer_coverage_noop_on_goldens(fixture):
+    """The stored golden contracts embed no intake answers -> answer_coverage is a
+    no-op on them (the dimension cannot regress an existing golden)."""
+    p = FIXTURES / fixture
+    if not p.exists():
+        pytest.skip(f"fixture {fixture} not present")
+    r = assess(json.loads(p.read_text()))
+    assert r["dimensions"]["answer_coverage"]["findings"] == [], fixture
+    assert not _has(r["warnings"], "answer_coverage"), r["warnings"]
+
+
+def test_answer_coverage_warns_on_weak_embedded_intake():
+    """When a contract embeds a vacuous intake corpus, the coverage scorer fires a
+    REPORT-MODE warning (never auto-promoted; only a finding)."""
+    c = _clean()
+    c["answers"] = {"q1": "do the thing", "q2": "make it good"}
+    c["rough_goal"] = "grow my app"
+    r = assess(c)
+    assert _has(r["warnings"], "answer_coverage"), r["warnings"]
+    # report mode: it is a warning, never a hard error, and ok stays True
+    assert not _has(r["errors"], "answer_coverage"), r["errors"]
+    assert r["ok"], r["errors"]
+
+
+def test_answer_coverage_noop_when_inputs_malformed_does_not_raise():
+    """Defensive: a non-dict answers payload must not raise and must stay a no-op."""
+    c = _clean()
+    c["answers"] = "not a dict"  # no usable corpus
+    r = assess(c)  # must not raise
+    assert r["dimensions"]["answer_coverage"]["findings"] == []

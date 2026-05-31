@@ -45,6 +45,15 @@ try:  # reuse the typed trigger grammar so "conversational" is detected the same
 except Exception:  # pragma: no cover - keep the module loadable if grammar import fails
     _grammar_has_inbound = None  # type: ignore
 
+try:  # the prose-specificity coverage scorer (H5: fold it in as a report-mode rail)
+    from hermes_cli.kanban_launch_coverage import (
+        DEFAULT_PASS_THRESHOLD as _COVERAGE_THRESHOLD,
+        evaluate_launch_intake_coverage as _evaluate_coverage,
+    )
+except Exception:  # pragma: no cover - keep the module loadable if coverage import fails
+    _COVERAGE_THRESHOLD = 0.6  # type: ignore
+    _evaluate_coverage = None  # type: ignore
+
 
 # Canonical dimension keys (worst-first). The dispatch gate enforces a configured
 # SUBSET of these (see kanban_db._launch_completeness_enforced_dimensions); the
@@ -61,6 +70,7 @@ DIMENSIONS: tuple[str, ...] = (
     "tunable_consumer_binding",
     "stage_reachability",
     "distinct_terminals",
+    "answer_coverage",
 )
 
 
@@ -71,8 +81,46 @@ _SCOREABLE_SUCCESS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A TYPED success entry (a dict) is first-class machine-gradeable: it carries the
+# metric, the comparator, the target, and where to read the value. These four
+# keys are the contract between the owner's objective and the scoreboard; a typed
+# entry that declares all four is scoreable WITHOUT any prose regex. Mirrors
+# kanban_db._TYPED_SUCCESS_REQUIRED_KEYS (kept local so this module stays
+# stdlib-only / engine-import-optional).
+_TYPED_SUCCESS_REQUIRED_KEYS: tuple[str, ...] = ("metric", "comparator", "target", "data_source")
+
+
+def _is_typed_success(entry: Any) -> bool:
+    """A success entry is *typed* when it is a dict that declares a ``metric``."""
+    return isinstance(entry, dict) and bool(str(entry.get("metric") or "").strip())
+
+
+def _typed_success_missing_keys(entry: dict) -> list[str]:
+    """Required keys a typed success entry is missing (empty/absent values count
+    as missing). A non-empty result means the entry is NOT scoreable."""
+    missing: list[str] = []
+    for key in _TYPED_SUCCESS_REQUIRED_KEYS:
+        val = entry.get(key)
+        # ``target`` may legitimately be the number 0; only treat None / blank
+        # string as missing, not a falsey-but-present numeric.
+        if val is None:
+            missing.append(key)
+        elif isinstance(val, str) and not val.strip():
+            missing.append(key)
+        elif not isinstance(val, (int, float, str, bool)):
+            missing.append(key)
+    return missing
+
 
 def _is_scoreable(entry: Any) -> bool:
+    """True when an entry can be machine-graded.
+
+    A typed entry (dict with ``metric``) is scoreable iff it declares every
+    required key; a prose string falls back to the existing measurable-target
+    regex heuristic.
+    """
+    if _is_typed_success(entry):
+        return not _typed_success_missing_keys(entry)
     text = str(entry or "").strip()
     return bool(text) and bool(_SCOREABLE_SUCCESS_RE.search(text))
 
@@ -275,6 +323,44 @@ def _proof_artifact_keys(contract: dict) -> set[str]:
     return produced
 
 
+# --- H5: answer_coverage report-mode rail ---------------------------------- #
+# Most contracts at gate time DO NOT carry the owner's raw intake answers, so
+# this dimension is a strict no-op unless the contract explicitly embeds the
+# coverage inputs the scorer needs. When it does (a stored intake snapshot kept
+# under launch_coverage/intake, or a bare top-level answers/rough_goal), we run
+# the deterministic prose-specificity scorer and emit a REPORT-ONLY warning when
+# the corpus scores below the coverage module's own pass threshold. The gate only
+# ever ENFORCES this if an owner adds "answer_coverage" to the enforce set; by
+# default it is advisory, mirroring the report-mode contract of the other
+# net-new dimensions.
+def _coverage_inputs(contract: dict) -> Optional[dict]:
+    """Pull the intake-answer corpus a contract may embed for coverage scoring.
+
+    Returns ``{"answers", "rough_goal", "external_research"}`` when the contract
+    carries usable coverage inputs, else ``None`` (the no-op signal). Looks under
+    a stored ``launch_coverage``/``intake`` snapshot first, then a bare top-level
+    ``answers``/``rough_goal`` (the shape the intake harness produces)."""
+    if not isinstance(contract, dict):
+        return None
+    for key in ("launch_coverage", "intake"):
+        snap = contract.get(key)
+        if isinstance(snap, dict) and (snap.get("answers") or snap.get("rough_goal")):
+            return {
+                "answers": snap.get("answers") if isinstance(snap.get("answers"), dict) else None,
+                "rough_goal": snap.get("rough_goal"),
+                "external_research": snap.get("external_research"),
+            }
+    answers = contract.get("answers")
+    rough_goal = contract.get("rough_goal")
+    if (isinstance(answers, dict) and answers) or rough_goal:
+        return {
+            "answers": answers if isinstance(answers, dict) else None,
+            "rough_goal": rough_goal,
+            "external_research": contract.get("external_research"),
+        }
+    return None
+
+
 def assess_launch_completeness(contract: Optional[dict], *, enforce: bool = False) -> dict:
     """Run the strong structural checks + the net-new completeness rules.
 
@@ -320,15 +406,26 @@ def assess_launch_completeness(contract: Optional[dict], *, enforce: bool = Fals
     workflow = contract.get("workflow") if isinstance(contract.get("workflow"), dict) else {}
 
     # --- D: success scoreability ---
-    succ = [s for s in _as_list(objective.get("success")) if str(s or "").strip()]
+    # A typed entry counts as present even if its dict has only a metric (it is
+    # judged scoreable/un-scoreable by _is_scoreable); a prose entry counts only
+    # when non-blank.
+    succ = [s for s in _as_list(objective.get("success")) if _is_typed_success(s) or str(s or "").strip()]
     unscoreable = [s for s in succ if not _is_scoreable(s)]
     f_succ: list[str] = []
     if not succ:
         f_succ.append("objective.success is empty")
     elif unscoreable:
+
+        def _why(entry: Any) -> str:
+            if _is_typed_success(entry):
+                missing = _typed_success_missing_keys(entry)
+                metric = str(entry.get("metric") or "?").strip() or "?"
+                return f"typed metric '{metric[:40]}' missing required key(s): {', '.join(missing)}"
+            return str(entry)[:80]
+
         f_succ.append(
             f"{len(unscoreable)}/{len(succ)} success criteria carry no measurable target the "
-            f"scoreboard can grade: " + "; ".join(str(u)[:80] for u in unscoreable[:3])
+            f"scoreboard can grade: " + "; ".join(_why(u) for u in unscoreable[:3])
             + (" ..." if len(unscoreable) > 3 else "")
         )
     emit("success_scoreability", f_succ)
@@ -525,6 +622,41 @@ def assess_launch_completeness(contract: Optional[dict], *, enforce: bool = Fals
         )
     emit("distinct_terminals", f_distinct)
 
+    # --- H5: answer_coverage (report-mode soft rail; no-op without inputs) ---
+    # Composes kanban_launch_coverage. NO-OP and never raises when the contract
+    # has no embedded intake corpus (the common gate-time case) or the coverage
+    # import failed; otherwise emits a report-only warning when the corpus scores
+    # below the coverage module's pass threshold.
+    cov_inputs = None
+    f_cov: list[str] = []
+    try:
+        cov_inputs = _coverage_inputs(contract)
+        if cov_inputs is not None and _evaluate_coverage is not None:
+            report = _evaluate_coverage(
+                cov_inputs.get("answers"),
+                external_research=cov_inputs.get("external_research"),
+                rough_goal=cov_inputs.get("rough_goal"),
+            )
+            score = float(getattr(report, "score", 0.0) or 0.0)
+            passed = bool(getattr(report, "passed", False))
+            threshold = float(getattr(report, "threshold", _COVERAGE_THRESHOLD) or _COVERAGE_THRESHOLD)
+            if not passed:
+                gaps = list(getattr(report, "gaps", []) or [])
+                f_cov.append(
+                    f"intake-answer coverage {score:.2f} is below the {threshold:.2f} pass "
+                    f"threshold -> the owner's answers underspecify: "
+                    + (", ".join(str(g) for g in gaps[:6]) if gaps else "(see coverage report)")
+                )
+    except Exception:  # pragma: no cover - defensive: coverage must never break the gate
+        cov_inputs = None
+        f_cov = []
+    if cov_inputs is not None:
+        emit("answer_coverage", f_cov)
+    else:
+        # no coverage inputs -> record an empty (clean) dimension without warning,
+        # so the dimension is always present in the report but never fires/regresses
+        dims["answer_coverage"] = {"findings": [], "enforced": enforce}
+
     return {"ok": not errors, "errors": errors, "warnings": warnings, "dimensions": dims}
 
 
@@ -590,6 +722,41 @@ if __name__ == "__main__":
     # 5. enforce-mode turns net-new findings into hard errors (ok=False)
     r5 = assess_launch_completeness(c1, enforce=True)
     check("enforce-mode makes prose success a hard error", (not r5["ok"]) and any("success_scoreability" in e for e in r5["errors"]), str(r5))
+
+    print("== G4 PART 1: typed objective.success entries are first-class scoreable ==")
+    # typed (all required keys) -> scoreable, no success_scoreability warn
+    cT = json.loads(json.dumps(base))
+    cT["objective"]["success"] = [{"metric": "mrr", "comparator": ">=", "target": 12000, "data_source": "Stripe"}]
+    rT = assess_launch_completeness(cT)
+    check("well-formed typed success does NOT warn", not any("success_scoreability" in w for w in rT["warnings"]), str(rT["warnings"]))
+    # typed missing required keys -> warns and names them
+    cTm = json.loads(json.dumps(base)); cTm["objective"]["success"] = [{"metric": "mrr", "comparator": ">="}]
+    rTm = assess_launch_completeness(cTm)
+    cov_find = " ".join(rTm["dimensions"]["success_scoreability"]["findings"])
+    check("typed-missing-keys warns + names missing keys", "target" in cov_find and "data_source" in cov_find, cov_find)
+    # enforce promotes the malformed typed entry
+    rTe = assess_launch_completeness(cTm, enforce=True)
+    check("enforce promotes malformed typed success", (not rTe["ok"]) and any("success_scoreability" in e for e in rTe["errors"]), str(rTe))
+
+    print("== G4 PART 2: side_effect_class default-DENY (missing blocks; 'none' is valid) ==")
+    # action with 'none' class -> NOT a finding (valid read-only declaration)
+    cN = json.loads(json.dumps(base)); cN["workflow"]["stages"][0]["actions"].append({"key": "read_db", "side_effect_class": "none"})
+    rN = assess_launch_completeness(cN)
+    check("side_effect_class 'none' is valid (not flagged)", "read_db" not in " ".join(rN["dimensions"]["side_effect_class_coverage"]["findings"]), str(rN["dimensions"]["side_effect_class_coverage"]))
+    # missing class -> default-deny hard error under enforce
+    cMiss = json.loads(json.dumps(base)); cMiss["workflow"]["stages"][0]["actions"].append({"key": "send_sms"})
+    rMiss = assess_launch_completeness(cMiss, enforce=True)
+    check("missing side_effect_class is default-DENY under enforce", (not rMiss["ok"]) and any("side_effect_class_coverage" in e for e in rMiss["errors"]), str(rMiss))
+
+    print("== H5: answer_coverage report-mode rail (no-op without inputs) ==")
+    # no embedded intake corpus -> no-op
+    cCov = json.loads(json.dumps(base))
+    rCov = assess_launch_completeness(cCov)
+    check("answer_coverage is a no-op without coverage inputs", rCov["dimensions"].get("answer_coverage", {}).get("findings") == [], str(rCov["dimensions"].get("answer_coverage")))
+    # embedded weak intake corpus -> report-mode warning (ok stays True)
+    cCovW = json.loads(json.dumps(base)); cCovW["answers"] = {"q1": "do the thing", "q2": "make it good"}; cCovW["rough_goal"] = "grow my app"
+    rCovW = assess_launch_completeness(cCovW)
+    check("weak embedded intake warns answer_coverage (report-mode)", any("answer_coverage" in w for w in rCovW["warnings"]) and not any("answer_coverage" in e for e in rCovW["errors"]), str(rCovW["warnings"]))
 
     print("== net-new dimensions C + E: win-signal, evidence namespace, reachability, distinct terminals ==")
     # C1. conversational loop whose terminals carry NO win-class outcome -> warns

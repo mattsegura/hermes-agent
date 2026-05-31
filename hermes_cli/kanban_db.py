@@ -4113,6 +4113,92 @@ def _normalize_objective_budget(value: Optional[Any]) -> Optional[dict]:
     return None
 
 
+# A TYPED success entry is a dict carrying a machine-gradeable target. The
+# scoreboard can read it directly instead of regex-sniffing prose. Required keys
+# are {metric, comparator, target, data_source}; ``baseline`` is optional. These
+# four are the minimum the spec's success_scoreability dimension needs to treat
+# the entry as scoreable. A typed entry that is MISSING any required key is kept
+# as-is (never raises) so the spec can flag exactly which keys are absent.
+_TYPED_SUCCESS_REQUIRED_KEYS: tuple[str, ...] = ("metric", "comparator", "target", "data_source")
+_TYPED_SUCCESS_OPTIONAL_KEYS: tuple[str, ...] = ("baseline",)
+# Accepted comparators: symbolic operators plus the two prose aliases the intake
+# path commonly emits. Aliases normalize to their symbolic form.
+_TYPED_SUCCESS_COMPARATORS: frozenset[str] = frozenset({">=", "<=", ">", "<", "==", "!="})
+_TYPED_SUCCESS_COMPARATOR_ALIASES: dict[str, str] = {"at_least": ">=", "at_most": "<="}
+
+
+def _looks_like_typed_success(entry: Any) -> bool:
+    """A success entry is *typed* when it is a dict that declares a ``metric``.
+    (Presence of ``metric`` is the discriminator; completeness is judged by the
+    spec, not here, so a half-filled dict is still treated as a typed entry and
+    preserved for the spec to flag.)"""
+    return isinstance(entry, dict) and bool(str(entry.get("metric") or "").strip())
+
+
+def _normalize_typed_success_entry(entry: dict) -> dict:
+    """Normalize a typed success dict WITHOUT dropping it on missing keys.
+
+    Known keys are coerced to a stable shape (strings stripped, comparator
+    aliases folded to symbols, numeric targets/baselines kept numeric). Unknown
+    keys are preserved verbatim so owner-authored extras survive a round-trip.
+    A dict missing required keys is returned intact (minus the keys it lacks):
+    the launch_completeness spec is the single place that flags it un-scoreable
+    and names the missing keys.
+    """
+    out = dict(entry)
+    metric = str(out.get("metric") or "").strip()
+    if metric:
+        out["metric"] = metric
+    comparator_raw = str(out.get("comparator") or "").strip()
+    comparator = _TYPED_SUCCESS_COMPARATOR_ALIASES.get(comparator_raw.lower(), comparator_raw)
+    if comparator:
+        out["comparator"] = comparator
+    for key in ("target", "baseline"):
+        if key not in out:
+            continue
+        val = out.get(key)
+        # keep numbers numeric; coerce everything else to a stripped string
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            out[key] = str(val).strip() if val is not None else ""
+    data_source = str(out.get("data_source") or "").strip()
+    if "data_source" in out:
+        out["data_source"] = data_source
+    return out
+
+
+def _normalize_success_entries(values: Optional[Any]) -> list:
+    """Normalize ``objective.success`` allowing a MIXED list of prose strings and
+    typed target dicts.
+
+    Backward-compatible by construction: a STRING entry is preserved
+    byte-identically via the existing ``_string_list`` contract (str+strip),
+    so an all-strings list round-trips to the exact same shape it does today and
+    the golden fixtures keep passing. A dict that declares a ``metric`` is kept
+    as a typed entry (normalized, never dropped). Any other non-string scalar
+    falls back to the legacy string coercion.
+    """
+    if values is None:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    elif isinstance(values, dict):
+        # a lone dict is treated as a single-entry list (typed or, if no metric,
+        # ignored by the legacy string path which drops bare dicts)
+        values = [values]
+    elif not isinstance(values, (list, tuple, set)):
+        return []
+    out: list = []
+    for value in values:
+        if _looks_like_typed_success(value):
+            out.append(_normalize_typed_success_entry(value))
+            continue
+        # legacy path: strings (and stringifiable scalars) stay byte-identical
+        text = str(value).strip()
+        if text and not isinstance(value, dict):
+            out.append(text)
+    return out
+
+
 def normalize_objective_metadata(objective: Optional[Any]) -> Optional[dict]:
     """Validate and normalize board-level objective metadata."""
     if objective is None:
@@ -4128,7 +4214,7 @@ def normalize_objective_metadata(objective: Optional[Any]) -> Optional[dict]:
         raise ValueError("objective must be a string or object")
     out = dict(objective)
     out["statement"] = str(out.get("statement") or out.get("objective") or "").strip()
-    out["success"] = _string_list(out.get("success") or out.get("success_criteria"))
+    out["success"] = _normalize_success_entries(out.get("success") or out.get("success_criteria"))
     out["failure"] = _string_list(out.get("failure") or out.get("failure_criteria"))
     out["constraints"] = _string_list(out.get("constraints"))
     budget = _normalize_objective_budget(out.get("budget"))
