@@ -841,7 +841,7 @@ def test_business_launch_review_tool_rejects_duplicate_intake_answers(monkeypatc
     })
     payload = json.loads(out)
 
-    assert "intake_answers already submitted" in payload["error"]
+    assert "intake_answers duplicate a prior submission" in payload["error"]
     intake = kb.read_board_metadata("duplicate-answer-tool")["business_contract"]["launch_intake"]
     assert intake["clarification_round"] == 1
 

@@ -233,3 +233,118 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         f"deliveries (texts: {[d['text'] for d in adapter.sent]})"
     )
     assert "crashed" in adapter.sent[1]["text"].lower()
+
+
+# --------------------------------------------------------------------------- #
+# S4: proactive board-health watcher (default-OFF owner DM on blocked boards)
+# --------------------------------------------------------------------------- #
+
+import importlib.util as _ilu
+import pathlib as _pl
+
+_crt_spec = _ilu.spec_from_file_location(
+    "_crt_helpers_notifier",
+    _pl.Path(__file__).resolve().parents[1]
+    / "hermes_cli" / "test_kanban_contract_runtime.py",
+)
+_crt = _ilu.module_from_spec(_crt_spec)
+_crt_spec.loader.exec_module(_crt)
+_managed_contract = _crt._contract
+
+
+def _blocked_managed_board(slug="health-blocked"):
+    """A managed board left unapproved -> board_dispatch_gate is closed, and a
+    real deduped dispatch_blocked signal is recorded (the same way the
+    dispatcher's recompute_ready pass records it)."""
+    kb.review_business_launch_contract(slug, contract=_managed_contract(), create_if_missing=True)
+    with kb.connect(board=slug) as conn:
+        promoted = kb.recompute_ready(conn)  # gate closed -> emits dispatch_blocked
+        assert promoted == 0
+        rows = conn.execute(
+            "SELECT COUNT(*) AS n FROM board_signals WHERE primitive_kind='dispatch_blocked'",
+        ).fetchone()
+        assert rows["n"] >= 1
+    return slug
+
+
+def _make_health_runner(adapter):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._board_health_seen = set()
+    return runner
+
+
+def test_board_health_collect_emits_one_card_then_dedupes(tmp_path, monkeypatch):
+    """S4 EFFECT: a blocked managed board yields exactly ONE card on the first
+    pass and ZERO on a second pass of the SAME state (no spam)."""
+    db_path = tmp_path / "health-1.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    slug = _blocked_managed_board("health-blocked")
+
+    runner = _make_health_runner(adapter=RecordingAdapter())
+    seen = runner._board_health_seen
+
+    first = runner._collect_board_health_cards(kb, seen)
+    boards_in_first = {c["board"] for c in first if c["kind"] == "dispatch_blocked"}
+    assert slug in boards_in_first, first
+    # Exactly one dispatch_blocked card for this board.
+    assert sum(1 for c in first if c["board"] == slug and c["kind"] == "dispatch_blocked") == 1
+
+    # Second pass, identical board state => no new cards for this board.
+    second = runner._collect_board_health_cards(kb, seen)
+    assert all(c["board"] != slug for c in second), second
+
+
+def test_board_health_watcher_flag_off_sends_zero(tmp_path, monkeypatch):
+    """S4: flag OFF (unset) => the watcher exits immediately, ZERO sends."""
+    db_path = tmp_path / "health-off.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.delenv("HERMES_BOARD_HEALTH_CARDS", raising=False)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "owner-1")
+    kb.init_db()
+    _blocked_managed_board("health-blocked-off")
+
+    adapter = RecordingAdapter()
+    runner = _make_health_runner(adapter)
+    asyncio.run(runner._board_health_watcher(interval=5))
+    assert adapter.sent == [], "flag-off watcher must send nothing"
+
+
+def test_board_health_watcher_flag_on_sends_one_per_transition(tmp_path, monkeypatch):
+    """S4: flag ON => exactly ONE owner DM per new blocked transition; a
+    second tick of the same state sends zero more."""
+    db_path = tmp_path / "health-on.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_BOARD_HEALTH_CARDS", "1")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "owner-1")
+    kb.init_db()
+    slug = _blocked_managed_board("health-blocked-on")
+
+    adapter = RecordingAdapter()
+    runner = _make_health_runner(adapter)
+
+    real_sleep = asyncio.sleep
+
+    # First tick only: let the 5s warmup pass, run one loop body, then stop.
+    async def fake_sleep_one(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep_one)
+    asyncio.run(runner._board_health_watcher(interval=5))
+
+    sent_for_board = [d for d in adapter.sent if slug in d["text"]]
+    assert len(sent_for_board) == 1, adapter.sent
+    assert "blocked" in sent_for_board[0]["text"].lower()
+
+    # Second tick, same state, same runner seen-set => no new send.
+    runner._running = True
+    before = len(adapter.sent)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep_one)
+    asyncio.run(runner._board_health_watcher(interval=5))
+    new_for_board = [d for d in adapter.sent[before:] if slug in d["text"]]
+    assert new_for_board == [], adapter.sent[before:]
