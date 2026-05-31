@@ -724,6 +724,35 @@ def fetch_unnotified_pending() -> list[dict]:
         return []
 
 
+def fetch_open_pending() -> list[dict]:
+    """Return ALL currently-open action-gate escalations (``status='pending'``).
+
+    Unlike :func:`fetch_unnotified_pending`, this ignores the ``notified`` flag
+    so a read-only ``/pending`` digest can enumerate every escalation still
+    awaiting an owner decision (already-carded ones included). Oldest-first.
+
+    Read-only and defensive: returns ``[]`` on any error so a digest handler
+    never crashes on a missing DB / transient lock.
+    """
+    try:
+        conn = _ensure_queue_db()
+        try:
+            rows = conn.execute(
+                """SELECT id, profile, tool_name, tool_args, description,
+                          classification, created_at, expires_at,
+                          session_id, task_id
+                   FROM pending_actions
+                   WHERE status='pending'
+                   ORDER BY created_at ASC, id ASC""",
+            ).fetchall()
+        finally:
+            conn.close()
+        return [dict(row) for row in rows]
+    except Exception as e:
+        _log.debug("fetch_open_pending failed: %s", e)
+        return []
+
+
 def mark_notified(action_id: int) -> bool:
     """Flag a pending action as having had its owner card delivered.
 

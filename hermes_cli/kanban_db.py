@@ -170,7 +170,17 @@ REQUIRE_CONTRACT_DEFAULTS_ENV: str = "HERMES_KANBAN_REQUIRE_CONTRACT_DEFAULTS"
 ENFORCE_WORKER_TOOLSETS_ENV: str = "HERMES_KANBAN_ENFORCE_WORKER_TOOLSETS"
 BRIDGE_TOOL_POLICY_ENV: str = "HERMES_KANBAN_BRIDGE_TOOL_POLICY"
 EXECUTABLE_WORK_STATUSES = {"ready", "review", "running"}
-LAUNCH_APPROVAL_TOKEN_TTL_SECONDS = 15 * 60
+# Launch-approval token lifetime. The token is minted at the moment the owner
+# is asked to approve a board and consumed when they answer. A human answering
+# from a Telegram DM may take hours (overnight, a meeting, a flight), so the
+# old 15-minute window expired the token before the owner could act, turning a
+# perfectly approvable board into a confusing "expired" dead-end. Default is
+# now 24h; operators can widen/narrow it via env/config (see
+# ``_resolve_launch_approval_token_ttl_seconds``). The token's SECURITY
+# invariants are unchanged: it stays single-use, board-scoped,
+# contract-hash-bound, and owner-confirmed regardless of TTL.
+LAUNCH_APPROVAL_TOKEN_TTL_SECONDS = 24 * 60 * 60
+LAUNCH_APPROVAL_TOKEN_TTL_ENV: str = "HERMES_KANBAN_LAUNCH_TOKEN_TTL_SECONDS"
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _UNSET = object()
 _IS_WINDOWS = sys.platform == "win32"
@@ -565,9 +575,45 @@ def normalize_runtime_mode(runtime: Optional[str]) -> str:
     return mode
 
 
-def normalize_board_launch_phase(phase: Optional[str], *, default: str = "active") -> str:
-    """Validate and normalize board launch lifecycle state."""
-    normalized = str(phase or default or "active").strip().lower()
+# S5(b): the non-dispatch phase a MANAGED board with a MISSING/NULL
+# launch_phase normalizes to. ``contract_review`` is in VALID_BOARD_LAUNCH_PHASES
+# and is NOT in BOARD_DISPATCH_PHASES, so it parks the board out of dispatch
+# until an explicit owner activation -- closing the fail-open that let a managed
+# board with no recorded phase be treated as ``active`` (the active-but-blocked
+# trap).
+MANAGED_MISSING_PHASE_DEFAULT = "contract_review"
+
+
+def normalize_board_launch_phase(
+    phase: Optional[str], *, default: str = "active", managed: bool = False
+) -> str:
+    """Validate and normalize board launch lifecycle state.
+
+    ``managed`` is a fail-CLOSED override for the MISSING/NULL case only
+    (S5(b)): a managed board (``_board_requires_launch_readiness``) with no
+    recorded ``launch_phase`` must NOT silently become dispatchable
+    (``active``); it normalizes to ``MANAGED_MISSING_PHASE_DEFAULT``
+    (a non-dispatch phase) so it requires an explicit owner activation.
+
+    Strict BACK-COMPAT:
+      * An EXPLICIT, non-empty ``phase`` is ALWAYS honored verbatim regardless
+        of ``managed`` -- so every existing board (all of which carry an
+        explicit phase) is byte-identical, including ``ninaxfinds-growth``
+        (phase=active) and the ``contract_review`` boards.
+      * ``managed=False`` (the default, and the unmanaged ``default`` board)
+        keeps the legacy ``default`` resolution (``active`` unless the caller
+        passed another default) for a missing/null phase.
+    """
+    raw = str(phase).strip().lower() if phase is not None else ""
+    if not raw:
+        # MISSING/NULL phase. Managed boards fail CLOSED to a non-dispatch
+        # phase; unmanaged boards keep the caller's legacy default.
+        if managed:
+            normalized = MANAGED_MISSING_PHASE_DEFAULT
+        else:
+            normalized = str(default or "active").strip().lower()
+    else:
+        normalized = raw
     if normalized not in VALID_BOARD_LAUNCH_PHASES:
         raise ValueError(
             "launch_phase must be one of: "
@@ -1197,7 +1243,7 @@ def issue_board_launch_approval_token(
             + ", ".join(readiness.get("missing") or readiness.get("errors") or ["unknown"])
         )
     now = int(time.time())
-    ttl = int(ttl_seconds or LAUNCH_APPROVAL_TOKEN_TTL_SECONDS)
+    ttl = int(ttl_seconds or _resolve_launch_approval_token_ttl_seconds())
     if ttl <= 0:
         raise ValueError("ttl_seconds must be positive")
     token_id = f"lat_{secrets.token_hex(6)}"
@@ -1332,6 +1378,65 @@ def _resolve_kanban_bool_flag(env_var: str, config_key: str) -> bool:
     if val is not None:
         return _coerce_bool(val)
     return False
+
+
+def _resolve_kanban_int_flag(
+    env_var: str, config_key: str, *, default: int
+) -> int:
+    """Resolve a positive-int kanban setting with the same precedence as
+    :func:`_resolve_kanban_bool_flag` (env, then config.yaml, then default).
+
+    Precedence (first that resolves to a positive int wins):
+      1. Env ``env_var`` (a positive integer; a non-int or non-positive token
+         falls through to config/default rather than guessing).
+      2. config.yaml ``kanban.<config_key>`` (positive int via ``int()``).
+      3. ``default`` -- unset means the built-in value, byte-identical.
+
+    Mirrors ``_resolve_kanban_bool_flag``'s "unrecognized token falls through,
+    never breaks an existing install" contract, but for an int knob.
+    """
+    raw = os.environ.get(env_var)
+    if raw is not None and str(raw).strip() != "":
+        try:
+            parsed = int(str(raw).strip())
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            return parsed
+        # Non-positive / non-int env token: fall through rather than guess.
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        kb_cfg = cfg.get("kanban") if isinstance(cfg, dict) else None
+        val = (kb_cfg or {}).get(config_key) if isinstance(kb_cfg, dict) else None
+    except Exception:  # pragma: no cover - config is optional
+        val = None
+    if val is not None:
+        try:
+            parsed_cfg = int(val)
+        except (TypeError, ValueError):
+            parsed_cfg = 0
+        if parsed_cfg > 0:
+            return parsed_cfg
+    return default
+
+
+def _resolve_launch_approval_token_ttl_seconds() -> int:
+    """Effective TTL (seconds) for a freshly minted launch-approval token.
+
+    Env ``HERMES_KANBAN_LAUNCH_TOKEN_TTL_SECONDS`` / config.yaml
+    ``kanban.launch_token_ttl_seconds``; otherwise the 24h default
+    (``LAUNCH_APPROVAL_TOKEN_TTL_SECONDS``). This widens the window a human
+    has to answer an approval from chat WITHOUT touching any token security
+    invariant (single-use, board-scoped, contract-hash-bound, owner-confirmed
+    are all enforced elsewhere and are independent of the lifetime).
+    """
+    return _resolve_kanban_int_flag(
+        LAUNCH_APPROVAL_TOKEN_TTL_ENV,
+        "launch_token_ttl_seconds",
+        default=LAUNCH_APPROVAL_TOKEN_TTL_SECONDS,
+    )
 
 
 def _require_contract_defaults_enabled() -> bool:
@@ -4902,8 +5007,19 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                     raw["business_contract"] = normalize_board_operating_contract(
                         raw.get("business_contract")
                     )
+                # S5(b): a MANAGED board persisted WITHOUT a launch_phase must
+                # NOT be silently coerced to dispatchable 'active' here (this
+                # load-time normalization was the true active-but-blocked
+                # fail-open). Resolve managed from the already-normalized
+                # runtime/contract on ``raw`` and fail CLOSED to a non-dispatch
+                # phase for the MISSING/NULL case only. An EXPLICIT phase is
+                # honored verbatim, so every existing board (all carry an
+                # explicit phase) is byte-identical.
+                _managed_for_phase = _board_requires_launch_readiness(raw)
                 raw["launch_phase"] = normalize_board_launch_phase(
-                    raw.get("launch_phase"), default="active"
+                    raw.get("launch_phase"),
+                    default="active",
+                    managed=_managed_for_phase,
                 )
                 raw["contract_version"] = _normalize_contract_version(
                     raw.get("contract_version")
@@ -5288,8 +5404,13 @@ def validate_board_launch_readiness(board: Optional[str] = None) -> dict[str, An
     board_slug = meta.get("slug")
     readiness = _launch_contract_readiness_for_storage(contract, board=board_slug)
     questions = _launch_review_questions(contract, readiness)
-    phase = normalize_board_launch_phase(meta.get("launch_phase"), default="active")
     managed = _board_requires_launch_readiness(meta)
+    # S5(b): a managed board with a MISSING/NULL phase fails CLOSED to a
+    # non-dispatch phase rather than fail-open to 'active'. Explicit phases are
+    # honored verbatim, so every existing board is unaffected.
+    phase = normalize_board_launch_phase(
+        meta.get("launch_phase"), default="active", managed=managed,
+    )
     launch_approved = _board_has_approved_launch_review(meta)
     dispatch_enabled = (
         phase in BOARD_DISPATCH_PHASES
@@ -5316,8 +5437,13 @@ def validate_board_launch_readiness(board: Optional[str] = None) -> dict[str, An
 def board_dispatch_gate(board: Optional[str] = None) -> dict[str, Any]:
     """Return whether dispatcher ticks may claim tasks on this board."""
     meta = read_board_metadata(board)
-    phase = normalize_board_launch_phase(meta.get("launch_phase"), default="active")
     managed = _board_requires_launch_readiness(meta)
+    # S5(b): a managed board with a MISSING/NULL phase fails CLOSED to a
+    # non-dispatch phase (active-but-blocked trap fix). Explicit phases are
+    # untouched, so all existing boards are byte-identical here.
+    phase = normalize_board_launch_phase(
+        meta.get("launch_phase"), default="active", managed=managed,
+    )
     readiness = _launch_contract_readiness_for_storage(
         _metadata_as_business_contract(meta), board=meta.get("slug"),
     )
@@ -12038,6 +12164,54 @@ def _emit_dispatch_blocked_signal(
             )
     except Exception:  # pragma: no cover - defensive telemetry guard
         _log.warning("dispatch_blocked signal emit failed", exc_info=True)
+
+
+def list_dispatch_blocked_signals(
+    conn: sqlite3.Connection, *, board: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """Return the deduped ``dispatch_blocked`` board_signals rows (S4 reader).
+
+    Each row is the single deduped record for a distinct
+    ``(board, sorted-blocker-codes)`` transition that ``board_dispatch_gate``
+    recorded via :func:`_emit_dispatch_blocked_signal` (the ``dedupe_key``
+    UNIQUE index keeps a stuck board to one row). Returns dicts with
+    ``board``, ``codes`` (the sorted blocker-code string in ``primitive_key``),
+    ``dedupe_key``, ``ts``, and the parsed ``action`` (carries the raw
+    ``blockers``/``reason``). Read-only: this never mutates a row or a task.
+    ``board`` filters to a single board's rows. A legacy table predating the
+    ``dedupe_key`` column degrades to NULL dedupe keys (still returned).
+    """
+    try:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(board_signals)")}
+    except Exception:
+        return []
+    if "dedupe_key" in cols:
+        dedupe_select = "dedupe_key"
+    else:  # pragma: no cover - legacy table without the migration-added column
+        dedupe_select = "NULL AS dedupe_key"
+    sql = (
+        f"SELECT board, ts, primitive_key, action, {dedupe_select} "
+        "FROM board_signals WHERE primitive_kind = 'dispatch_blocked' "
+    )
+    params: list[Any] = []
+    if board is not None:
+        sql += "AND board = ? "
+        params.append(_normalize_board_slug(board) or board)
+    sql += "ORDER BY ts ASC, id ASC"
+    out: list[dict[str, Any]] = []
+    for row in conn.execute(sql, params).fetchall():
+        try:
+            action = json.loads(row["action"]) if row["action"] else None
+        except Exception:
+            action = None
+        out.append({
+            "board": row["board"],
+            "ts": row["ts"],
+            "codes": row["primitive_key"] or "",
+            "dedupe_key": row["dedupe_key"],
+            "action": action if isinstance(action, dict) else {},
+        })
+    return out
 
 
 def _structured_completion_evidence_keys(*, metadata: Optional[dict], funnel_data: Optional[dict]) -> set[str]:
@@ -24127,6 +24301,46 @@ def task_age(task: Task) -> dict:
 # ---------------------------------------------------------------------------
 # Notification subscriptions (used by the gateway kanban-notifier)
 # ---------------------------------------------------------------------------
+
+# S7(a): a BOARD-LEVEL subscription is recorded as an ordinary notify-sub row
+# whose ``task_id`` is this reserved sentinel. The gateway notifier expands a
+# board-level sub into per-task subs for every live task on the board each tick
+# (idempotent), so future agent/intake-created tasks are auto-covered without
+# the owner re-subscribing per task. The sentinel is NOT a real task id; it can
+# never collide with a ``t_<hex>`` task id, and it carries no task events of its
+# own (the per-task subs the fan-out creates are what deliver).
+BOARD_NOTIFY_SENTINEL_TASK_ID = "__board__"
+
+
+def add_board_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+) -> None:
+    """Register a BOARD-LEVEL terminal-event subscription (S7(a)).
+
+    Idempotent on (sentinel, platform, chat, thread) -- exactly like
+    :func:`add_notify_sub`, of which this is a thin board-scoped wrapper.
+    """
+    add_notify_sub(
+        conn,
+        task_id=BOARD_NOTIFY_SENTINEL_TASK_ID,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        user_id=user_id,
+        notifier_profile=notifier_profile,
+    )
+
+
+def list_board_notify_subs(conn: sqlite3.Connection) -> list[dict]:
+    """Return the board-level subscription rows (the sentinel task_id)."""
+    return list_notify_subs(conn, BOARD_NOTIFY_SENTINEL_TASK_ID)
+
 
 def add_notify_sub(
     conn: sqlite3.Connection,

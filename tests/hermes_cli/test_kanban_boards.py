@@ -1047,6 +1047,156 @@ class TestBoardCRUD:
             ).fetchone()
         assert token_record["status"] == "expired"
 
+    def test_launch_token_ttl_resolves_env_then_config_then_default(
+        self, fresh_home, monkeypatch, tmp_path
+    ):
+        """S6: launch-token TTL is env/config-resolved, default 24h (86400).
+
+        Tests the EFFECT through the real resolver AND the real mint
+        (``expires_at`` reflects the resolved TTL), not just the constant.
+        """
+        # 1) Default: unset env/config -> 24h.
+        monkeypatch.delenv(kb.LAUNCH_APPROVAL_TOKEN_TTL_ENV, raising=False)
+        assert kb._resolve_launch_approval_token_ttl_seconds() == 86400
+        assert kb.LAUNCH_APPROVAL_TOKEN_TTL_SECONDS == 86400
+
+        # 2) Env override wins (positive int).
+        monkeypatch.setenv(kb.LAUNCH_APPROVAL_TOKEN_TTL_ENV, "7200")
+        assert kb._resolve_launch_approval_token_ttl_seconds() == 7200
+        # Non-positive / junk env falls through to the default rather than
+        # guessing (mirrors the bool-flag "unrecognized token" contract).
+        monkeypatch.setenv(kb.LAUNCH_APPROVAL_TOKEN_TTL_ENV, "0")
+        assert kb._resolve_launch_approval_token_ttl_seconds() == 86400
+        monkeypatch.setenv(kb.LAUNCH_APPROVAL_TOKEN_TTL_ENV, "not-a-number")
+        assert kb._resolve_launch_approval_token_ttl_seconds() == 86400
+
+        # 3) config.yaml is consulted when env is unset. Patch on a nested
+        #    context so the override is dropped before the real-mint check.
+        monkeypatch.delenv(kb.LAUNCH_APPROVAL_TOKEN_TTL_ENV, raising=False)
+        import hermes_cli.config as _cfgmod
+        _orig_load = _cfgmod.load_config
+        _cfgmod.load_config = lambda *a, **k: {  # type: ignore[assignment]
+            "kanban": {"launch_token_ttl_seconds": 3600}
+        }
+        try:
+            assert kb._resolve_launch_approval_token_ttl_seconds() == 3600
+        finally:
+            _cfgmod.load_config = _orig_load  # type: ignore[assignment]
+
+        # EFFECT through the real mint: with no override, a freshly minted
+        # token's expires_at is ~24h out (not the old 15 minutes).
+        monkeypatch.delenv(kb.LAUNCH_APPROVAL_TOKEN_TTL_ENV, raising=False)
+        contract = _launch_ready_contract()
+        kb.review_business_launch_contract(
+            "ttl-default-board", contract=contract, create_if_missing=True,
+        )
+        import time as _t
+        before = int(_t.time())
+        issued = kb.issue_board_launch_approval_token(
+            "ttl-default-board",
+            contract=contract,
+            approved_by="owner",
+            approval_evidence={"source": "ttl-test"},
+            owner_authority_confirmed=True,
+        )
+        lifetime = int(issued["expires_at"]) - before
+        # Allow a small clock slack; must be ~24h, definitely > the old 15m.
+        assert 86400 - 5 <= lifetime <= 86400 + 5, lifetime
+
+    @pytest.mark.parametrize(
+        "phase,managed,expected",
+        [
+            # MISSING/NULL phase on a managed board -> non-dispatch (fail-closed).
+            (None, True, "contract_review"),
+            ("", True, "contract_review"),
+            ("   ", True, "contract_review"),
+            # MISSING/NULL phase on an unmanaged board -> legacy 'active' (back-compat).
+            (None, False, "active"),
+            ("", False, "active"),
+            # EXPLICIT phase is ALWAYS honored verbatim, managed or not.
+            ("active", True, "active"),          # e.g. ninaxfinds-growth
+            ("active", False, "active"),
+            ("contract_review", True, "contract_review"),
+            ("contract_review", False, "contract_review"),
+            ("paused", True, "paused"),
+            ("draft", True, "draft"),
+        ],
+    )
+    def test_normalize_phase_managed_missing_is_fail_closed(
+        self, phase, managed, expected
+    ):
+        """S5(b): missing/null phase fails CLOSED to non-dispatch ONLY for
+        managed boards; explicit phases are untouched (back-compat)."""
+        assert kb.normalize_board_launch_phase(
+            phase, default="active", managed=managed
+        ) == expected
+        # The managed fail-closed target is genuinely a NON-dispatch phase.
+        if managed and (phase is None or not str(phase).strip()):
+            assert expected not in kb.BOARD_DISPATCH_PHASES
+
+    def test_managed_board_missing_phase_does_not_dispatch(self, fresh_home):
+        """S5(b) EFFECT through board_dispatch_gate: a MANAGED board whose
+        launch_phase is NULL must NOT present as a dispatchable 'active' board.
+
+        Proves the active-but-blocked fail-open is closed at the real seam.
+        """
+        contract = _launch_ready_contract()
+        # Create + approve a managed board so readiness.ok AND launch_approved
+        # are both True -- isolating launch_phase as the ONLY thing that could
+        # have wrongly enabled dispatch.
+        kb.review_business_launch_contract(
+            "null-phase-managed", contract=contract, create_if_missing=True,
+        )
+        token = kb.issue_board_launch_approval_token(
+            "null-phase-managed",
+            contract=contract,
+            approved_by="owner",
+            approval_evidence={"source": "test"},
+            owner_authority_confirmed=True,
+        )["token"]
+        kb.review_business_launch_contract(
+            "null-phase-managed",
+            contract=contract,
+            approve=True,
+            approval_token=token,
+        )
+        # Sanity: it is managed and now active.
+        meta = kb.read_board_metadata("null-phase-managed")
+        assert kb._board_requires_launch_readiness(meta)
+        gate_active = kb.board_dispatch_gate("null-phase-managed")
+        assert gate_active["ok"] is True
+        assert gate_active["launch_phase"] == "active"
+
+        # Now NULL out the launch_phase on disk (simulating a future/legacy
+        # board persisted without one) and re-read the gate.
+        path = kb.board_metadata_path("null-phase-managed")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw.pop("launch_phase", None)
+        path.write_text(json.dumps(raw), encoding="utf-8")
+
+        gate_null = kb.board_dispatch_gate("null-phase-managed")
+        # FAIL-CLOSED: the gate must NOT treat the null phase as 'active'.
+        assert gate_null["launch_phase"] != "active"
+        assert gate_null["launch_phase"] not in kb.BOARD_DISPATCH_PHASES
+        assert gate_null["ok"] is False
+        codes = {b.get("code") for b in gate_null["blockers"]}
+        assert "board_not_active" in codes, gate_null["blockers"]
+
+    def test_unmanaged_board_missing_phase_still_active(self, fresh_home):
+        """S5(b) BACK-COMPAT: an UNMANAGED board with a missing phase keeps
+        defaulting to 'active' (dispatchable) -- the fix only touches managed."""
+        kb.create_board("plain-unmanaged", name="Plain")
+        meta = kb.read_board_metadata("plain-unmanaged")
+        assert not kb._board_requires_launch_readiness(meta)
+        # Strip launch_phase to force the missing case.
+        path = kb.board_metadata_path("plain-unmanaged")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw.pop("launch_phase", None)
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        gate = kb.board_dispatch_gate("plain-unmanaged")
+        assert gate["launch_phase"] == "active"
+        assert gate["ok"] is True
+
     def test_launch_approval_token_is_one_time(self, fresh_home):
         contract = _launch_ready_contract()
         kb.review_business_launch_contract(

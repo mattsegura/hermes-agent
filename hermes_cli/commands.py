@@ -96,6 +96,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[session|always|<board>]"),
     CommandDef("deny", "Deny a pending dangerous command", "Session",
                gateway_only=True),
+    CommandDef("pending", "List open approvals + boards awaiting launch (read-only)", "Session",
+               gateway_only=True),
     CommandDef("background", "Run a prompt in the background", "Session",
                aliases=("bg", "btw"), args_hint="<prompt>"),
     CommandDef("agents", "Show active agents and running tasks", "Session",

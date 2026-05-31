@@ -62,13 +62,26 @@ def fresh_home(tmp_path, monkeypatch):
     return home
 
 
-def _make_runner():
+def _make_runner(config=None):
     """Bare GatewayRunner — no __init__, just the attrs the approve path reads."""
     runner = object.__new__(gateway_run.GatewayRunner)
     runner.adapters = {}
     runner.session_store = None
     runner._pending_approvals = {}
+    runner.config = config
     return runner
+
+
+def _config_with_admin(admin_ids):
+    """A GatewayConfig whose telegram DM scope gates /approve to ``admin_ids``."""
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    cfg = GatewayConfig()
+    cfg.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        token="test-token",
+        extra={"allow_admin_from": list(admin_ids)},
+    )
+    return cfg
 
 
 def _make_event(text: str, *, platform=Platform.TELEGRAM, user_id="owner-1",
@@ -275,6 +288,149 @@ async def test_approve_command_launches_and_binds(fresh_home):
     # Contract-role profiles are bound to THIS board.
     for prof in ("land-ceo", "land-opt", "land-operator"):
         assert kb.profile_board_binding(prof) == "land-wholesaling"
+
+
+@pytest.mark.asyncio
+async def test_approve_recovers_from_expired_token_via_remint(fresh_home, monkeypatch):
+    """S6: a CLEAN token expiry on activation is recovered by ONE re-mint.
+
+    Drives the REAL retry seam: the first activation sees a genuinely-expired
+    token (we expire the just-minted row in the DB so the REAL consume path
+    raises the REAL "approval_token has expired" ValueError); the handler
+    re-mints (the owner's /approve is fresh authority) and the second
+    activation succeeds. Asserts the EFFECT: the reply is a success (not a raw
+    "expired" dead-end) and the board ends up ACTIVE.
+    """
+    _draft_board("land-wholesaling")
+    runner = _make_runner()
+
+    real_review = kb.review_business_launch_contract
+    calls = {"n": 0}
+
+    def _review_expiring_first_token(board, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Expire EVERY pending token for this board so the real consume
+            # path inside review_business_launch_contract rejects it as
+            # expired -- exactly the late-answer scenario.
+            with kb.connect(board=board) as conn:
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE board_launch_approval_tokens "
+                        "SET expires_at = 1 WHERE status = 'pending'",
+                    )
+        return real_review(board, *args, **kwargs)
+
+    monkeypatch.setattr(kb, "review_business_launch_contract", _review_expiring_first_token)
+
+    out = await runner._handle_approve_command(_make_event("/approve land-wholesaling"))
+
+    # Recovered: two activation attempts (first expired, second clean).
+    assert calls["n"] == 2, calls
+    # The owner sees success, not a raw expired dead-end.
+    assert "active" in out.lower()
+    assert "expired" not in out.lower()
+    # Board is genuinely active now.
+    meta = kb.read_board_metadata("land-wholesaling")
+    assert kb.normalize_board_launch_phase(meta.get("launch_phase")) == "active"
+
+
+@pytest.mark.asyncio
+async def test_approve_owner_id_match_mints(fresh_home, monkeypatch):
+    """S5(a): with slash-gating ON, the matching owner mints + launches."""
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    _draft_board("land-wholesaling")
+    runner = _make_runner(config=_config_with_admin(["owner-1"]))
+    out = await runner._handle_approve_command(
+        _make_event("/approve land-wholesaling", user_id="owner-1")
+    )
+    assert "active" in out.lower()
+    # No "ran without slash-gating" warning when identity WAS verified.
+    assert "without slash-gating" not in out.lower()
+    meta = kb.read_board_metadata("land-wholesaling")
+    assert kb.normalize_board_launch_phase(meta.get("launch_phase")) == "active"
+
+
+@pytest.mark.asyncio
+async def test_approve_non_owner_is_refused_before_mint(fresh_home, monkeypatch):
+    """S5(a) FAIL-CLOSED: a non-owner with slash-gating ON is refused, and NO
+    token is minted (the board never goes active)."""
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    _draft_board("land-wholesaling")
+    runner = _make_runner(config=_config_with_admin(["owner-1"]))
+
+    minted = {"n": 0}
+    real_mint = kb.issue_board_launch_approval_token
+
+    def _counting_mint(*a, **k):
+        minted["n"] += 1
+        return real_mint(*a, **k)
+
+    monkeypatch.setattr(kb, "issue_board_launch_approval_token", _counting_mint)
+
+    out = await runner._handle_approve_command(
+        _make_event("/approve land-wholesaling", user_id="intruder-9")
+    )
+    assert "refused" in out.lower()
+    # Critically: the mint was NEVER reached.
+    assert minted["n"] == 0, "non-owner must be refused BEFORE the token mint"
+    meta = kb.read_board_metadata("land-wholesaling")
+    assert kb.normalize_board_launch_phase(meta.get("launch_phase")) != "active"
+
+
+@pytest.mark.asyncio
+async def test_approve_unconfirmed_owner_mints_with_warning(fresh_home, monkeypatch):
+    """S5(a): with NO slash-gating AND no allowlist, /approve still mints (the
+    admin-gated command path is the legacy trust boundary) but MUST warn that
+    it ran without slash-gating — never a silent un-gated mint."""
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    _draft_board("land-wholesaling")
+    runner = _make_runner(config=None)  # no config => slash-gating disabled
+    out = await runner._handle_approve_command(
+        _make_event("/approve land-wholesaling", user_id="whoever")
+    )
+    # Still launches…
+    assert "active" in out.lower()
+    meta = kb.read_board_metadata("land-wholesaling")
+    assert kb.normalize_board_launch_phase(meta.get("launch_phase")) == "active"
+    # …but the un-gated approval is surfaced, not silent.
+    assert "without slash-gating" in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_approve_allowlist_owner_match_mints_no_warning(fresh_home, monkeypatch):
+    """S5(a): TELEGRAM_ALLOWED_USERS[0] is the canonical owner; a matching
+    invoker mints with no warning even when slash-gating config is absent."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "owner-1,helper-2")
+    _draft_board("land-wholesaling")
+    runner = _make_runner(config=None)
+    out = await runner._handle_approve_command(
+        _make_event("/approve land-wholesaling", user_id="owner-1")
+    )
+    assert "active" in out.lower()
+    assert "without slash-gating" not in out.lower()
+
+
+@pytest.mark.asyncio
+async def test_approve_allowlist_non_owner_refused(fresh_home, monkeypatch):
+    """S5(a) FAIL-CLOSED: a user not matching TELEGRAM_ALLOWED_USERS[0] is
+    refused even with slash-gating config absent."""
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "owner-1")
+    _draft_board("land-wholesaling")
+    runner = _make_runner(config=None)
+    minted = {"n": 0}
+    real_mint = kb.issue_board_launch_approval_token
+
+    def _counting_mint(*a, **k):
+        minted["n"] += 1
+        return real_mint(*a, **k)
+
+    monkeypatch.setattr(kb, "issue_board_launch_approval_token", _counting_mint)
+    out = await runner._handle_approve_command(
+        _make_event("/approve land-wholesaling", user_id="someone-else")
+    )
+    assert "refused" in out.lower()
+    assert minted["n"] == 0
 
 
 @pytest.mark.asyncio
@@ -493,3 +649,125 @@ async def test_driven_router_flow(fresh_home):
     # Read / reason / board-ops stay allowed.
     assert check_action_gate("read_file", {"path": "/tmp/x"}) is None
     assert check_action_gate("kanban_match_board", {"goal": "x"}) is None
+
+
+# ---------------------------------------------------------------------------
+# S7(a): /approve auto-subscribes the owner at the BOARD level
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_approve_creates_board_level_notify_sub(fresh_home, monkeypatch):
+    """S7(a): a successful /approve registers a BOARD-LEVEL notify sub for the
+    approving owner's chat and tells them updates will arrive here."""
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    _draft_board("land-wholesaling")
+    runner = _make_runner()
+    out = await runner._handle_approve_command(
+        _make_event("/approve land-wholesaling", chat_id="chat-77")
+    )
+    assert "active" in out.lower()
+    assert "updates here" in out.lower()
+    # A board-level subscription row exists for the approving chat.
+    conn = kb.connect(board="land-wholesaling")
+    try:
+        board_subs = kb.list_board_notify_subs(conn)
+    finally:
+        conn.close()
+    assert any(
+        s["task_id"] == kb.BOARD_NOTIFY_SENTINEL_TASK_ID
+        and s["chat_id"] == "chat-77"
+        and (s["platform"] or "").lower() == "telegram"
+        for s in board_subs
+    ), board_subs
+
+
+def test_board_notify_fanout_covers_future_tasks(fresh_home):
+    """S7(a) EFFECT: the notifier fan-out expands a board-level sub into a
+    per-task sub for a task created AFTER the subscription (future coverage)."""
+    runner = _make_runner()
+    conn = kb.connect(board=kb.DEFAULT_BOARD)
+    try:
+        kb.add_board_notify_sub(
+            conn, platform="telegram", chat_id="chat-77", notifier_profile="default",
+        )
+        # A task created AFTER the board-level subscribe.
+        tid = kb.create_task(conn, title="future task", assignee="worker")
+        subs = kb.list_notify_subs(conn)
+        runner._expand_board_notify_subs(kb, conn, subs, "default")
+        per_task = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+    assert any(
+        s["chat_id"] == "chat-77" and s["task_id"] == tid for s in per_task
+    ), "board-level sub must seed a per-task sub for the future task"
+
+
+# ---------------------------------------------------------------------------
+# S7(b): read-only /pending digest
+# ---------------------------------------------------------------------------
+
+def _insert_pending_action(profile="default", tool="send_message", task_id="t_abc"):
+    """Insert one open action-gate escalation into the queue DB."""
+    import json as _json
+    import time as _t
+    from agent import action_gate as _ag
+    conn = _ag._ensure_queue_db()
+    try:
+        now = int(_t.time())
+        cur = conn.execute(
+            """INSERT INTO pending_actions
+               (profile, tool_name, tool_args, description, classification,
+                status, created_at, expires_at, session_id, task_id)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+            (profile, tool, _json.dumps({"to": "x"}), "send a message",
+             "external_write", now, now + 300, "sess-1", task_id),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_enumerates_escalations_and_boards_readonly(fresh_home, monkeypatch):
+    """S7(b): /pending lists open escalations AND boards awaiting launch, and
+    does NOT mutate any escalation (read-only)."""
+    # Reset the action_gate queue path so it uses this fresh HERMES_HOME.
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    from agent import action_gate as _ag
+    _ag._QUEUE_DB_PATH = None  # force re-resolve under fresh_home
+
+    aid = _insert_pending_action(tool="send_message", task_id="t_dead")
+    _draft_board("land-wholesaling")  # a board awaiting /approve
+
+    runner = _make_runner()
+    out = await runner._handle_pending_command(_make_event("/pending"))
+
+    # Escalation enumerated (id + tool + task).
+    assert f"#{aid}" in out
+    assert "send_message" in out
+    # Board awaiting launch enumerated.
+    assert "land-wholesaling" in out
+    assert "awaiting launch" in out.lower()
+
+    # READ-ONLY: the escalation is still pending (never approved/denied).
+    conn = _ag._ensure_queue_db()
+    try:
+        row = conn.execute(
+            "SELECT status FROM pending_actions WHERE id = ?", (aid,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["status"] == "pending", "/pending must not mutate escalations"
+
+
+@pytest.mark.asyncio
+async def test_pending_empty_is_clean(fresh_home, monkeypatch):
+    """S7(b): /pending with nothing open says so without error."""
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+    from agent import action_gate as _ag
+    _ag._QUEUE_DB_PATH = None
+    runner = _make_runner()
+    out = await runner._handle_pending_command(_make_event("/pending"))
+    assert "no open action-gate escalations" in out.lower()
+    assert "no boards awaiting launch" in out.lower()

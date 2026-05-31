@@ -1068,6 +1068,34 @@ logger = logging.getLogger(__name__)
 _AGENT_PENDING_SENTINEL = object()
 
 
+class _RecoverableLaunchTokenError(RuntimeError):
+    """A launch-approval token was rejected for a CLEAN, recoverable reason.
+
+    Raised by ``_mint_and_activate_launch`` when activation failed because the
+    just-minted token had expired or no longer matched the live contract AND a
+    single fresh re-mint (the owner's /approve is fresh authority) still could
+    not apply. The /approve handler turns this into a "send /approve again"
+    sentence instead of a confusing raw "expired" dead-end. It is NOT a
+    security relaxation: every token remains single-use, board-scoped,
+    contract-hash-bound, and owner-confirmed.
+    """
+
+
+# Substrings the launch-token consume path uses for the two CLEAN, owner-
+# recoverable rejections (vs. an unrecoverable "not launch-ready" refusal).
+# Matched case-insensitively against the ValueError text raised by
+# ``kanban_db._commit_board_launch_approval`` / ``_validate_approval_token_record``.
+_RECOVERABLE_LAUNCH_TOKEN_MARKERS = (
+    "has expired",
+    "for a different contract",
+)
+
+
+def _is_recoverable_launch_token_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _RECOVERABLE_LAUNCH_TOKEN_MARKERS)
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -4458,6 +4486,15 @@ class GatewayRunner:
         # proposal flow still works. Gated off by HERMES_ACTION_GATE_CARDS.
         asyncio.create_task(self._action_gate_card_watcher())
 
+        # Start background board-health watcher (S4) — polls each board's
+        # deduped dispatch_blocked signals + launch_phase and pushes ONE owner
+        # DM per NEW (board, blocker-codes) transition or pending approval /
+        # credentials entry, so an ACTIVE-but-BLOCKED board surfaces proactively
+        # instead of silently stranding its tasks. DEFAULT-OFF: gated by
+        # HERMES_BOARD_HEALTH_CARDS (mirrors HERMES_ACTION_GATE_CARDS); with the
+        # flag unset this task idles immediately and sends nothing.
+        asyncio.create_task(self._board_health_watcher())
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
@@ -4865,6 +4902,67 @@ class GatewayRunner:
         except Exception:
             return "default"
 
+    @staticmethod
+    def _expand_board_notify_subs(_kb, conn, subs: list, notifier_profile) -> None:
+        """S7(a): seed per-task subs for each BOARD-LEVEL subscription row.
+
+        For every sentinel (board-level) sub in ``subs``, register a per-task
+        sub for each live (non-archived, non-done) task on the board, reusing
+        the SAME (platform, chat, thread). ``add_notify_sub`` is idempotent
+        (INSERT OR IGNORE), so an already-subscribed task keeps its cursor and
+        only new tasks get a fresh row. The sentinel row stays in place so
+        future ticks keep covering newly-created tasks. Best-effort: a failure
+        to seed never breaks delivery for already-subscribed tasks.
+        """
+        board_subs = [
+            s for s in subs
+            if s.get("task_id") == _kb.BOARD_NOTIFY_SENTINEL_TASK_ID
+        ]
+        if not board_subs:
+            return
+        try:
+            live_tasks = _kb.list_tasks(conn, include_archived=False)
+        except Exception:
+            return
+        live_ids = [
+            t.id for t in live_tasks
+            if getattr(t, "status", None) not in ("done", "archived")
+        ]
+        if not live_ids:
+            return
+        existing_ids = {s.get("task_id") for s in subs}
+        for bsub in board_subs:
+            for tid in live_ids:
+                try:
+                    _kb.add_notify_sub(
+                        conn,
+                        task_id=tid,
+                        platform=bsub.get("platform"),
+                        chat_id=bsub.get("chat_id"),
+                        thread_id=bsub.get("thread_id") or None,
+                        user_id=bsub.get("user_id"),
+                        notifier_profile=bsub.get("notifier_profile") or notifier_profile,
+                    )
+                except Exception:
+                    logger.debug(
+                        "kanban notifier: board-level fan-out failed for task %s",
+                        tid, exc_info=True,
+                    )
+                    continue
+                # Make the freshly-seeded sub visible to THIS tick's loop so a
+                # task that already has a terminal event isn't missed for one
+                # cycle. Only append genuinely-new ids.
+                if tid not in existing_ids:
+                    existing_ids.add(tid)
+                    subs.append({
+                        "task_id": tid,
+                        "platform": bsub.get("platform"),
+                        "chat_id": bsub.get("chat_id"),
+                        "thread_id": bsub.get("thread_id") or "",
+                        "user_id": bsub.get("user_id"),
+                        "notifier_profile": bsub.get("notifier_profile") or notifier_profile,
+                    })
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -4976,9 +5074,22 @@ class GatewayRunner:
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
                             subs = _kb.list_notify_subs(conn)
+                            # S7(a): expand any BOARD-LEVEL subscription (the
+                            # sentinel task_id) into per-task subs for every
+                            # live (non-archived/non-done) task on this board.
+                            # Idempotent: add_notify_sub IGNOREs duplicates, so a
+                            # task already subscribed is untouched (its cursor is
+                            # preserved) and only genuinely-new tasks get a fresh
+                            # sub. This is how "future agent/intake-created
+                            # tasks are covered, not just per-task".
+                            self._expand_board_notify_subs(_kb, conn, subs, notifier_profile)
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
+                                # The board-level sentinel itself carries no
+                                # task_events; it only seeds per-task subs above.
+                                if sub.get("task_id") == _kb.BOARD_NOTIFY_SENTINEL_TASK_ID:
+                                    continue
                                 owner_profile = sub.get("notifier_profile") or None
                                 if owner_profile and owner_profile != notifier_profile:
                                     logger.debug(
@@ -6194,6 +6305,180 @@ class GatewayRunner:
         while slept < interval and self._running:
             await asyncio.sleep(min(1.0, interval - slept))
             slept += 1.0
+
+    # Launch phases that mean "this managed board is parked waiting on a HUMAN"
+    # (owner approval / credentials) rather than dispatching work. A board that
+    # sits in one of these is worth ONE proactive owner nudge.
+    _BOARD_HEALTH_PENDING_PHASES = ("pending_approval", "pending_credentials")
+
+    @staticmethod
+    def _board_health_enabled() -> bool:
+        """S4 flag: DEFAULT-OFF, mirrors HERMES_ACTION_GATE_CARDS semantics.
+
+        Only an explicit truthy token enables it; unset/empty/falsy => off, so
+        a base install sends zero board-health DMs (byte-identical to today).
+        """
+        raw = os.environ.get("HERMES_BOARD_HEALTH_CARDS", "").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    def _collect_board_health_cards(self, _kb, seen: set) -> list[dict]:
+        """Read-only board-health pass: return ONE card dict per NEW blocked /
+        pending transition not already in ``seen``.
+
+        A card is emitted for either:
+          * a NEW deduped ``dispatch_blocked`` signal (keyed by its
+            ``dedupe_key`` / ``(board, codes)``), OR
+          * a managed board sitting in a pending_approval / pending_credentials
+            launch phase (keyed by ``(board, phase)``).
+
+        ``seen`` is mutated with the key of every card returned so a stuck board
+        is nudged exactly ONCE (no per-tick spam). Never mutates a board/task.
+        """
+        cards: list[dict] = []
+        try:
+            boards = _kb.list_boards(include_archived=False)
+        except Exception:
+            return cards
+        # NOTE: we do NOT dedupe by db_path here (unlike the task-event
+        # notifier). Signals are board-scoped rows and every read filters
+        # ``WHERE board = slug``, so two slugs sharing one DB (e.g. when
+        # HERMES_KANBAN_DB pins a single path) must each be queried for THEIR
+        # own signals. Cross-board double-counting is impossible because of the
+        # board filter; per-board double-NOTIFYING is prevented by ``seen``.
+        for board_meta in boards:
+            slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+
+            # (A) NEW deduped dispatch_blocked signals for this board.
+            try:
+                conn = _kb.connect(board=slug)
+            except Exception:
+                conn = None
+            if conn is not None:
+                try:
+                    signals = _kb.list_dispatch_blocked_signals(conn, board=slug)
+                except Exception:
+                    signals = []
+                finally:
+                    conn.close()
+                # Read the live phase once so the card can name it.
+                try:
+                    phase = str(
+                        _kb.read_board_metadata(slug).get("launch_phase") or ""
+                    ).strip().lower()
+                except Exception:
+                    phase = ""
+                for sig in signals:
+                    codes = sig.get("codes") or ""
+                    key = sig.get("dedupe_key") or f"dispatch_blocked:{slug}:{codes}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    cards.append({
+                        "board": slug,
+                        "kind": "dispatch_blocked",
+                        "codes": codes,
+                        "phase": phase,
+                        "key": key,
+                    })
+
+            # (B) Managed board parked in a human-pending phase.
+            try:
+                meta = _kb.read_board_metadata(slug)
+            except Exception:
+                meta = None
+            if meta is not None and _kb._board_requires_launch_readiness(meta):
+                phase = str(meta.get("launch_phase") or "").strip().lower()
+                if phase in self._BOARD_HEALTH_PENDING_PHASES:
+                    key = f"pending_phase:{slug}:{phase}"
+                    if key not in seen:
+                        seen.add(key)
+                        cards.append({
+                            "board": slug,
+                            "kind": "pending_phase",
+                            "phase": phase,
+                            "codes": "",
+                            "key": key,
+                        })
+        return cards
+
+    @staticmethod
+    def _render_board_health_card(card: dict) -> str:
+        """Render ONE board-health card as a phone-friendly owner sentence."""
+        board = card.get("board")
+        if card.get("kind") == "pending_phase":
+            phase = card.get("phase") or "pending"
+            return (
+                f"⏳ Board `{board}` is waiting on you ({phase}). "
+                f"/kanban boards contract status {board}"
+            )
+        phase = card.get("phase") or "?"
+        codes = card.get("codes") or "blocked"
+        return (
+            f"⚠️ Board `{board}` is {phase.upper()} but BLOCKED ({codes}) — "
+            f"its tasks are idle. /kanban boards contract status {board}"
+        )
+
+    async def _board_health_watcher(self, interval: float = 30.0) -> None:
+        """S4: proactively DM the owner when a board is ACTIVE-but-BLOCKED or
+        parked waiting on a human, ONE card per new transition.
+
+        DEFAULT-OFF (``HERMES_BOARD_HEALTH_CARDS``). Reuses the action-gate
+        owner-DM resolution + the 1s-sliced sleep so shutdown stays snappy.
+        All SQLite work runs in ``asyncio.to_thread``; a per-tick failure never
+        stops later ticks. The in-process ``seen`` set dedupes so a stuck board
+        is nudged once, not every tick.
+        """
+        from gateway.config import Platform as _Platform
+
+        if not self._board_health_enabled():
+            logger.info("board-health watcher: disabled (HERMES_BOARD_HEALTH_CARDS unset)")
+            return
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            logger.warning("board-health watcher: kanban_db not importable; disabled")
+            return
+
+        interval = max(float(interval), 5.0)
+        seen: set = getattr(self, "_board_health_seen", set())
+        self._board_health_seen = seen
+
+        await asyncio.sleep(5)  # let adapters wire up
+
+        while self._running:
+            try:
+                adapter = self.adapters.get(_Platform.TELEGRAM)
+                owner_dm = self._action_gate_owner_dm() if adapter is not None else None
+                if adapter is None or not owner_dm:
+                    await self._action_gate_sleep(interval)
+                    continue
+                cards = await asyncio.to_thread(
+                    self._collect_board_health_cards, _kb, seen,
+                )
+                for card in cards:
+                    if not self._running:
+                        return
+                    msg = self._render_board_health_card(card)
+                    try:
+                        await adapter.send(str(owner_dm), msg)
+                        logger.info(
+                            "board-health watcher: sent %s card for board %s",
+                            card.get("kind"), card.get("board"),
+                        )
+                    except Exception as exc:
+                        # Delivery failed: drop the key so a later tick retries
+                        # (we have not actually notified the owner).
+                        seen.discard(card.get("key"))
+                        logger.warning(
+                            "board-health watcher: send failed for %s: %s",
+                            card.get("board"), exc,
+                        )
+            except asyncio.CancelledError:
+                logger.debug("board-health watcher: cancelled")
+                raise
+            except Exception:
+                logger.exception("board-health watcher: unexpected watcher error")
+            await self._action_gate_sleep(interval)
 
     async def _platform_reconnect_watcher(self) -> None:
         """Background task that periodically retries connecting failed platforms.
@@ -8114,6 +8399,9 @@ class GatewayRunner:
 
         if canonical == "approve":
             return await self._handle_approve_command(event)
+
+        if canonical == "pending":
+            return await self._handle_pending_command(event)
 
         if canonical == "deny":
             return await self._handle_deny_command(event)
@@ -14472,6 +14760,213 @@ class GatewayRunner:
             return ""
 
     @staticmethod
+    def _format_pending_age(created_at) -> str:
+        """Render the age of a pending escalation as a compact owner string."""
+        try:
+            age = max(0, int(time.time()) - int(created_at))
+        except Exception:
+            return "?"
+        if age < 60:
+            return f"{age}s"
+        if age < 3600:
+            return f"{age // 60}m"
+        if age < 86400:
+            return f"{age // 3600}h"
+        return f"{age // 86400}d"
+
+    async def _handle_pending_command(self, event: MessageEvent) -> str:
+        """S7(b): read-only `/pending` digest — open action-gate escalations +
+        boards awaiting launch, in one phone-friendly message.
+
+        Lists each open escalation (id, board/task, tool, age) and RE-SENDS its
+        approve/deny card (reusing ``send_action_gate_card`` — same
+        ``ag:approve:<id>`` / ``ag:deny:<id>`` buttons the watcher uses) so the
+        owner can act inline. Also appends drafted boards awaiting `/approve`
+        (reuses ``_pending_board_launch_summary``). No authz change: this only
+        READS and re-renders existing escalations; it never approves or denies.
+        """
+        try:
+            from agent import action_gate as _ag
+            escalations = await asyncio.to_thread(_ag.fetch_open_pending)
+        except Exception:
+            logger.debug("/pending: action_gate fetch failed", exc_info=True)
+            escalations = []
+
+        lines: list[str] = ["📋 *Pending*"]
+        if escalations:
+            lines.append("")
+            lines.append(f"Open action-gate escalations ({len(escalations)}):")
+            for row in escalations:
+                aid = row.get("id")
+                tool = str(row.get("tool_name") or "?")
+                # Action-gate rows are scoped by session/task; surface task when
+                # present so a fleet owner can tell escalations apart.
+                scope = str(row.get("task_id") or row.get("session_id") or "")
+                scope_note = f" · {scope}" if scope else ""
+                age = self._format_pending_age(row.get("created_at"))
+                lines.append(f"• #{aid} `{tool}`{scope_note} — {age} old")
+        else:
+            lines.append("")
+            lines.append("No open action-gate escalations.")
+
+        # Re-send the inline approve/deny cards (best-effort) so the owner can
+        # act without scrolling back. Only when telegram is connected + an
+        # owner DM resolves; failures here never break the text digest.
+        try:
+            from gateway.config import Platform as _Platform
+            adapter = self.adapters.get(_Platform.TELEGRAM)
+            owner_dm = self._action_gate_owner_dm() if adapter is not None else None
+            if adapter is not None and owner_dm and escalations:
+                for row in escalations:
+                    aid = row.get("id")
+                    if aid is None:
+                        continue
+                    try:
+                        await adapter.send_action_gate_card(
+                            chat_id=str(owner_dm),
+                            action_id=int(aid),
+                            tool_name=str(row.get("tool_name") or ""),
+                            description=str(row.get("description") or ""),
+                            profile=str(row.get("profile") or ""),
+                            args_preview=str(row.get("tool_args") or ""),
+                            classification=str(row.get("classification") or ""),
+                        )
+                    except Exception:
+                        logger.debug(
+                            "/pending: re-send card failed for id=%s", aid, exc_info=True,
+                        )
+        except Exception:
+            logger.debug("/pending: card re-send pass failed", exc_info=True)
+
+        # Boards awaiting launch (read-only; reuses the shared summary).
+        launch_summary = self._pending_board_launch_summary()
+        if launch_summary:
+            lines.append(launch_summary)
+        elif not escalations:
+            lines.append("\nNo boards awaiting launch.")
+        return "\n".join(lines)
+
+    def _resolve_launch_owner_verdict(self, source) -> tuple:
+        """S5(a): confirm the /approve invoker is the resolved board owner BEFORE
+        a launch token is minted.
+
+        Returns ``(verdict, detail)``:
+          * ``("owner", None)``      — the invoker matches the resolved owner
+            identity (slash-gating admin OR ``TELEGRAM_ALLOWED_USERS[0]``);
+            mint normally.
+          * ``("denied", reason)``   — owner identity IS resolvable and the
+            invoker does NOT match it; FAIL CLOSED (refuse, never mint).
+          * ``("unconfirmed", note)``— owner identity can't be confirmed at all
+            (slash-gating disabled / no ``allow_admin_from``, AND no
+            ``TELEGRAM_ALLOWED_USERS``). The caller still mints (the legacy
+            trust boundary is the admin-gated command path) but MUST surface a
+            one-line warning that approval ran without slash-gating, so a
+            silent un-gated mint is never possible.
+
+        This ADDS an explicit owner-id check on top of the existing
+        owner-confirmed token path; it never widens who can mint.
+        """
+        user_id = str(getattr(source, "user_id", "") or "").strip()
+
+        # (1) Authoritative slash-gating identity, when the operator opted in
+        #     (allow_admin_from set for this scope -> policy.enabled).
+        try:
+            from gateway.slash_access import policy_for_source as _policy_for_source
+            policy = _policy_for_source(getattr(self, "config", None), source)
+        except Exception:
+            policy = None
+        if policy is not None and getattr(policy, "enabled", False):
+            if user_id and policy.is_admin(user_id):
+                return ("owner", None)
+            return (
+                "denied",
+                "you are not an admin for this scope (slash-gating is on)",
+            )
+
+        # (2) Canonical owner allowlist (TELEGRAM_ALLOWED_USERS[0]) — the same
+        #     identity the action gate uses for its owner DM.
+        try:
+            owner_dm = self._action_gate_owner_dm()
+        except Exception:
+            owner_dm = None
+        if owner_dm:
+            owner_dm = str(owner_dm).strip()
+            if user_id and user_id == owner_dm:
+                return ("owner", None)
+            if user_id:
+                return (
+                    "denied",
+                    "your user id does not match the configured owner",
+                )
+            # No user_id on the event but an owner is configured — can't match.
+            return ("denied", "no user id on the approval request")
+
+        # (3) Nothing to check against: slash-gating off AND no allowlist.
+        return (
+            "unconfirmed",
+            "slash-gating is not configured (allow_admin_from / "
+            "TELEGRAM_ALLOWED_USERS unset)",
+        )
+
+    def _mint_and_activate_launch(
+        self, kb, slug: str, *, contract, approved_by: str, evidence: dict
+    ) -> dict:
+        """Mint a one-time launch token and immediately activate ``slug`` with it.
+
+        Single source of truth for the mint->activate handshake the /approve
+        owner path uses. Returns the ``review_business_launch_contract`` result
+        dict on success.
+
+        Recoverable-expiry handling (S6): the token is consumed in the call
+        right after it is minted, so an expiry is normally impossible. But the
+        consume path fails CLOSED on an expired / contract-mismatched token,
+        and the owner could legitimately answer this /approve much later than
+        the previous draft. Because this handler re-resolved the LIVE contract
+        already and the /approve command IS fresh owner authority, a CLEAN
+        expiry / contract-mismatch on activation is recovered by minting one
+        fresh token against the same just-resolved contract and retrying
+        activation exactly ONCE. A second clean failure raises
+        :class:`_RecoverableLaunchTokenError` so the caller can ask the owner
+        to re-issue. Any other (unrecoverable) ValueError -- e.g. "not
+        launch-ready" -- propagates unchanged so a genuinely incomplete board
+        is still refused, never launched.
+        """
+        max_attempts = 2  # initial mint + at most one clean re-mint
+        last_recoverable: Optional[ValueError] = None
+        for attempt in range(max_attempts):
+            token = kb.issue_board_launch_approval_token(
+                slug,
+                contract=contract,
+                approved_by=approved_by,
+                approval_evidence=evidence,
+                approval_reason="owner /approve in admin-gated chat",
+                owner_authority_confirmed=True,
+                owner_acknowledged_coverage=True,
+            )["token"]
+            try:
+                return kb.review_business_launch_contract(
+                    slug,
+                    contract=contract,
+                    approve=True,
+                    author=approved_by,
+                    approved_by=approved_by,
+                    approval_evidence=evidence,
+                    approval_token=token,
+                )
+            except ValueError as exc:
+                if not _is_recoverable_launch_token_error(exc):
+                    # Unrecoverable (e.g. not launch-ready): fail CLOSED.
+                    raise
+                last_recoverable = exc
+                logger.info(
+                    "launch token for %s rejected as recoverable (%s); "
+                    "re-mint attempt %d/%d",
+                    slug, exc, attempt + 1, max_attempts,
+                )
+                continue
+        raise _RecoverableLaunchTokenError(str(last_recoverable or "approval expired"))
+
+    @staticmethod
     def _owner_facing_gate_reasons(kb, gate: dict) -> str:
         """Render a board_dispatch_gate() result's blockers as plain owner prose.
 
@@ -14612,6 +15107,35 @@ class GatewayRunner:
         launch_amendment_id = resolution.get("amendment_id")
 
         source = event.source
+
+        # APPROVAL SAFETY (S5(a)): explicitly confirm the invoker is the
+        # resolved owner BEFORE minting a launch token. Fail CLOSED if the
+        # invoker is a known non-owner; if owner identity can't be confirmed at
+        # all (slash-gating off + no allowlist) we still mint (the admin-gated
+        # command path is the legacy trust boundary) but MUST warn so an
+        # un-gated approval is never silent.
+        unconfirmed_owner_warning = ""
+        verdict, detail = self._resolve_launch_owner_verdict(source)
+        if verdict == "denied":
+            logger.warning(
+                "/approve %s refused: invoker not owner (%s) user_id=%r",
+                slug, detail, getattr(source, "user_id", None),
+            )
+            return (
+                f"⛔ `/approve {slug}` refused — {detail}. Only the board owner "
+                "can launch a board."
+            )
+        if verdict == "unconfirmed":
+            logger.warning(
+                "/approve %s minting WITHOUT slash-gating: %s", slug, detail,
+            )
+            unconfirmed_owner_warning = (
+                "⚠️ Heads up: this approval ran WITHOUT slash-gating "
+                f"({detail}), so owner identity wasn't verified. Set "
+                "`allow_admin_from` (or `TELEGRAM_ALLOWED_USERS`) to gate "
+                "`/approve` to you.\n\n"
+            )
+
         platform = (
             source.platform.value if source and source.platform else "?"
         )
@@ -14645,20 +15169,42 @@ class GatewayRunner:
             _preview_statement[:200],
         )
 
-        # 1) Mint the one-time launch token. owner_authority_confirmed=True is
-        #    the human authority boundary; owner_acknowledged_coverage=True
-        #    because the owner is explicitly approving the drafted contract the
-        #    agent already surfaced to them in chat.
+        # 1+2) Mint the one-time launch token, then activate with it.
+        #    owner_authority_confirmed=True is the human authority boundary;
+        #    owner_acknowledged_coverage=True because the owner is explicitly
+        #    approving the drafted contract the agent already surfaced in chat.
+        #    Activation compiles the contract runtime and binds the
+        #    contract-role profiles to this board (server-side inside
+        #    review_business_launch_contract).
+        #
+        #    RECOVERABLE EXPIRY (S6): the token is minted here and consumed in
+        #    the very next call, so a clean expiry between the two is normally
+        #    impossible; but the consume path fails CLOSED on any expired /
+        #    contract-mismatched token. Because /approve re-resolved the LIVE
+        #    contract above and the owner's command IS the fresh authority, a
+        #    clean-expiry/contract-mismatch on activation is safe to recover by
+        #    minting one fresh token (against the same just-resolved contract)
+        #    and retrying activation ONCE. We never reuse a token (single-use
+        #    invariant intact) and never widen who can approve.
         try:
-            token = kb.issue_board_launch_approval_token(
+            result = self._mint_and_activate_launch(
+                kb,
                 slug,
                 contract=contract,
                 approved_by=approved_by,
-                approval_evidence=evidence,
-                approval_reason="owner /approve in admin-gated chat",
-                owner_authority_confirmed=True,
-                owner_acknowledged_coverage=True,
-            )["token"]
+                evidence=evidence,
+            )
+        except _RecoverableLaunchTokenError as exc:
+            # The clean expiry / contract-mismatch survived the single re-mint
+            # retry (e.g. the live contract genuinely moved underneath us).
+            # Tell the owner in plain words that their authority is still good
+            # and a simple re-issue fixes it -- never a dead-end "expired".
+            return (
+                f"⌛ Your approval for `{slug}` couldn't be applied because the "
+                f"approval window had moved on ({exc}). Your `/approve` is still "
+                f"the authority -- just send `/approve {slug}` again to re-issue "
+                "it against the current contract."
+            )
         except ValueError as exc:
             return (
                 f"⛔ Can't approve `{slug}` yet: {exc}\n"
@@ -14666,27 +15212,8 @@ class GatewayRunner:
                 f"launch status), then `/approve {slug}` again."
             )
         except Exception as exc:
-            logger.exception("board launch token mint failed for %s", slug)
+            logger.exception("board mint+activation failed for %s", slug)
             return f"⛔ Approval failed for `{slug}`: {exc}"
-
-        # 2) Activate with the freshly minted token. Activation compiles the
-        #    contract runtime and binds the contract-role profiles to this
-        #    board (both happen server-side inside review_business_launch_contract).
-        try:
-            result = kb.review_business_launch_contract(
-                slug,
-                contract=contract,
-                approve=True,
-                author=approved_by,
-                approved_by=approved_by,
-                approval_evidence=evidence,
-                approval_token=token,
-            )
-        except ValueError as exc:
-            return f"⛔ `{slug}` launch rejected on activation: {exc}"
-        except Exception as exc:
-            logger.exception("board activation failed for %s", slug)
-            return f"⛔ Activation failed for `{slug}`: {exc}"
 
         result_phase = str(result.get("launch_phase") or "").strip().lower()
         if result_phase != "active":
@@ -14707,6 +15234,37 @@ class GatewayRunner:
             "\nBound profiles: " + ", ".join(f"`{p}`" for p in bound)
             if bound else ""
         )
+
+        # S7(a): auto-subscribe the approving owner's chat to this board's task
+        # stream at the BOARD LEVEL so future agent/intake-created tasks are
+        # covered, not just the ones that exist now. Best-effort: a failed
+        # subscribe must never block the launch confirmation.
+        updates_note = ""
+        platform_str = (source.platform.value if source and source.platform else "").lower()
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if platform_str and chat_id:
+            try:
+                thread_id = str(getattr(source, "thread_id", "") or "") or None
+                user_id = str(getattr(source, "user_id", "") or "") or None
+                notifier_profile = (
+                    getattr(self, "_kanban_notifier_profile", None)
+                    or self._active_profile_name()
+                )
+                conn = kb.connect(board=slug)
+                try:
+                    kb.add_board_notify_sub(
+                        conn,
+                        platform=platform_str,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        user_id=user_id,
+                        notifier_profile=notifier_profile,
+                    )
+                finally:
+                    conn.close()
+                updates_note = " You'll get updates here."
+            except Exception:
+                logger.debug("board-level auto-subscribe on /approve failed", exc_info=True)
         # Prefer the deterministic, structured owner summary (pipeline, watchers,
         # knobs, approval boundaries) so the owner sees exactly what just went
         # live; fall back to the synthesizer's free-text owner_summary string.
@@ -14741,11 +15299,11 @@ class GatewayRunner:
         )
         header = (
             f"✅ Board `{slug}` launched — phase: **active**. "
-            "Runtime compiled and profiles bound." + source_note
+            "Runtime compiled and profiles bound." + source_note + updates_note
         )
         if summary_block:
-            return f"{header}{bound_line}\n\n{summary_block}"
-        return f"{header}{bound_line}"
+            return f"{unconfirmed_owner_warning}{header}{bound_line}\n\n{summary_block}"
+        return f"{unconfirmed_owner_warning}{header}{bound_line}"
 
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).
