@@ -339,3 +339,36 @@ def loop_max_nudges(loop: dict, tunables: Optional[dict] = None) -> Optional[int
         if best is not None:
             return best[1]
     return None
+
+
+def loop_declared_terminal_classes(loop: dict) -> dict[str, str]:
+    """Resolve a loop's DECLARED terminal-state -> outcome-class map (9b, opt-in).
+
+    Delegates to the closed-vocabulary grammar so the reward rail and the intake
+    validator agree on what a declared class is. Returns an empty dict when the
+    loop did not opt in (no declared classes) -- the caller keeps the legacy
+    substring reward behavior, byte-identical to today.
+    """
+    try:
+        from hermes_cli.kanban_launch_grammar import (
+            loop_declared_terminal_classes as _grammar_classes,
+        )
+        return _grammar_classes(loop)
+    except Exception:  # pragma: no cover - defensive: degrade to legacy (no opt-in)
+        return {}
+
+
+def loop_max_defers(loop: dict) -> Optional[int]:
+    """Resolve a loop's bound on approval-deferral ticks (9c, opt-in).
+
+    Looks at the loop itself (``max_defers`` / ``max_deferrals``). ``None`` means
+    NO declared bound -> unbounded deferral, byte-identical to today's behavior.
+    Only a loop that explicitly declares a non-negative bound gets the anti-zombie
+    cap. A bare ``0`` is honored (terminate on the first unapproved fire attempt).
+    """
+    if isinstance(loop, dict):
+        for key in ("max_defers", "max_deferrals", "max_defer"):
+            n = _coerce_int(loop.get(key))
+            if n is not None and n >= 0:
+                return n
+    return None

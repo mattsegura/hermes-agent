@@ -230,6 +230,95 @@ def normalize_side_effect_class(value: Any) -> Optional[str]:
     canon = value.strip().lower()
     return canon if canon in SIDE_EFFECT_CLASSES else None
 
+
+# --------------------------------------------------------------------------
+# Closed vocabulary -- the single source of truth for TERMINAL OUTCOME classes.
+#
+# DECLARE, DON'T INFER (mirrors the trigger ``kind`` / ``side_effect_class``
+# patterns). The reward rail used to decide "is this terminal a conversion?" by
+# substring-guessing ``won`` on free text -- so ``unwon`` / ``wonky`` /
+# ``won_but_lost`` wrongly earned the 1.0 conversion reward. The durable fix is a
+# DECLARED class on a loop's ``terminal_states``: a loop may tag each terminal
+# state with its outcome class and the reward rail credits ONLY a declared
+# ``win`` terminal (exact match, no substring). The closed vocabulary is::
+#
+#     win | loss | neutral
+#
+#   win     -- a converting terminal (earns the conversion reward).
+#   loss    -- a losing terminal (never credits).
+#   neutral -- a non-converting close that is neither a win nor a loss
+#              (e.g. owner_stopped / disqualified-by-policy); never credits.
+# --------------------------------------------------------------------------
+TERMINAL_OUTCOME_CLASSES: frozenset[str] = frozenset({"win", "loss", "neutral"})
+
+
+def is_known_terminal_outcome_class(value: Any) -> bool:
+    """True iff ``value`` is a member of the closed terminal-outcome vocabulary."""
+    return isinstance(value, str) and value.strip().lower() in TERMINAL_OUTCOME_CLASSES
+
+
+def normalize_terminal_outcome_class(value: Any) -> Optional[str]:
+    """Return the canonical (lower, stripped) terminal class, or None if not in vocab."""
+    if not isinstance(value, str):
+        return None
+    canon = value.strip().lower()
+    return canon if canon in TERMINAL_OUTCOME_CLASSES else None
+
+
+def loop_declared_terminal_classes(loop: Any) -> dict[str, str]:
+    """Extract a loop's DECLARED terminal-state -> outcome-class map.
+
+    A loop OPTS IN to the declared-class reward path by tagging its terminal
+    states with a closed-vocabulary class. Two declaration shapes are accepted::
+
+        # (1) a list of {state/key/outcome, class} objects
+        "terminal_states": [
+            {"state": "closed_won", "class": "win"},
+            {"state": "closed_lost", "class": "loss"},
+            {"state": "owner_stopped", "class": "neutral"},
+        ]
+
+        # (2) a sibling map keyed by terminal-state name
+        "terminal_states": ["closed_won", "closed_lost", "owner_stopped"],
+        "terminal_classes": {"closed_won": "win", "closed_lost": "loss"}
+
+    Returns a ``{normalized_state: normalized_class}`` dict containing ONLY the
+    entries whose class is in the closed vocabulary. An empty dict means the loop
+    did NOT opt in (it has no declared classes) -- the caller keeps the legacy
+    substring behavior. An unknown class string is dropped (it does not opt the
+    loop in), so a fat-fingered class can never silently flip reward behavior.
+    """
+    if not isinstance(loop, dict):
+        return {}
+    out: dict[str, str] = {}
+    # Shape (1): {state, class} objects embedded in terminal_states.
+    for src in ("terminal_states", "terminal_state"):
+        items = loop.get(src)
+        if isinstance(items, (list, tuple)):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                state = str(
+                    item.get("state")
+                    or item.get("key")
+                    or item.get("outcome")
+                    or ""
+                ).strip().lower()
+                cls = normalize_terminal_outcome_class(
+                    item.get("class") or item.get("kind")
+                )
+                if state and cls:
+                    out[state] = cls
+    # Shape (2): a sibling terminal_classes map.
+    classes_map = loop.get("terminal_classes")
+    if isinstance(classes_map, dict):
+        for state, cls in classes_map.items():
+            s = str(state or "").strip().lower()
+            c = normalize_terminal_outcome_class(cls)
+            if s and c:
+                out[s] = c
+    return out
+
 # Reply-style tokens: an external party is responding to us, so the stage models
 # an ongoing conversation that must be watched. Kept tight to reply words so a
 # free-text trigger that merely contains the noun "message" or "call" (e.g.

@@ -27,10 +27,12 @@ from hermes_cli.kanban_launch_grammar import (
     SENSOR_OPTIONAL_KNOBS,
     SENSOR_REQUIRED_KNOBS,
     SIDE_EFFECT_CLASSES,
+    TERMINAL_OUTCOME_CLASSES,
     has_inbound as _grammar_has_inbound,
     has_timer as _grammar_has_timer,
     is_external_side_effect_class as _grammar_is_external_side_effect,
     is_known_side_effect_class as _grammar_is_known_side_effect,
+    loop_declared_terminal_classes as _grammar_loop_terminal_classes,
     normalize_side_effect_class as _grammar_normalize_side_effect,
     normalize_sensor_kind as _grammar_normalize_sensor_kind,
     trigger_kind as _grammar_trigger_kind,
@@ -273,6 +275,50 @@ def _loop_has_finite_max_nudges(loop: dict[str, Any], root: dict[str, Any]) -> b
     return False
 
 
+def _iter_declared_loop_terminal_classes(loop: dict[str, Any]):
+    """Yield ``(state, raw_class)`` for every declared terminal-state class.
+
+    Mirrors the two declaration shapes the grammar accepts: ``{state, class}``
+    objects embedded in ``terminal_states`` and a sibling ``terminal_classes``
+    map. Only entries that actually carry a class are yielded; a loop with no
+    declared class yields nothing (it did NOT opt in -- legacy substring path).
+    """
+    for src in ("terminal_states", "terminal_state"):
+        items = loop.get(src)
+        if isinstance(items, (list, tuple)):
+            for item in items:
+                if isinstance(item, dict) and (item.get("class") or item.get("kind")):
+                    state = str(
+                        item.get("state") or item.get("key") or item.get("outcome") or ""
+                    ).strip()
+                    yield (state or "(unnamed)", item.get("class") or item.get("kind"))
+    classes_map = loop.get("terminal_classes")
+    if isinstance(classes_map, dict):
+        for state, cls in classes_map.items():
+            yield (str(state or "(unnamed)").strip(), cls)
+
+
+def _check_loop_terminal_classes(
+    name: str, loop: dict[str, Any], report: InvariantReport
+) -> None:
+    """9(b): a DECLARED terminal-outcome class must be in the closed vocabulary.
+
+    Opt-in: a loop with no declared classes is unaffected (legacy path). When a
+    loop DOES declare classes, an unknown class is an error -- the reward rail
+    would otherwise silently drop it and the loop would credit on the substring
+    fallback, exactly the infer-from-strings failure this work removes.
+    """
+    for state, raw in _iter_declared_loop_terminal_classes(loop):
+        canon = str(raw or "").strip().lower()
+        if canon not in TERMINAL_OUTCOME_CLASSES:
+            report.errors.append(
+                f"event loop '{name}' terminal state '{state}' declares unknown "
+                f"outcome class {raw!r} -- must be one of {sorted(TERMINAL_OUTCOME_CLASSES)}; "
+                f"an untyped class is silently dropped and the loop credits on the "
+                f"substring fallback instead of the declared win."
+            )
+
+
 def _check_event_loops(root: dict[str, Any], report: InvariantReport) -> None:
     # Synthesized-style contracts model the watcher as event_loops + entities.
     loops = [e for e in _as_list(root.get("event_loops")) if isinstance(e, dict)]
@@ -301,6 +347,12 @@ def _check_event_loops(root: dict[str, Any], report: InvariantReport) -> None:
                     f"event loop '{name}' declares no terminal_states or stop_conditions -- "
                     f"it can never stop watching."
                 )
+        # 9(b) DECLARE-DON'T-INFER: when a loop OPTS IN to declared terminal
+        # classes, every declared class MUST be a member of the closed
+        # vocabulary. A fat-fingered class (e.g. "wonn" / "victory") would
+        # otherwise be silently dropped and the loop would fall back to the
+        # substring reward path -- so it must surface at intake, not run blind.
+        _check_loop_terminal_classes(name, loop, report)
         if _grammar_has_inbound(triggers):
             if not _grammar_has_timer(triggers):
                 report.errors.append(

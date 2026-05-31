@@ -9694,12 +9694,15 @@ CREATE TABLE IF NOT EXISTS reactive_timer_schedules (
     side_effect_class TEXT,
     action          TEXT,
     terminal_states TEXT,
+    terminal_classes TEXT,
     stop_conditions TEXT,
     active          INTEGER NOT NULL DEFAULT 1,
     stop_reason     TEXT,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL,
     last_fired_at   INTEGER,
+    max_defers      INTEGER,
+    defers_used     INTEGER NOT NULL DEFAULT 0,
     UNIQUE(board, loop_key, entity_id)
 );
 
@@ -11041,6 +11044,39 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "UPDATE task_events SET kind = ? WHERE kind = ?",
             (new, old),
         )
+
+    # reactive_timer_schedules gained additive, default-OFF columns for the
+    # declared-vocabulary safety work (Step 9). All are NULL on legacy rows so an
+    # existing board's timer behavior is byte-identical:
+    #   * ``terminal_classes`` -- 9(b): a JSON {state: win|loss|neutral} map a
+    #     loop OPTS IN to. NULL/absent = no declared classes = the corrected
+    #     legacy substring reward path (no behavior change for legacy loops).
+    #   * ``max_defers``       -- 9(c): a bound on approval-deferral ticks. NULL =
+    #     unbounded = today's behavior; only a board that SETS it gets the bound.
+    #   * ``defers_used``      -- 9(c): the running defer counter (DEFAULT 0). It
+    #     only matters once ``max_defers`` is set, so legacy rows are unaffected.
+    schedules_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='reactive_timer_schedules'"
+    ).fetchone() is not None
+    if schedules_table_exists:
+        sched_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(reactive_timer_schedules)")
+        }
+        if "terminal_classes" not in sched_cols:
+            _add_column_if_missing(
+                conn, "reactive_timer_schedules", "terminal_classes",
+                "terminal_classes TEXT",
+            )
+        if "max_defers" not in sched_cols:
+            _add_column_if_missing(
+                conn, "reactive_timer_schedules", "max_defers", "max_defers INTEGER",
+            )
+        if "defers_used" not in sched_cols:
+            _add_column_if_missing(
+                conn, "reactive_timer_schedules", "defers_used",
+                "defers_used INTEGER NOT NULL DEFAULT 0",
+            )
 
     # board_signals gained a ``dedupe_key`` column (exactly-once reward
     # attribution). Legacy rows get NULL (no dedupe key -> never collapsed),
@@ -17195,17 +17231,26 @@ def _upsert_timer_schedule(
     stop_conditions: list[str],
     action: Optional[dict],
     now: int,
+    terminal_classes: Optional[dict[str, str]] = None,
+    max_defers: Optional[int] = None,
 ) -> None:
-    """Idempotently register a timer schedule for a loop (UNIQUE board+loop+entity)."""
+    """Idempotently register a timer schedule for a loop (UNIQUE board+loop+entity).
+
+    ``terminal_classes`` (9b) and ``max_defers`` (9c) are OPT-IN: a loop that does
+    not declare them leaves both NULL, which is byte-identical to a legacy row
+    (corrected-substring reward + unbounded deferral). Only a loop that declares a
+    closed-vocabulary terminal class / a defer bound persists a non-NULL value.
+    """
     with write_txn(conn):
         conn.execute(
             """
             INSERT OR IGNORE INTO reactive_timer_schedules (
                 board, loop_key, entity_id, task_id, trigger_type, trigger_key,
                 cadence_seconds, next_fire_at, nudges_used, max_nudges,
-                side_effect_class, action, terminal_states, stop_conditions,
-                active, created_at, updated_at, last_fired_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 1, ?, ?, NULL)
+                side_effect_class, action, terminal_states, terminal_classes,
+                stop_conditions, active, created_at, updated_at, last_fired_at,
+                max_defers, defers_used
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, 0)
             """,
             (
                 board,
@@ -17220,9 +17265,11 @@ def _upsert_timer_schedule(
                 _normalize_funnel_text(side_effect_class),
                 _json_text_or_none(action),
                 json.dumps(terminal_states, ensure_ascii=False) if terminal_states else None,
+                json.dumps(terminal_classes, ensure_ascii=False) if terminal_classes else None,
                 json.dumps(stop_conditions, ensure_ascii=False) if stop_conditions else None,
                 now,
                 now,
+                int(max_defers) if max_defers is not None else None,
             ),
         )
 
@@ -17355,6 +17402,11 @@ def _compile_one_reactive_loop(
         terminal_states = _reactive.loop_terminal_states(loop)
         stop_conditions = _reactive.loop_stop_conditions(loop)
         max_nudges = _reactive.loop_max_nudges(loop, tunables)
+        # 9(b)/9(c) opt-in: a loop may DECLARE a closed-vocabulary terminal class
+        # map and/or a defer bound. Both are empty/None for legacy loops, so the
+        # schedule row is byte-identical to today unless the contract opts in.
+        terminal_classes = _reactive.loop_declared_terminal_classes(loop) or None
+        max_defers = _reactive.loop_max_defers(loop)
         side_effect_class = str(
             loop.get("side_effect_class")
             or spec.get("side_effect_class")
@@ -17390,6 +17442,8 @@ def _compile_one_reactive_loop(
                 max_nudges=max_nudges,
                 side_effect_class=side_effect_class,
                 terminal_states=terminal_states,
+                terminal_classes=terminal_classes,
+                max_defers=max_defers,
                 stop_conditions=stop_conditions,
                 action={
                     "kind": "timer_follow_up",
@@ -17461,6 +17515,41 @@ def record_contract_approval(
                     {"gate_key": gate, "approved_by": approved_by},
                 )
     return signal_id
+
+
+def _side_effect_strict_enabled(policy: dict) -> bool:
+    """9(a): is DEFAULT-DENY side-effect enforcement OPTED IN for this board?
+
+    Per-board, DECLARED on the contract so it travels with the board (not a
+    global flag): ``side_effect_policy.strict: true``. DEFAULT-OFF -- an absent /
+    falsey field means the legacy fall-through gate, byte-identical to today. A
+    board only gets fail-closed enforcement when it explicitly declares it.
+    """
+    if not isinstance(policy, dict):
+        return False
+    return _coerce_bool(policy.get("strict"))
+
+
+def _side_effect_class_is_recognized(side_effect_class: Optional[str]) -> bool:
+    """True iff ``side_effect_class`` is a member of the closed vocabulary.
+
+    The canonical set is :data:`kanban_launch_grammar.SIDE_EFFECT_CLASSES`
+    (none / internal / external_reversible / external_irreversible / financial).
+    A typo'd / near-miss class is UNRECOGNIZED -- under strict enforcement that
+    routes to approval (fail-closed) instead of firing ungated. Callers pass the
+    COALESCED class (NULL -> "none"), so an absent class reads as the benign
+    ``none`` and is NOT treated as suspicious (that would defer every legitimate
+    read-only loop, since ``_normalize_funnel_text`` persists "none" as NULL).
+    """
+    try:
+        from hermes_cli.kanban_launch_grammar import is_known_side_effect_class
+        return bool(is_known_side_effect_class(side_effect_class))
+    except Exception:  # pragma: no cover - defensive: degrade to inlined vocab
+        canon = str(side_effect_class or "").strip().lower()
+        return canon in {
+            "none", "internal", "external_reversible",
+            "external_irreversible", "financial",
+        }
 
 
 def _reactive_side_effect_approved(
@@ -17538,6 +17627,35 @@ def _timer_schedule_terminal_states(row: Any) -> list[str]:
         return []
 
 
+def _timer_schedule_terminal_classes(row: Any) -> dict[str, str]:
+    """Read a schedule row's DECLARED terminal-state -> outcome-class map (9b).
+
+    Empty when the column is absent (legacy DB before the additive migration) or
+    NULL (a loop that did not opt in) -- the caller then keeps the corrected
+    legacy substring reward path. Only a loop that declared closed-vocabulary
+    classes returns a non-empty map.
+    """
+    try:
+        raw = row["terminal_classes"] if "terminal_classes" in row.keys() else None
+    except Exception:
+        raw = None
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    out: dict[str, str] = {}
+    for state, cls in parsed.items():
+        s = str(state or "").strip().lower()
+        c = str(cls or "").strip().lower()
+        if s and c:
+            out[s] = c
+    return out
+
+
 # G6: decouple the conversion reward from the literal 'won' substring. Before,
 # the reward only fired when ``terminal_outcome`` literally contained 'won', so a
 # domain whose win terminal is ``under_contract`` / ``onboarded`` / ``published``
@@ -17556,6 +17674,37 @@ def _timer_schedule_terminal_states(row: Any) -> list[str]:
 # paid / signed / sold / delivered / completed / approved / ...). If that import
 # fails we fall back to the legacy 'won'-substring-only behavior, never crashing
 # and never silently dropping the existing reward path.
+
+#: The SAME loss-terminal denylist launch_completeness uses, inlined here as a
+#: defensive fallback so the reward rail's loss check never depends on an import
+#: succeeding. Kept byte-identical to launch_completeness._LOSS_TERMINAL_TOKENS.
+_LEGACY_LOSS_TOKENS: tuple[str, ...] = (
+    "lost", "loss", "closed_lost", "unsigned", "incomplete",
+    "not_completed", "not_complete", "disapprov", "disqualif",
+    "reject", "declin", "cancel", "abandon", "churn", "expired",
+    "dead", "failed", "fail", "withdrawn", "bounced",
+)
+
+
+def _outcome_is_loss_token(outcome: str) -> bool:
+    """True when ``outcome`` reads as an explicit LOSS terminal.
+
+    Used to make the legacy 'won'-substring reward shortcut loss-aware: a loss
+    terminal that embeds the 'won' substring (``won_but_lost`` / ``closed_lost``
+    / ...) must NEVER earn the conversion reward. Mirrors the launch_completeness
+    loss denylist (the SAME tokens the spec's win detector applies first);
+    imported defensively, degrading to the inlined copy on import failure so the
+    loss check is never silently skipped (fail-closed for the reward gate).
+    """
+    t = (outcome or "").strip().lower()
+    if not t:
+        return False
+    try:
+        from hermes_cli.launch_completeness import _LOSS_TERMINAL_TOKENS as _loss
+        return any(tok in t for tok in _loss)
+    except Exception:  # pragma: no cover - defensive: never skip the loss check
+        return any(tok in t for tok in _LEGACY_LOSS_TOKENS)
+
 
 def _looks_like_win_token(token: Optional[str]) -> bool:
     """True when ``token`` reads as a win-class outcome.
@@ -17589,29 +17738,54 @@ def _looks_like_win_token(token: Optional[str]) -> bool:
 
 
 def _terminal_outcome_is_conversion(
-    terminal_outcome: Optional[str], declared_terminal_states: list[str]
+    terminal_outcome: Optional[str],
+    declared_terminal_states: list[str],
+    declared_terminal_classes: Optional[dict[str, str]] = None,
 ) -> bool:
     """Decide whether a loop's terminal outcome should emit the conversion reward.
 
-    A conversion is credited when the outcome is a DECLARED win-class terminal
-    for this loop (the outcome matches one of the loop's ``terminal_states`` and
-    that declared terminal itself looks like a win), OR -- backward-compat -- the
-    outcome still contains the legacy 'won' substring. The declared-terminal gate
-    keeps the signal honest: a loop only earns conversion credit for an outcome it
-    actually declared as a win-class terminal, not any string that happens to
-    contain a win token.
+    DECLARE, DON'T INFER (merge-gate Sec.4):
+
+    * **Declared path (opt-in, 9b).** When the loop DECLARES a closed-vocabulary
+      ``{state: win|loss|neutral}`` class map (``declared_terminal_classes``),
+      conversion credit comes from the DECLARED class ALONE: the outcome must
+      EXACTLY match a state the loop declared as ``win``. No substring is ever
+      consulted, so ``unwon`` / ``wonky`` / an arbitrary string can NEVER credit
+      unless the loop literally declared that exact state as a win.
+
+    * **Legacy path (corrected, applies to loops that did NOT opt in).** This
+      completes the G6 loss-denylist fix. The pre-fix code had
+      ``if "won" in outcome: return True`` running BEFORE any loss check, so
+      ``won_but_lost`` / ``closed_lost`` (and any loss terminal embedding the
+      'won' substring) wrongly earned the 1.0 conversion reward. That shortcut
+      now routes through :func:`_looks_like_win_token`, which applies the loss
+      denylist FIRST -- removing credit that should never have existed while
+      preserving every legitimate win (``closed_won`` / a bare ``won`` still
+      credit). A declared win-class terminal also credits (exact match), so a
+      domain whose win terminal has no 'won' substring is still recognised.
     """
     if not terminal_outcome:
         return False
     outcome = str(terminal_outcome).strip().lower()
     if not outcome:
         return False
-    # (b) Legacy backward-compat: the literal 'won' substring always rewards,
-    # exactly as before, regardless of declared terminal_states.
-    if "won" in outcome:
+    # (a) Declared path (opt-in): a loop that declared closed-vocabulary terminal
+    # classes is governed ONLY by those declarations -- no substring inference.
+    # ``unwon`` / ``wonky`` / an arbitrary string can NEVER credit here.
+    if declared_terminal_classes:
+        return declared_terminal_classes.get(outcome) == "win"
+    # (b) Legacy path (no declared classes): the SAME 'won'-substring shortcut as
+    # before, but now loss-aware. Previously ``if "won" in outcome: return True``
+    # ran before any loss check, so ``won_but_lost`` (and any loss terminal that
+    # embeds 'won') wrongly earned the conversion reward. Apply the loss denylist
+    # FIRST -- this removes ONLY credit that should never have existed; ``won`` /
+    # ``closed_won`` (and even the pre-existing ``unwon`` / ``wonky`` substring
+    # quirk) still credit exactly as before, so no legitimate win regresses.
+    if "won" in outcome and not _outcome_is_loss_token(outcome):
         return True
-    # (a) Declared win-class terminal: the outcome matches one of the loop's
-    # declared terminal_states AND that declared terminal is itself win-class.
+    # (c) Legacy declared win-class terminal: the outcome matches one of the
+    # loop's declared terminal_states AND that declared terminal looks win-class.
+    # Unchanged from the shipped G6 behavior.
     for declared in declared_terminal_states or []:
         d = str(declared).strip().lower()
         if not d:
@@ -17959,6 +18133,10 @@ def reactive_tick(
     policy = _contract_object(contract.get("side_effect_policy"))
     forbidden = set(_string_list(policy.get("forbidden")))
     approval_required = set(_string_list(policy.get("approval_required")))
+    # 9(a): DEFAULT-DENY enforcement is OPT-IN per board (declared on the
+    # contract). When unset (every legacy board incl. ninaxfinds) this is False
+    # and the gate is byte-identical to today's legacy fall-through.
+    strict_side_effects = _side_effect_strict_enabled(policy)
     fired = 0
     for row in rows:
         if max_fires is not None and fired >= max_fires:
@@ -17978,6 +18156,14 @@ def reactive_tick(
             )
             result["stopped"].append({"loop_key": row["loop_key"], "reason": stop_reason})
             continue
+        # A NULL/absent class coalesces to the benign ``none`` -- this is the
+        # established persistence convention (``_normalize_funnel_text`` collapses
+        # a declared "none" to NULL), so an absent class is NOT treated as
+        # suspicious (that would defer every legitimate read-only loop). The hole
+        # strict mode closes is a NON-EMPTY typo/near-miss class that is not a
+        # member of the closed vocabulary -- the coalesced value below is what the
+        # recognition check sees, so NULL -> "none" -> recognized -> fires
+        # (byte-identical), while "extrnal_ireversible" -> unrecognized -> defers.
         side_effect_class = row["side_effect_class"] or "none"
         if side_effect_class in forbidden:
             _close_timer_schedule(
@@ -17988,15 +18174,48 @@ def reactive_tick(
                 {"loop_key": row["loop_key"], "reason": "side_effect_forbidden"}
             )
             continue
-        if side_effect_class in approval_required:
+        # 9(a) FAIL-CLOSED: under strict enforcement an UNRECOGNIZED or MISSING
+        # class (a typo / near-miss / NULL that is not a member of the closed
+        # vocabulary) does NOT fall through and fire. It routes to the same
+        # approval-required deferral path as a gated side effect -- the loop is
+        # held pending an explicit approval rather than performing an unguarded
+        # external action. Default-off (strict False) skips this entirely, so the
+        # legacy fall-through is untouched for every board that did not opt in.
+        strict_unrecognized = (
+            strict_side_effects
+            and not _side_effect_class_is_recognized(side_effect_class)
+        )
+        if side_effect_class in approval_required or strict_unrecognized:
             task = get_task(conn, row["task_id"]) if row["task_id"] else None
             satisfied = (
                 _satisfied_approval_gate_keys(conn, board_slug, task) if task else set()
             )
-            if not _reactive_side_effect_approved(contract, side_effect_class, satisfied):
-                _defer_timer_schedule(conn, row, now=now)
+            # An unrecognized class can never be "approved" (there is no declared
+            # gate for a class that is not in the vocabulary), so it always
+            # defers under strict mode -- fail-closed by construction.
+            approved = (
+                not strict_unrecognized
+                and _reactive_side_effect_approved(
+                    contract, side_effect_class, satisfied
+                )
+            )
+            if not approved:
+                reason = (
+                    "side_effect_unrecognized_strict"
+                    if strict_unrecognized
+                    else "approval_required"
+                )
+                if not _defer_timer_schedule(
+                    conn, row, now=now, board=board_slug, entity=entity
+                ):
+                    # 9(c): the defer bound was hit -- the loop terminated rather
+                    # than deferring again (recorded inside _defer_timer_schedule).
+                    result["stopped"].append(
+                        {"loop_key": row["loop_key"], "reason": "deferral_exhausted"}
+                    )
+                    continue
                 result["deferred"].append(
-                    {"loop_key": row["loop_key"], "reason": "approval_required"}
+                    {"loop_key": row["loop_key"], "reason": reason}
                 )
                 continue
         nudge_no = _fire_timer_schedule(conn, row, now=now, board=board_slug)
@@ -20175,12 +20394,71 @@ def build_learned_state_read_model(
     return result
 
 
-def _defer_timer_schedule(conn: sqlite3.Connection, row: Any, *, now: int) -> None:
+def _timer_schedule_max_defers(row: Any) -> Optional[int]:
+    """Read a schedule row's defer bound (9c). NULL/absent = unbounded = legacy."""
+    try:
+        raw = row["max_defers"] if "max_defers" in row.keys() else None
+    except Exception:
+        raw = None
+    if raw is None:
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
+def _timer_schedule_defers_used(row: Any) -> int:
+    """Read a schedule row's running defer counter (9c). Absent column -> 0."""
+    try:
+        raw = row["defers_used"] if "defers_used" in row.keys() else None
+    except Exception:
+        raw = None
+    try:
+        return int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _defer_timer_schedule(
+    conn: sqlite3.Connection,
+    row: Any,
+    *,
+    now: int,
+    board: Optional[str] = None,
+    entity: Optional["ReactiveEntity"] = None,
+) -> bool:
+    """Push a timer schedule's next fire out by one cadence (an approval defer).
+
+    9(c) anti-zombie bound (OPT-IN): when the loop declared a ``max_defers`` bound
+    and this defer would EXCEED it, the loop TERMINATES with a
+    ``deferral_exhausted`` terminal outcome instead of deferring forever. Returns
+    ``True`` when the schedule was deferred (still active) and ``False`` when the
+    bound was hit and the loop was terminated.
+
+    DEFAULT byte-identical: ``max_defers`` is NULL/absent on every legacy row, so
+    the bound is unbounded and the function always defers and returns ``True`` --
+    exactly today's behavior. Only a board that SETS ``max_defers`` gets the cap.
+    """
+    max_defers = _timer_schedule_max_defers(row)
+    used = _timer_schedule_defers_used(row)
+    # This call is the (used+1)-th defer. Under a declared bound, terminate once
+    # the attempted defer count exceeds the bound (max_defers=2 -> the 3rd defer
+    # terminates; defers 1 and 2 still happen).
+    if max_defers is not None and (used + 1) > max_defers:
+        _close_timer_schedule(
+            conn, row, reason="deferral_exhausted", now=now,
+            board=_connection_board(conn, board), entity=entity,
+        )
+        return False
     with write_txn(conn):
         conn.execute(
-            "UPDATE reactive_timer_schedules SET next_fire_at = ?, updated_at = ? WHERE id = ?",
+            "UPDATE reactive_timer_schedules SET next_fire_at = ?, "
+            "defers_used = COALESCE(defers_used, 0) + 1, updated_at = ? WHERE id = ?",
             (now + int(row["cadence_seconds"]), now, int(row["id"])),
         )
+    return True
 
 
 def _close_timer_schedule(
@@ -20200,13 +20478,17 @@ def _close_timer_schedule(
             (reason, now, int(row["id"])),
         )
         terminal_outcome = entity.terminal_outcome if entity is not None else None
-        # G6: reward a conversion when the outcome is a DECLARED win-class
-        # terminal for THIS loop (resolved from the schedule row's own
-        # terminal_states), OR -- backward-compat -- still matches the legacy
-        # 'won' substring. The schedule row is the single source of truth for the
-        # loop's declared terminal_states, so no extra contract lookup is needed.
+        # G6 + 9(b): reward a conversion from the loop's DECLARED terminal class
+        # when it opted in (closed vocabulary, exact match, no substring), else
+        # the corrected legacy path (loss-aware 'won' detection + declared
+        # win-class terminal match). The schedule row is the single source of
+        # truth for both the declared terminal_states and the declared classes,
+        # so no extra contract lookup is needed and dedupe/attribution are intact.
         declared_terminal_states = _timer_schedule_terminal_states(row)
-        won = _terminal_outcome_is_conversion(terminal_outcome, declared_terminal_states)
+        declared_terminal_classes = _timer_schedule_terminal_classes(row)
+        won = _terminal_outcome_is_conversion(
+            terminal_outcome, declared_terminal_states, declared_terminal_classes
+        )
         reward_kind = "conversion" if won else "loop_closed"
         reward_value = 1.0 if won else 0.0
         _safe_record_board_signal(
