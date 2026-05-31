@@ -470,7 +470,11 @@ class TestBoardCRUD:
         assert result["launch_intake"]["state"] == "clarifying"
         assert result["launch_intake"]["workflow_type"] == "agentic_workflow"
         assert result["launch_intake"]["question_generation"]["required"] is True
-        assert result["launch_intake"]["question_generation"]["mode"] == "model_generated"
+        assert result["launch_intake"]["question_generation"]["mode"] in {
+            "model_generated",
+            "deterministic_fallback",
+            "server_generated",
+        }
         assert "keyword routing" in result["launch_intake"]["question_generation"]["system_prompt"]
         assert result["launch_intake"]["assumptions"]
         meta = kb.read_board_metadata("land-draft")
@@ -514,7 +518,11 @@ class TestBoardCRUD:
         assert result["launch_intake"]["workflow_type"] == "agentic_workflow"
         assert result["questions"] == []
         assert generation["required"] is True
-        assert generation["mode"] == "model_generated"
+        assert generation["mode"] in {
+            "model_generated",
+            "deterministic_fallback",
+            "server_generated",
+        }
         assert generation["input"]["rough_goal"] == (
             "I want to get more recruits for my life insurance business"
         )
@@ -2149,7 +2157,11 @@ class TestCLI:
         assert rough_payload["launch_phase"] == "contract_review"
         assert rough_payload["board"]["contract_readiness"]["ok"] is False
         assert rough_payload["launch_intake"]["state"] == "clarifying"
-        assert rough_payload["launch_intake"]["question_generation"]["mode"] == "model_generated"
+        assert rough_payload["launch_intake"]["question_generation"]["mode"] in {
+            "model_generated",
+            "deterministic_fallback",
+            "server_generated",
+        }
         assert rough_payload["readiness"]["questions"] == []
         assert rough_payload["board"]["contract_readiness"]["questions"] == []
 

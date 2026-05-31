@@ -164,13 +164,21 @@ routing, regex matching, fixed industry templates, or prewritten question
 lists. Infer the likely business or workflow shape from the whole request, then
 ask only what is genuinely unknown and important.
 
+Use pre-interview research aggressively: when research mentions platforms,
+channels, regulations, or domain norms (e.g. iOS vs Android for app growth,
+MLS/compliance for real estate, SMS consent for wholesaling, TikTok content
+rules for social growth), turn those into specific confirmation questions
+instead of generic ones.
+
 The questions should help Hermes understand:
 - the concrete outcome and measurable success/failure signals
 - the people, items, accounts, or opportunities involved
+- domain-specific channels, platforms, and constraints (infer from research)
 - where work should start and what systems or channels are allowed
 - the real-world path from first signal through done, paused, or disqualified
 - what Hermes may do autonomously versus what requires owner approval
 - proof, updates, and stop conditions that would make execution trustworthy
+- budget sensitivity and quality bar (when tradeoffs matter for model routing)
 
 Rules:
 - Ask 2 to 6 questions, written for a non-technical owner.
@@ -178,6 +186,7 @@ Rules:
   loops, provider policies, or worker envelopes.
 - If pre-interview research already answers a dimension, do not re-ask it; record
   it as an assumption to confirm instead.
+- Prefer one sharp domain-specific question over two vague generic ones.
 
 Output ONLY a JSON object:
 {"questions": ["..."], "assumptions": ["..."]}

@@ -25,7 +25,7 @@ fragments so a partial contract still produces a usable summary).
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from hermes_cli.kanban_launch_grammar import (
     is_external_side_effect_class,
@@ -38,6 +38,8 @@ __all__ = [
     "render_contract_one_liner",
     "render_launch_setup_block",
     "contract_summary_facts",
+    "render_contract_sections_table",
+    "export_contract_document",
 ]
 
 
@@ -378,6 +380,51 @@ def _model_routing(root: dict[str, Any]) -> list[str]:
     return out[:12]
 
 
+def _quality_metrics(root: dict[str, Any]) -> list[str]:
+    objective = _as_dict(root.get("objective"))
+    metrics: list[str] = []
+    for item in _as_list(objective.get("success")):
+        text = str(item or "").strip()
+        if text:
+            metrics.append(text)
+    hitl = _as_dict(root.get("hitl_policy") or _as_dict(root.get("runtime")).get("hitl_policy"))
+    if hitl:
+        mode = str(hitl.get("mode") or hitl.get("balance") or "").strip()
+        if mode:
+            metrics.append(f"HITL balance: {mode}")
+    return metrics[:8]
+
+
+def _budget_summary(root: dict[str, Any]) -> list[str]:
+    runtime = _as_dict(root.get("runtime"))
+    try:
+        from hermes_cli.kanban_launch_cost import format_cost_lines, project_contract_costs
+
+        projection = runtime.get("cost_projection")
+        if not isinstance(projection, dict):
+            projection = project_contract_costs(root)
+        lines = format_cost_lines(projection)
+        budget = _as_dict(runtime.get("budget"))
+        pref = str(budget.get("preference") or "").strip()
+        if pref:
+            lines.insert(0, f"Budget preference: {pref}")
+        cap = budget.get("weekly_usd_cap")
+        if cap is not None:
+            lines.insert(0, f"Weekly cap: ${cap} USD (target)")
+        return lines
+    except Exception:
+        return ["Cost projection unavailable (estimate scaffold not loaded)"]
+
+
+def _contract_status_line(root: dict[str, Any]) -> str:
+    status = str(
+        root.get("contract_status")
+        or _as_dict(root.get("runtime")).get("contract_status")
+        or "pending_approval"
+    ).strip()
+    return status.replace("_", " ")
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -396,6 +443,9 @@ def contract_summary_facts(contract: Any) -> dict[str, Any]:
         "needs_approval": needs_approval,
         "autonomous_external": autonomous_external,
         "model_routing": _model_routing(root),
+        "quality_metrics": _quality_metrics(root),
+        "budget_lines": _budget_summary(root),
+        "contract_status": _contract_status_line(root),
     }
 
 
@@ -453,6 +503,111 @@ def render_launch_setup_block(
     return "\n".join(lines)
 
 
+def render_contract_sections_table(
+    contract: Any,
+    *,
+    board: Optional[str] = None,
+    credentials: Optional[dict[str, Any]] = None,
+) -> str:
+    """Compact section table for CLI and Telegram (Markdown pipe table)."""
+    facts = contract_summary_facts(contract)
+    rows = [
+        ("Status", facts["contract_status"]),
+        ("Objective", facts["objective"] or "(unknown)"),
+        ("Pipeline", " -> ".join(facts["pipeline"][:6]) if facts["pipeline"] else "(none)"),
+        ("Models", "; ".join(facts["model_routing"][:4]) if facts["model_routing"] else "(profile default)"),
+        ("Budget", facts["budget_lines"][0] if facts["budget_lines"] else "(estimate pending)"),
+        (
+            "Quality metrics",
+            "; ".join(facts["quality_metrics"][:3]) if facts["quality_metrics"] else "(from objective.success)",
+        ),
+        (
+            "Owner approval",
+            ", ".join(facts["needs_approval"][:4]) if facts["needs_approval"] else "all external actions gated",
+        ),
+        ("Autonomy / HITL", "owner-gated external; auto-tune knobs within bounds"),
+    ]
+    if credentials and credentials.get("required_count"):
+        prov = int(credentials.get("provisioned_count") or 0)
+        req = int(credentials.get("required_count") or 0)
+        rows.append(("Credentials", f"{prov}/{req} provisioned"))
+    lines = ["| Section | Summary |", "| --- | --- |"]
+    for section, summary in rows:
+        safe = str(summary).replace("|", "/").replace("\n", " ")
+        if len(safe) > 120:
+            safe = safe[:117] + "..."
+        lines.append(f"| {section} | {safe} |")
+    if board:
+        lines.append(f"\nBoard: `{board}`")
+    return "\n".join(lines)
+
+
+ExportFormat = Literal["markdown", "asciidoc", "json"]
+
+
+def export_contract_document(
+    contract: Any,
+    *,
+    format: ExportFormat = "markdown",
+    board: Optional[str] = None,
+    credentials: Optional[dict[str, Any]] = None,
+    include_approve_hint: bool = True,
+) -> str:
+    """Export a portable contract document for CLI, agents, or archival."""
+    if format == "json":
+        import json
+
+        root = _contract_root(contract)
+        payload = {
+            "board": board,
+            "contract": root,
+            "summary_facts": contract_summary_facts(contract),
+        }
+        if credentials:
+            payload["credentials"] = credentials
+        return json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+
+    summary = render_owner_contract_summary(
+        contract,
+        board=board,
+        include_approve_hint=include_approve_hint,
+        credentials=credentials,
+    )
+    table = render_contract_sections_table(
+        contract, board=board, credentials=credentials,
+    )
+
+    if format == "asciidoc":
+        title = board or "board-contract"
+        parts = [
+            f"= Launch contract: {title}",
+            "",
+            "== At a glance",
+            "",
+            "[cols=\"1,3\"]",
+            "|===",
+        ]
+        for line in table.splitlines():
+            if line.startswith("| ") and " | " in line:
+                cells = [c.strip() for c in line.strip("|").split("|")]
+                if len(cells) == 2 and cells[0] != "Section":
+                    parts.append(f"| {cells[0]} | {cells[1]}")
+        parts.extend(["|===", "", "== Owner summary", "", summary])
+        return "\n".join(parts) + "\n"
+
+    return "\n".join([
+        f"# Launch contract{f' — `{board}`' if board else ''}",
+        "",
+        "## Sections",
+        "",
+        table,
+        "",
+        "## Owner summary",
+        "",
+        summary,
+    ])
+
+
 def render_contract_one_liner(contract: Any) -> str:
     """A single dense line for board listings / pending-approval lists."""
     facts = contract_summary_facts(contract)
@@ -492,6 +647,8 @@ def render_owner_contract_summary(
     if facts["objective"]:
         lines.append(f"\n*Goal:* {facts['objective']}")
 
+    lines.append(f"\n*Contract status:* {facts['contract_status']}")
+
     if facts["pipeline"]:
         arrow = " → ".join(facts["pipeline"])
         lines.append(f"\n*Pipeline:* {arrow}")
@@ -526,8 +683,18 @@ def render_owner_contract_summary(
     else:
         lines.append(
             "\n*Model routing:* each agent uses its profile's default model "
-            "(override at launch with `runtime.models`)."
+            "(override at launch with `runtime.models` or the Model Route skill)."
         )
+
+    if facts["budget_lines"]:
+        lines.append("\n*Budget (projected estimates):*")
+        for row in facts["budget_lines"][:4]:
+            lines.append(f"• {row}")
+
+    if facts["quality_metrics"]:
+        lines.append("\n*Quality / success metrics:*")
+        for metric in facts["quality_metrics"][:5]:
+            lines.append(f"• {metric}")
 
     setup_block = render_launch_setup_block(
         contract, board=board, credentials=credentials

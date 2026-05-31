@@ -195,6 +195,8 @@ def assess_board_credentials(
 
     for spec in specs:
         key = spec["key"]
+        if str(spec.get("type") or "").strip().lower() == "payment_method":
+            continue
         env_var = credential_env_var(key, spec)
         entry = entries.get(key) if isinstance(entries, dict) else None
         vault_fp = entry.get("fingerprint") if isinstance(entry, dict) else None
@@ -215,7 +217,11 @@ def assess_board_credentials(
             "fingerprint": vault_fp if vault_ok else None,
         })
 
-    required = [s for s in specs if s.get("required", True)]
+    required = [
+        s for s in specs
+        if s.get("required", True)
+        and str(s.get("type") or "").strip().lower() != "payment_method"
+    ]
     provisioned_count = sum(1 for row in inputs if row["provisioned"])
     return {
         "ok": not missing_keys,

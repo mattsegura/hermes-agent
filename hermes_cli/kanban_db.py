@@ -81,6 +81,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -120,10 +121,20 @@ VALID_STATUSES = {
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 VALID_BOARD_LAUNCH_PHASES = {
+    "draft",
     "draft_intake",
+    "pending_credentials",
+    "pending_payment",
+    "pending_approval",
     "contract_review",
     "active",
     "paused",
+    # Terminal lifecycle state set by `hermes kanban boards retire <slug>`.
+    # A retired board is non-dispatching (not in BOARD_DISPATCH_PHASES) and its
+    # data is moved out of boards/ to kanban/backups/deleted-boards-<ts>/, so it
+    # never reappears in active listings; the phase is stamped onto the board's
+    # board.json *before* the move so the backup records why it was torn down.
+    "retired",
 }
 LAUNCH_INTAKE_STATE_CLARIFYING = "clarifying"
 LAUNCH_INTAKE_STATE_ASSESSING = "assessing_answers"
@@ -978,6 +989,15 @@ def _token_target_for_contract(
                 f"from_version={from_version}, current_version={current_version}"
             )
         candidate = normalize_board_operating_contract(amendment.get("candidate_contract"))
+        readiness = validate_business_runtime_contract(candidate, board=normed)
+        try:
+            from hermes_cli.kanban_launch_lifecycle import sync_contract_lifecycle_on_contract
+
+            candidate = sync_contract_lifecycle_on_contract(
+                candidate, board=normed, readiness=readiness,
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
         return {
             "kind": "contract_amendment",
             "contract": candidate,
@@ -985,16 +1005,26 @@ def _token_target_for_contract(
             "contract_version": current_version + 1,
             "from_version": current_version,
             "amendment_id": amendment_id,
-            "readiness": validate_business_runtime_contract(candidate),
+            "readiness": readiness,
         }
 
     target_readiness: Optional[dict[str, Any]] = None
     if contract is None and rough_goal is None:
         candidate = _metadata_as_business_contract(meta)
+        try:
+            from hermes_cli.kanban_launch_lifecycle import sync_contract_lifecycle_on_contract
+
+            readiness_snapshot = validate_business_runtime_contract(candidate, board=normed)
+            candidate = sync_contract_lifecycle_on_contract(
+                candidate, board=normed, readiness=readiness_snapshot,
+            )
+        except Exception:  # pragma: no cover - defensive
+            pass
     else:
         candidate, target_readiness = _prepare_business_runtime_contract_for_review(
             contract,
             rough_goal=rough_goal,
+            board=normed,
         )
         candidate = _reconcile_launch_intake_draft_with_existing(
             candidate,
@@ -1107,6 +1137,17 @@ def issue_board_launch_approval_token(
                 "then re-issue with owner_acknowledged_coverage=True"
             )
     readiness = target["readiness"]
+    gate_contract = target.get("contract")
+    if isinstance(gate_contract, dict):
+        from hermes_cli.kanban_launch_lifecycle import launch_gate_blockers
+
+        for blocker in launch_gate_blockers(
+            gate_contract,
+            board=normed,
+            operator_override=operator_override,
+            approving=True,
+        ):
+            raise ValueError(blocker)
     if not readiness.get("ok"):
         raise ValueError(
             "cannot issue approval token for non-ready contract: "
@@ -1519,7 +1560,7 @@ def _contract_intake_questions(contract: dict) -> list[str]:
     generation = intake.get("question_generation")
     if isinstance(generation, dict):
         mode = str(generation.get("mode") or "").strip().lower()
-        if generation.get("required") and mode == "model_generated":
+        if generation.get("required") and mode in _UNIVERSAL_LAUNCH_INTAKE_MODES:
             return []
     critical_unknowns = _string_list(intake.get("critical_unknowns") or intake.get("missing_context"))
     return critical_unknowns[:6]
@@ -1806,6 +1847,124 @@ def launch_clarity_questions(missing: Iterable[str]) -> list[str]:
     return questions
 
 
+# Validator/enum/grammar tokens that aren't literal missing-field keys but map
+# onto the SAME owner vocabulary in `_LAUNCH_QUESTION_BY_MISSING`. Keeping this
+# the only alias table means there is ONE source of truth for owner wording:
+# both the missing-field path (launch_clarity_questions) and the error-string
+# translator below resolve through `_LAUNCH_QUESTION_BY_MISSING`.
+_OWNER_ERROR_FIELD_ALIASES: dict[str, str] = {
+    "side_effect_class": "side_effect_policy",
+    "side_effect_policy": "side_effect_policy",
+    "exit_criteria": "workflow.exit_criteria",
+    "exit_states": "entities.states",
+    "terminal_states": "event_loops.termination",
+    "stage_actions": "workflow.stage_actions",
+    "actions": "workflow.stage_actions",
+    "stages": "workflow.stages",
+    "workstreams": "workflow.workstreams",
+    "require_semantics": "workflow.require_semantics",
+    "provider_policy": "runtime.provider_policy",
+    "worker_envelopes": "runtime.worker_envelopes",
+    "approval_gates": "approval_gates",
+    "proof_requirements": "proof_requirements",
+    "escalation_paths": "escalation_paths",
+    "owner_summary": "owner_summary",
+    "event_loops": "event_loops",
+    "triggers": "event_loops",
+    "trigger": "event_loops",
+    "entities": "entities",
+    "success": "objective.success",
+    "failure": "objective.failure",
+    "constraints": "objective.constraints",
+    "statement": "objective.statement",
+}
+
+# Recognizes dotted field paths and bare field tokens inside an error string.
+_OWNER_ERROR_TOKEN_RE = re.compile(r"[A-Za-z_][\w.]*")
+
+_OWNER_ERROR_GENERIC = (
+    "I need a little more detail on one part of the plan before I can start it."
+)
+
+
+def _owner_question_for_token(token: str) -> Optional[str]:
+    """Resolve one field token to its plain-language owner question (or None)."""
+    lookup = _OWNER_ERROR_FIELD_ALIASES.get(token, token)
+    question = _LAUNCH_QUESTION_BY_MISSING.get(lookup)
+    if question:
+        return question
+    # Handle indexed workflow paths (workflow.stages.0.exit_criteria, ...).
+    matched = launch_clarity_questions([token])
+    return matched[0] if matched else None
+
+
+def owner_facing_error_sentence(raw: Any) -> str:
+    """Translate ONE internal error/missing string into a plain owner sentence.
+
+    Never leaks raw keys, enum names, or validator jargon: it scans the error
+    for a known field token and renders the matching owner question from the
+    single `_LAUNCH_QUESTION_BY_MISSING` vocabulary; if nothing matches it falls
+    back to a generic friendly line. Raw strings stay in logs/internal payloads
+    for debugging — this is only for the owner-facing boundary.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return _OWNER_ERROR_GENERIC
+    for token in _OWNER_ERROR_TOKEN_RE.findall(text):
+        question = _owner_question_for_token(token)
+        if question:
+            q = question[0].lower() + question[1:] if question else question
+            return f"Before I can start, I need to know: {q}"
+    return _OWNER_ERROR_GENERIC
+
+
+def owner_facing_error_sentences(raws: Iterable[Any]) -> list[str]:
+    """Translate a list of internal errors to deduped plain owner sentences."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in raws or []:
+        sentence = owner_facing_error_sentence(raw)
+        if sentence not in seen:
+            seen.add(sentence)
+            out.append(sentence)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Owner-facing progress feedback (F2): lightweight, thread-local breadcrumb.
+# ---------------------------------------------------------------------------
+#
+# Contract synthesis / steering can take ~30-60s (aux-model research + draft +
+# self-repair). Without streaming, the owner sees silence. We record short
+# owner-friendly phrases at the existing pipeline checkpoints into a thread-local
+# buffer; owner-facing tool handlers drain it (reset before, snapshot after) so
+# the assistant can relay "Researched your market… Drafted your plan… Double-
+# checked it." This is NOT a streaming system and changes no contract logic.
+_OWNER_PROGRESS = threading.local()
+
+
+def owner_progress_reset() -> None:
+    """Clear the owner-facing progress buffer for this thread."""
+    _OWNER_PROGRESS.items = []
+
+
+def _owner_progress_record(phrase: Optional[str]) -> None:
+    phrase = str(phrase or "").strip()
+    if not phrase:
+        return
+    items = getattr(_OWNER_PROGRESS, "items", None)
+    if items is None:
+        items = []
+        _OWNER_PROGRESS.items = items
+    if phrase not in items:
+        items.append(phrase)
+
+
+def owner_progress_snapshot() -> list[str]:
+    """Return a copy of the owner-facing progress phrases recorded so far."""
+    return list(getattr(_OWNER_PROGRESS, "items", []) or [])
+
+
 _SCOREABLE_SUCCESS_RE = re.compile(
     r"(\d|%|\$|>=|<=|>|<|\bat least\b|\bat most\b|\bper\b|\bwithin\b|\brate\b|"
     r"\bratio\b|\bcount\b|\bnumber of\b|\bMRR\b|\bARR\b|\bMAU\b|\bDAU\b|\bLTV\b|\bCAC\b)",
@@ -2023,6 +2182,42 @@ def validate_business_runtime_contract(
     except Exception:  # pragma: no cover - defensive
         _log.warning("launch readiness: credential assessment skipped", exc_info=True)
 
+    payment: dict[str, Any] = {"ok": True, "required": False}
+    try:
+        from hermes_cli import kanban_stripe_connect as _pay
+
+        payment = _pay.assess_board_payment(board, normalized)
+        if payment.get("required") and not payment.get("ok"):
+            missing_field = "launch_payment.method"
+            if missing_field not in missing:
+                missing.append(missing_field)
+            for q in _pay.launch_payment_questions(payment):
+                if q not in questions:
+                    questions.append(q)
+            if status not in ("invalid",):
+                status = "needs_clarification"
+    except Exception:  # pragma: no cover - defensive
+        _log.warning("launch readiness: payment assessment skipped", exc_info=True)
+
+    contract_status = "draft"
+    try:
+        from hermes_cli.kanban_launch_lifecycle import derive_contract_status
+
+        contract_status = derive_contract_status(
+            normalized,
+            board=board,
+            credentials=credentials,
+            payment=payment,
+            readiness={
+                "ok": not errors and not missing,
+                "errors": errors,
+                "missing": missing,
+                "status": status,
+            },
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
+
     return {
         "ok": not errors and not missing,
         "status": status,
@@ -2035,6 +2230,8 @@ def validate_business_runtime_contract(
         "owner_summary": normalized.get("owner_summary"),
         "completeness": _completeness,
         "credentials": credentials,
+        "payment": payment,
+        "contract_status": contract_status,
     }
 
 
@@ -2747,7 +2944,7 @@ def _launch_intake_questions(contract: dict[str, Any]) -> list[str]:
     generation = intake.get("question_generation")
     if isinstance(generation, dict):
         mode = str(generation.get("mode") or "").strip().lower()
-        if generation.get("required") and mode == "model_generated":
+        if generation.get("required") and mode in _UNIVERSAL_LAUNCH_INTAKE_MODES:
             return []
     assumptions = _contract_assumptions(contract)
     if assumptions:
@@ -2761,7 +2958,19 @@ def _launch_review_questions(
     contract: dict[str, Any],
     readiness: dict[str, Any],
 ) -> list[str]:
+    intake = _contract_object(contract.get("launch_intake"))
+    intake_state = str(intake.get("state") or "").strip().lower()
     missing = _string_list(readiness.get("missing"))
+    if intake_state in {
+        LAUNCH_INTAKE_STATE_CLARIFYING,
+        LAUNCH_INTAKE_STATE_ASSESSING,
+    }:
+        # Universal / rough-goal intake: questions live under launch_intake only.
+        # Partial contracts with real objective detail still get targeted top-level
+        # readiness questions (e.g. missing workflow.stages).
+        if not (missing and _contract_has_partial_launch_detail(contract)):
+            if intake.get("workflow_type") or _contract_uses_model_generated_intake(contract):
+                return []
     targeted = launch_clarity_questions(missing)[:6]
     readiness_questions = _string_list(readiness.get("questions"))[:6]
     intake_questions = _launch_intake_questions(contract)[:6]
@@ -2772,13 +2981,21 @@ def _launch_review_questions(
     return readiness_questions or targeted or intake_questions
 
 
+_UNIVERSAL_LAUNCH_INTAKE_MODES = frozenset(
+    {"model_generated", "deterministic_fallback", "server_generated"}
+)
+
+
 def _contract_uses_model_generated_intake(contract: dict[str, Any]) -> bool:
+    """True when launch uses universal rough-goal intake (any generation mode)."""
     intake = _contract_object(contract.get("launch_intake"))
     generation = intake.get("question_generation")
     if not isinstance(generation, dict):
         return False
+    if not generation.get("required"):
+        return False
     mode = str(generation.get("mode") or "").strip().lower()
-    return bool(generation.get("required")) and mode == "model_generated"
+    return mode in _UNIVERSAL_LAUNCH_INTAKE_MODES
 
 
 def _contract_has_saved_launch_intake_answers(contract: Optional[dict[str, Any]]) -> bool:
@@ -2870,8 +3087,16 @@ def _launch_contract_readiness_for_storage(
     if not _contract_uses_model_generated_intake(contract):
         return readiness
     intake = _contract_object(contract.get("launch_intake"))
+    intake_state = str(intake.get("state") or "").strip().lower()
     readiness = dict(readiness)
-    readiness["questions"] = _contract_intake_questions(contract)[:6]
+    # During universal intake Q&A, questions live under launch_intake only.
+    if intake_state in {
+        LAUNCH_INTAKE_STATE_CLARIFYING,
+        LAUNCH_INTAKE_STATE_ASSESSING,
+    }:
+        readiness["questions"] = []
+    else:
+        readiness["questions"] = _contract_intake_questions(contract)[:6]
     if isinstance(intake.get("question_generation"), dict):
         readiness["question_generation"] = dict(intake["question_generation"])
     if isinstance(intake.get("answer_assessment"), dict):
@@ -2888,6 +3113,14 @@ def _finalize_business_runtime_contract_for_review(
     draft = _sync_launch_intake_state(draft, readiness)
     if draft.get("launch_intake") is not None:
         readiness = _launch_contract_readiness_for_storage(draft, board=board)
+    try:
+        from hermes_cli.kanban_launch_lifecycle import sync_contract_lifecycle_on_contract
+
+        draft = sync_contract_lifecycle_on_contract(
+            draft, board=board, readiness=readiness,
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
     return draft, readiness
 
 
@@ -2898,7 +3131,7 @@ def _reconcile_launch_intake_draft_with_existing(
     """Bind an intake-derived draft to the latest saved answers on the board."""
     existing_intake = _contract_object(existing_contract.get("launch_intake"))
     existing_answers = _normalize_launch_intake_answers(existing_intake.get("answers"))
-    if not existing_answers or not _contract_uses_model_generated_intake(existing_contract):
+    if not existing_answers:
         return draft
 
     merged = dict(draft)
@@ -2984,8 +3217,17 @@ LAUNCH_INTAKE_DEGRADED_HINT = (
 )
 
 
-def _emit_launch_cli_progress(message: str) -> None:
-    """Print launch-pipeline progress to stderr when CLI progress is enabled."""
+def _emit_launch_cli_progress(message: str, *, owner_phrase: Optional[str] = None) -> None:
+    """Surface launch-pipeline progress.
+
+    Always records ``owner_phrase`` (when given) into the thread-local
+    owner-facing progress buffer (F2) so owner-facing tools can relay it, and
+    additionally prints the internal ``message`` to stderr when CLI progress is
+    enabled. The two channels are independent: owner phrases are plain-language;
+    the stderr message keeps the internal detail for operators.
+    """
+    if owner_phrase:
+        _owner_progress_record(owner_phrase)
     flag = str(os.environ.get("HERMES_KANBAN_CLI_PROGRESS") or "").strip().lower()
     if flag not in ("1", "true", "yes", "on"):
         return
@@ -3053,7 +3295,10 @@ def _maybe_run_pre_interview_research(draft: dict[str, Any]) -> dict[str, Any]:
     rough_goal = _intake_rough_goal(intake)
     if not rough_goal or not _launch_intake_aux_enabled():
         return draft
-    _emit_launch_cli_progress("running pre-interview research (kanban_launch_intake aux)...")
+    _emit_launch_cli_progress(
+        "running pre-interview research (kanban_launch_intake aux)...",
+        owner_phrase="Researching your market…",
+    )
     try:
         from hermes_cli import kanban_launch_intake as kli
         result = kli.run_pre_interview_research(rough_goal)
@@ -3108,7 +3353,10 @@ def _maybe_generate_launch_intake_questions(draft: dict[str, Any]) -> dict[str, 
         merged = dict(draft)
         merged["launch_intake"] = _apply_launch_intake_question_fallback(dict(intake))
         return merged
-    _emit_launch_cli_progress("generating launch-intake questions (kanban_launch_intake aux)...")
+    _emit_launch_cli_progress(
+        "generating launch-intake questions (kanban_launch_intake aux)...",
+        owner_phrase="Putting together a few questions for you…",
+    )
     try:
         from hermes_cli import kanban_launch_intake as kli
         result = kli.run_question_generation(
@@ -3156,7 +3404,10 @@ def _maybe_assess_launch_intake_answers(draft: dict[str, Any]) -> dict[str, Any]
     coverage = _launch_intake_coverage_report(
         answers, rough_goal=rough_goal, external_research=intake.get("external_research")
     )
-    _emit_launch_cli_progress("assessing launch-intake answers (kanban_launch_intake aux)...")
+    _emit_launch_cli_progress(
+        "assessing launch-intake answers (kanban_launch_intake aux)...",
+        owner_phrase="Reviewing your answers…",
+    )
     try:
         from hermes_cli import kanban_launch_intake as kli
         result = kli.run_answer_assessment(
@@ -3586,12 +3837,14 @@ def _synthesize_launch_contract_from_intake(draft: dict[str, Any]) -> dict[str, 
         def _progress(attempt: int):
             if attempt == 1:
                 _emit_launch_cli_progress(
-                    "synthesizing board contract (kanban_launch_intake aux)..."
+                    "synthesizing board contract (kanban_launch_intake aux)...",
+                    owner_phrase="Drafting your plan…",
                 )
             else:
                 _emit_launch_cli_progress(
                     f"repairing synthesized contract (attempt {attempt}/"
-                    f"{LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS})..."
+                    f"{LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS})...",
+                    owner_phrase="Double-checking it against the rules…",
                 )
 
         outcome = synthesize_contract_with_repair(
@@ -4863,7 +5116,23 @@ def _review_business_launch_contract_unlocked(
         }
     readiness_questions = _string_list(readiness.get("questions"))
     review_questions = _launch_review_questions(draft, readiness)
-    phase = "active" if approve and readiness.get("ok") else "contract_review"
+    from hermes_cli.kanban_launch_lifecycle import (
+        launch_gate_blockers,
+        resolve_post_review_launch_phase,
+    )
+
+    if approve and readiness.get("ok"):
+        approve_blockers = launch_gate_blockers(
+            draft, board=review_board, approving=True,
+        )
+        if approve_blockers:
+            raise ValueError("; ".join(approve_blockers))
+    phase = resolve_post_review_launch_phase(
+        contract=draft,
+        board=review_board,
+        readiness=readiness,
+        approve=bool(approve and readiness.get("ok")),
+    )
     launch_review_id = f"lr_{secrets.token_hex(6)}" if phase == "active" else None
     launch_approval = None
     if launch_review_id:
@@ -5385,8 +5654,18 @@ def steer_board_contract_amendment(
         union = _union_candidate_errors(candidate)
         return (union["ok"], list(union["errors"]) + list(union["missing"]), union)
 
+    def _progress(attempt: int):
+        # Owner-facing breadcrumbs (F2) for the ~30-60s steering wait.
+        _emit_launch_cli_progress(
+            f"steering contract edit (attempt {attempt}/{max_attempts})...",
+            owner_phrase=(
+                "Drafting your change…" if attempt == 1
+                else "Double-checking it against the rules…"
+            ),
+        )
+
     outcome = synthesize_contract_with_repair(
-        _synthesize, _validate, max_attempts=max_attempts
+        _synthesize, _validate, max_attempts=max_attempts, on_attempt=_progress
     )
     if not outcome["ok"]:
         reply = captured["reply"]
@@ -5401,8 +5680,12 @@ def steer_board_contract_amendment(
             "degraded": bool(outcome["degraded"]),
             "summary": "", "changes": [],
             "reply": reply, "errors": list(outcome["errors"]),
+            "progress": owner_progress_snapshot(),
         }
 
+    _emit_launch_cli_progress(
+        "storing pending amendment", owner_phrase="Saving your change for approval…"
+    )
     amendment = propose_board_contract_amendment(
         normed,
         patch=captured["patch"] or {},
@@ -5416,6 +5699,7 @@ def steer_board_contract_amendment(
         "ok": True, "stored": True, "amendment": amendment,
         "summary": summary, "changes": changes,
         "reply": captured["reply"], "errors": [], "degraded": False,
+        "progress": owner_progress_snapshot(),
     }
 
 
@@ -7314,6 +7598,447 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
         import shutil
         shutil.rmtree(d)
         return {"slug": normed, "action": "deleted", "new_path": ""}
+
+
+# ---------------------------------------------------------------------------
+# Board retire / teardown (durable, transactional cleanup)
+# ---------------------------------------------------------------------------
+#
+# `hermes kanban boards retire <slug>` encodes the manual cleanup that the
+# fragmentation incidents required: a board pinned in a profile's .env, a stale
+# `kanban/current` pointer, an orphaned dispatcher gateway + event-bridge still
+# bound to a deleted board, the MANIFEST drifting from reality. The retire path
+# does all of it in ONE safe, repeatable, dry-runnable command.
+#
+# Retired phase value: there was no pre-existing retired/archived launch_phase,
+# so we added "retired" to VALID_BOARD_LAUNCH_PHASES (a terminal,
+# non-dispatching phase) and stamp it onto board.json *before* moving the dir.
+#
+# Backup convention: reuse the existing on-disk teardown signature observed in
+# the live data dir — kanban/backups/deleted-boards-<UTC compact timestamp>/.
+# Each retire run gets its own timestamped folder so prior retired boards are
+# never clobbered.
+
+RETIRED_LAUNCH_PHASE = "retired"
+
+
+def deleted_boards_backup_root(*, timestamp: Optional[str] = None) -> Path:
+    """Return ``<root>/kanban/backups/deleted-boards-<ts>`` (teardown convention).
+
+    ``ts`` is a compact UTC timestamp (``YYYYMMDDTHHMMSSZ``) matching the
+    existing ``deleted-boards-*`` folders already present under
+    ``kanban/backups/``. Pass ``timestamp`` to pin it (tests / dry-run preview).
+    """
+    ts = timestamp or time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    return kanban_home() / "kanban" / "backups" / f"deleted-boards-{ts}"
+
+
+def _read_pid_file(path: Path) -> Optional[int]:
+    """Best-effort read of an integer PID from a pid/lock file. None on failure."""
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    # Accept either a bare "1234" or a JSON {"pid": 1234} (gateway.pid style).
+    if raw.startswith("{"):
+        try:
+            return int(json.loads(raw)["pid"])
+        except (ValueError, KeyError, TypeError):
+            return None
+    token = raw.split()[0]
+    try:
+        return int(token)
+    except ValueError:
+        return None
+
+
+def _pid_is_live(pid: Optional[int]) -> bool:
+    """True if a signal-0 probe says ``pid`` exists (best-effort, POSIX)."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but owned by another user — treat as live so we don't claim
+        # it's gone.
+        return True
+    except OSError:
+        return False
+
+
+def find_profile_board_pins(slug: str, *, home: Optional[Path] = None) -> list[dict]:
+    """Return ``profiles/*/.env`` files whose ``HERMES_KANBAN_BOARD`` pins ``slug``.
+
+    The .env pin is the explicit binding fact the dispatcher reads at gateway
+    start, so it doubles as the proof a gateway belongs to THIS board. Each
+    entry: ``{"profile", "env_path", "line_no", "line"}``.
+    """
+    normed = _normalize_board_slug(slug)
+    root = (home or kanban_home()) / "profiles"
+    out: list[dict] = []
+    if not root.is_dir():
+        return out
+    for env_path in sorted(root.glob("*/.env")):
+        try:
+            lines = env_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped.startswith("HERMES_KANBAN_BOARD="):
+                continue
+            value = stripped.split("=", 1)[1].strip().strip("'\"")
+            try:
+                pinned = _normalize_board_slug(value)
+            except ValueError:
+                pinned = value
+            if pinned == normed:
+                out.append({
+                    "profile": env_path.parent.name,
+                    "env_path": str(env_path),
+                    "line_no": idx + 1,
+                    "line": line,
+                })
+                break
+    return out
+
+
+def clear_profile_board_pin(env_path: Path | str, slug: str) -> bool:
+    """Comment out a ``HERMES_KANBAN_BOARD=<slug>`` pin in a profile ``.env``.
+
+    We COMMENT the line (rather than delete or rewrite to ``default``): it is
+    the least-destructive option — a ``# HERMES_KANBAN_BOARD=...`` line is
+    ignored by the .env loader (and by :func:`_load_profile_kanban_flags`,
+    which only matches an un-commented prefix), so the gateway falls back
+    through ``kanban/current`` → ``default`` exactly like an unpinned profile,
+    while the original value stays in the file for audit. Returns True if the
+    file changed.
+    """
+    path = Path(env_path)
+    normed = _normalize_board_slug(slug)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    changed = False
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("HERMES_KANBAN_BOARD="):
+            value = stripped.split("=", 1)[1].strip().strip("'\"")
+            try:
+                pinned = _normalize_board_slug(value)
+            except ValueError:
+                pinned = value
+            if pinned == normed:
+                out.append(
+                    f"# {line}  # board {normed!r} retired by "
+                    "`hermes kanban boards retire`; pin cleared"
+                )
+                changed = True
+                continue
+        out.append(line)
+    if changed:
+        path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return changed
+
+
+def find_board_event_bridge(slug: str) -> Optional[dict]:
+    """Return the board's event-bridge pid/lock files if present, else None.
+
+    Looks for ``boards/<slug>/.event_bridge.pid`` and ``.event_bridge.lock``.
+    These are runtime artifacts written alongside the board; the retire path
+    SIGTERMs a live pid and removes the stale files.
+    """
+    d = board_dir(slug)
+    pid_file = d / ".event_bridge.pid"
+    lock_file = d / ".event_bridge.lock"
+    has_pid = pid_file.exists()
+    has_lock = lock_file.exists()
+    if not has_pid and not has_lock:
+        return None
+    pid = _read_pid_file(pid_file) if has_pid else None
+    return {
+        "pid_file": str(pid_file) if has_pid else None,
+        "lock_file": str(lock_file) if has_lock else None,
+        "pid": pid,
+        "live": _pid_is_live(pid),
+    }
+
+
+def discover_board_dispatcher_gateways(
+    slug: str, *, home: Optional[Path] = None
+) -> list[dict]:
+    """Find running dispatcher gateways bound to ``slug`` via an explicit pin.
+
+    Only profiles whose ``.env`` pins ``HERMES_KANBAN_BOARD=<slug>`` are
+    considered (the same binding fact used by :func:`find_profile_board_pins`),
+    and only those with a live ``gateway.pid`` are returned — so we never touch
+    a gateway that belongs to another board. Each entry:
+    ``{"profile", "profile_dir", "pid", "live"}``.
+    """
+    normed = _normalize_board_slug(slug)
+    root = home or kanban_home()
+    out: list[dict] = []
+    for pin in find_profile_board_pins(normed, home=root):
+        profile_dir = root / "profiles" / pin["profile"]
+        pid_file = profile_dir / "gateway.pid"
+        if not pid_file.exists():
+            continue
+        pid = _read_pid_file(pid_file)
+        out.append({
+            "profile": pin["profile"],
+            "profile_dir": str(profile_dir),
+            "pid": pid,
+            "live": _pid_is_live(pid),
+        })
+    return out
+
+
+def retire_board(
+    slug: str,
+    *,
+    force: bool = False,
+    dry_run: bool = False,
+    timestamp: Optional[str] = None,
+    home: Optional[Path] = None,
+) -> dict:
+    """Durably retire a board: stop its runtime, back up data, fix all pointers.
+
+    Steps (all skipped in ``dry_run``, which only computes the plan):
+
+    1. Refuse if ``slug`` is missing or the built-in ``default`` board.
+    2. Detect ``profiles/*/.env`` pins → without ``force`` REFUSE and list them
+       (zero changes); with ``force`` they are rewritten (commented out).
+    3. Stop the board's dispatcher gateway(s) (hermes-native, by pid file) and
+       SIGTERM its event-bridge; clean stale ``.event_bridge.pid``/``.lock``.
+    4. Stamp ``launch_phase=retired`` onto ``board.json``.
+    5. Reset ``kanban/current`` to ``default`` if it points at ``slug``.
+    6. Move the board dir to ``kanban/backups/deleted-boards-<ts>/<slug>/``.
+    7. Flag ``slug`` in ``boards/MANIFEST.json`` (if present).
+    8. Run the binding-health check and report orphans/bad bindings.
+
+    Returns a structured report. ``ok=False`` with ``reason="pinned_profiles"``
+    means a refusal (nothing changed); re-run with ``force=True`` after
+    re-pointing, or pass ``force`` to rewrite the pins automatically.
+    """
+    normed = _normalize_board_slug(slug)
+    if not normed:
+        raise ValueError("board slug is required")
+    if normed == DEFAULT_BOARD:
+        raise ValueError("the 'default' board cannot be retired")
+    if not board_exists(normed):
+        raise ValueError(f"board {normed!r} does not exist")
+
+    root = home or kanban_home()
+    pins = find_profile_board_pins(normed, home=root)
+    gateways = discover_board_dispatcher_gateways(normed, home=root)
+    event_bridge = find_board_event_bridge(normed)
+
+    current_file = current_board_path()
+    current_points_here = False
+    try:
+        if current_file.exists():
+            current_points_here = (
+                _normalize_board_slug(current_file.read_text(encoding="utf-8").strip())
+                == normed
+            )
+    except (OSError, ValueError):
+        current_points_here = False
+
+    backup_root = deleted_boards_backup_root(timestamp=timestamp)
+    backup_dest = backup_root / normed
+    manifest_path = root / "kanban" / "boards" / "MANIFEST.json"
+
+    plan = {
+        "slug": normed,
+        "force": force,
+        "pinned_profiles": pins,
+        "gateways": gateways,
+        "event_bridge": event_bridge,
+        "current_reset": current_points_here,
+        "backup_dest": str(backup_dest),
+        "manifest_path": str(manifest_path) if manifest_path.exists() else None,
+        "retired_phase": RETIRED_LAUNCH_PHASE,
+    }
+
+    if dry_run:
+        return {"ok": True, "dry_run": True, "actions": [], "plan": plan,
+                "health": None}
+
+    # Fail-closed on profile pins unless --force: never silently edit .env.
+    if pins and not force:
+        return {
+            "ok": False,
+            "dry_run": False,
+            "reason": "pinned_profiles",
+            "plan": plan,
+            "pinned_profiles": pins,
+            "message": (
+                f"{len(pins)} profile .env file(s) still pin board {normed!r}. "
+                "Re-point them or re-run with --force to clear the pins."
+            ),
+        }
+
+    actions: list[str] = []
+
+    # 1) Stop dispatcher gateway(s) (hermes-native, best-effort).
+    for gw in gateways:
+        try:
+            # Lazy import: profiles isn't a load-time dependency of kanban_db,
+            # and is only needed for the optional process-stop step (mirrors
+            # this module's existing lazy-import pattern for heavy/optional deps).
+            from hermes_cli import profiles as _profiles
+            _profiles._stop_gateway_process(Path(gw["profile_dir"]))
+            actions.append(f"stopped gateway for profile {gw['profile']!r} (pid {gw.get('pid')})")
+        except Exception as exc:  # best-effort: never block teardown on a stuck gateway
+            actions.append(f"warning: could not stop gateway {gw['profile']!r}: {exc}")
+
+    # 2) SIGTERM event-bridge and clean stale pid/lock.
+    if event_bridge:
+        pid = event_bridge.get("pid")
+        if pid and event_bridge.get("live"):
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+                actions.append(f"sent SIGTERM to event-bridge (pid {pid})")
+            except (ProcessLookupError, PermissionError, OSError) as exc:
+                actions.append(f"warning: could not signal event-bridge pid {pid}: {exc}")
+        for key in ("pid_file", "lock_file"):
+            fp = event_bridge.get(key)
+            if fp:
+                try:
+                    Path(fp).unlink()
+                    actions.append(f"removed stale {Path(fp).name}")
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    actions.append(f"warning: could not remove {fp}: {exc}")
+
+    # 3) Stamp retired phase onto board.json (before the move, so the backup
+    #    records why it was retired).
+    try:
+        write_board_metadata(normed, launch_phase=RETIRED_LAUNCH_PHASE)
+        actions.append(f"set launch_phase={RETIRED_LAUNCH_PHASE}")
+    except Exception as exc:
+        actions.append(f"warning: could not stamp launch_phase: {exc}")
+
+    # 4) Reset the current pointer if it points here.
+    if current_points_here:
+        clear_current_board()
+        actions.append("reset kanban/current → default")
+
+    # Drop any cached schema-init for this board's DB so a stray connect()
+    # after the move can't resurrect a ghost at the old path.
+    _INITIALIZED_PATHS.discard(str((board_dir(normed) / "kanban.db").resolve()))
+
+    # 5) Move the board dir to the deleted-boards backup (per-run timestamped
+    #    folder; never clobber a prior retired board).
+    d = board_dir(normed)
+    if d.exists():
+        backup_root.mkdir(parents=True, exist_ok=True)
+        dest = backup_dest
+        suffix = 1
+        while dest.exists():
+            dest = backup_root / f"{normed}-{suffix}"
+            suffix += 1
+        d.rename(dest)
+        plan["backup_dest"] = str(dest)
+        actions.append(f"moved board data → {dest}")
+
+    # 6) Rewrite (comment out) profile .env pins under --force.
+    if force and pins:
+        for pin in pins:
+            if clear_profile_board_pin(pin["env_path"], normed):
+                actions.append(f"cleared .env pin in profile {pin['profile']!r}")
+
+    # 7) Flag the slug in MANIFEST.json (best-effort; only if it exists).
+    manifest_result = _flag_board_retired_in_manifest(
+        manifest_path, normed, plan["backup_dest"]
+    )
+    if manifest_result:
+        actions.append(manifest_result)
+
+    # 8) Post-retire health check (prove the system is clean).
+    try:
+        health = board_binding_health()
+    except Exception as exc:  # never let the health probe fail the retire
+        health = {"ok": None, "error": str(exc)}
+
+    return {
+        "ok": True,
+        "dry_run": False,
+        "slug": normed,
+        "actions": actions,
+        "plan": plan,
+        "health": health,
+    }
+
+
+def _flag_board_retired_in_manifest(
+    manifest_path: Path, slug: str, backup_dest: str
+) -> Optional[str]:
+    """Flag ``slug`` as retired in ``boards/MANIFEST.json`` (best-effort).
+
+    The manifest is a hand-maintained audit document (there is no code-side
+    regenerate helper), so we surgically FLAG the matching board entry —
+    ``archived=true``, ``location`` pointing at the backup, plus a note — rather
+    than rewriting the whole file or deleting the row (preserves the audit
+    trail). If the slug isn't listed, append a minimal flagged entry. Returns a
+    human-readable action string, or None when there's no manifest to touch.
+    """
+    if not manifest_path.exists():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return f"warning: could not update MANIFEST.json: {exc}"
+    if not isinstance(data, dict):
+        return "warning: MANIFEST.json is not an object; left unchanged"
+
+    boards = data.get("boards")
+    if not isinstance(boards, list):
+        boards = []
+        data["boards"] = boards
+
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    note = f"retired by `hermes kanban boards retire` at {now_iso}; data at {backup_dest}"
+    try:
+        rel_location = str(Path(backup_dest).relative_to(kanban_home() / "kanban"))
+    except (ValueError, OSError):
+        rel_location = backup_dest
+
+    found = False
+    for entry in boards:
+        if isinstance(entry, dict) and _normalize_board_slug(entry.get("slug")) == slug:
+            entry["archived"] = True
+            entry["retired"] = True
+            entry["location"] = rel_location
+            entry["note"] = note
+            found = True
+            break
+    if not found:
+        boards.append({
+            "slug": slug,
+            "location": rel_location,
+            "purpose": "retired",
+            "archived": True,
+            "retired": True,
+            "dispatcher_profile": None,
+            "note": note,
+        })
+
+    data["generated_at_utc"] = now_iso
+    data["generated_by"] = "hermes kanban boards retire"
+    try:
+        manifest_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        return f"warning: could not write MANIFEST.json: {exc}"
+    return f"flagged {slug!r} retired in MANIFEST.json"
 
 
 # ---------------------------------------------------------------------------

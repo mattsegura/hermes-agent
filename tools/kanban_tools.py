@@ -629,6 +629,8 @@ def _attach_launch_intake_followup(payload: dict[str, Any]) -> None:
             if isinstance(stored, list) and stored:
                 question_list = [str(q) for q in stored if str(q).strip()]
                 break
+    if question_list and not payload.get("questions"):
+        payload["questions"] = question_list
     if isinstance(intake, dict):
         intake_state = str(intake.get("state") or "").strip().lower()
         answer_quality = intake.get("answer_quality")
@@ -1447,6 +1449,9 @@ def _handle_business_launch_review(args: dict, **kw) -> str:
         return tool_error(bool_error)
     try:
         from hermes_cli import kanban_db as kb
+        # Reset the owner-facing progress breadcrumb so we relay only the phrases
+        # emitted by THIS review's research/draft/repair checkpoints (F2).
+        kb.owner_progress_reset()
         result = kb.review_business_launch_contract(
             board,
             contract=contract,
@@ -1464,6 +1469,9 @@ def _handle_business_launch_review(args: dict, **kw) -> str:
             require_launch_intake=_is_owner_launch_intake_profile(),
         )
         sanitized = _sanitize_launch_tool_result(kb, result)
+        progress = kb.owner_progress_snapshot()
+        if progress:
+            sanitized["progress"] = progress
         try:
             from hermes_cli.kanban_model_routing import build_model_routing_read_model
 
@@ -1626,6 +1634,9 @@ def _handle_contract_steer(args: dict, **kw) -> str:
     try:
         from hermes_cli import kanban_db as kb
 
+        # Reset the owner-facing progress breadcrumb so we only relay phrases
+        # from THIS steering run (F2).
+        kb.owner_progress_reset()
         result = kb.steer_board_contract_amendment(
             board,
             str(intent),
@@ -1635,29 +1646,37 @@ def _handle_contract_steer(args: dict, **kw) -> str:
         if not result.get("ok"):
             # Steering model unavailable, asked a clarifying question, or could
             # not converge on a valid change. Surface the plain-language reply;
-            # nothing was stored.
-            return json.dumps(
-                {
-                    "ok": False,
-                    "status": (
-                        "steering_unavailable"
-                        if result.get("degraded")
-                        else "no_change"
-                    ),
-                    "message": result.get("reply") or "No change was made.",
-                    "errors": result.get("errors") or [],
-                },
-                ensure_ascii=False,
-            )
+            # nothing was stored. Translate any validator errors into owner-
+            # friendly sentences (F1) — raw keys stay under ``errors_internal``
+            # for debugging, never in the owner-facing message.
+            raw_errors = result.get("errors") or []
+            friendly = kb.owner_facing_error_sentences(raw_errors)
+            payload = {
+                "ok": False,
+                "status": (
+                    "steering_unavailable"
+                    if result.get("degraded")
+                    else "no_change"
+                ),
+                "message": result.get("reply") or "No change was made.",
+                "progress": result.get("progress") or [],
+            }
+            if friendly:
+                payload["owner_message"] = " ".join(friendly)
+            if raw_errors:
+                payload["errors_internal"] = raw_errors
+            return json.dumps(payload, ensure_ascii=False)
         amendment = result.get("amendment") or {}
         return _ok(
             status="pending_amendment",
             message=result.get("summary") or "Updated the board contract.",
             changes=result.get("changes") or [],
             reply=result.get("reply") or "",
+            progress=result.get("progress") or [],
             amendment_id=amendment.get("id"),
             next_step=(
-                f"If this preview is right, the owner approves with `/approve {board}`."
+                f"Show the owner this preview, then close with the literal line: "
+                f"`/approve {board}` — approving it makes the change live."
             ),
         )
     except ValueError as e:
@@ -2654,6 +2673,42 @@ KANBAN_CONTRACT_AMENDMENT_PROPOSE_SCHEMA = {
     },
 }
 
+KANBAN_CONTRACT_STEER_SCHEMA = {
+    "name": "kanban_contract_steer",
+    "description": (
+        "PREFERRED owner-facing way to CHANGE a board's contract. Give a board "
+        "and a plain-English `intent` describing the change the owner wants "
+        "(e.g. 'tighten the success target to 1M MAU and add a TikTok "
+        "workstream'). Hermes routes it through the steering model with a "
+        "server-side self-repair loop that drafts a MINIMAL, targeted diff, "
+        "auto-fixes any validator errors, and stores ONE clean pending "
+        "amendment — you never hand-author JSON or chase validator errors. "
+        "Returns a plain-language summary of what changed for the owner to "
+        "review before `/approve`. Use the low-level "
+        "`kanban_contract_amendment_propose` only as an escape hatch when you "
+        "must apply a precise raw patch yourself."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "board": _board_schema_prop(),
+            "intent": {
+                "type": "string",
+                "description": (
+                    "Plain-English description of the change the owner wants. "
+                    "Hermes converts it into a minimal validated contract diff."
+                ),
+            },
+            "risk": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "description": "Estimated operational risk for the change.",
+            },
+        },
+        "required": ["board", "intent"],
+    },
+}
+
 KANBAN_CONTRACT_SCHEMA_SCHEMA = {
     "name": "kanban_contract_schema",
     "description": (
@@ -3263,6 +3318,15 @@ registry.register(
     handler=_handle_contract_amendment_propose,
     check_fn=_check_kanban_launch_intake_mode,
     emoji="🧭",
+)
+
+registry.register(
+    name="kanban_contract_steer",
+    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    schema=KANBAN_CONTRACT_STEER_SCHEMA,
+    handler=_handle_contract_steer,
+    check_fn=_check_kanban_launch_intake_mode,
+    emoji="🗣️",
 )
 
 registry.register(

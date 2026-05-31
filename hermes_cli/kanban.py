@@ -373,6 +373,26 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                       help="Hard-delete the board directory instead of archiving it. "
                            "Default is to move it to boards/_archived/ so it's recoverable.")
 
+    b_retire = boards_sub.add_parser(
+        "retire",
+        help="Durably tear down a board: stop its runtime, back up data, "
+             "and fix every pointer/pin/manifest reference",
+    )
+    b_retire.add_argument("slug")
+    b_retire.add_argument(
+        "--force", action="store_true",
+        help="Rewrite (comment out) any profile .env HERMES_KANBAN_BOARD pins "
+             "for this board. Without --force, pinned profiles cause a refusal.")
+    b_retire.add_argument(
+        "--dry-run", action="store_true",
+        help="Print exactly what WOULD happen (pointer reset, affected .env "
+             "pins, gateways/PIDs to stop, backup destination, manifest change) "
+             "and make ZERO changes.")
+    b_retire.add_argument(
+        "--yes", action="store_true",
+        help="Confirm the destructive teardown. Required for a real run "
+             "(omit it with --dry-run to preview safely).")
+
     b_switch = boards_sub.add_parser(
         "switch", aliases=["use"],
         help="Set the active board for subsequent CLI calls",
@@ -423,6 +443,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     bc_status.add_argument("slug", nargs="?", default=None,
                            help="Board slug (defaults to current board)")
     bc_status.add_argument("--json", action="store_true")
+    bc_export = b_contract_sub.add_parser(
+        "export",
+        help="Export contract as markdown, asciidoc, or json",
+    )
+    bc_export.add_argument("slug", nargs="?", default=None,
+                           help="Board slug (defaults to current board)")
+    bc_export.add_argument(
+        "--format",
+        choices=("markdown", "asciidoc", "json"),
+        default="markdown",
+        help="Export format (default: markdown)",
+    )
+    bc_export.add_argument(
+        "-o", "--output",
+        default=None,
+        help="Write export to file instead of stdout",
+    )
     bc_review = b_contract_sub.add_parser("review", help="Review/store a draft launch contract")
     bc_review.add_argument("slug", help="Board slug")
     bc_review.add_argument("--rough-goal", default=None,
@@ -1646,6 +1683,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_create(args)
     if sub in {"rm", "remove", "delete"}:
         return _cmd_boards_rm(args)
+    if sub == "retire":
+        return _cmd_boards_retire(args)
     if sub in {"switch", "use"}:
         return _cmd_boards_switch(args)
     if sub in {"show", "current"}:
@@ -2029,6 +2068,99 @@ def _cmd_boards_rm(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_retire_plan(plan: dict, *, dry_run: bool) -> None:
+    """Render a retire plan/report header (shared by dry-run and real runs)."""
+    verb = "WOULD" if dry_run else "will"
+    slug = plan.get("slug")
+    print(f"Retire board {slug!r}:")
+    pins = plan.get("pinned_profiles") or []
+    if pins:
+        action = "rewrite (comment out)" if plan.get("force") else "BLOCK retire"
+        print(f"  .env pins ({action}):")
+        for pin in pins:
+            print(f"    - profile {pin['profile']!r}: {pin['env_path']}:{pin['line_no']}")
+    else:
+        print("  .env pins: none")
+    gws = plan.get("gateways") or []
+    if gws:
+        print(f"  Dispatcher gateway(s) {verb} stop:")
+        for gw in gws:
+            live = "live" if gw.get("live") else "stale pid"
+            print(f"    - profile {gw['profile']!r} (pid {gw.get('pid')}, {live})")
+    else:
+        print("  Dispatcher gateways: none running")
+    eb = plan.get("event_bridge")
+    if eb:
+        state = "live" if eb.get("live") else "stale"
+        print(f"  Event-bridge {verb} stop: pid {eb.get('pid')} ({state}); "
+              "clean .event_bridge.pid/.lock")
+    else:
+        print("  Event-bridge: none")
+    print(f"  kanban/current reset → default: {'yes' if plan.get('current_reset') else 'no'}")
+    print(f"  launch_phase → {plan.get('retired_phase')}")
+    print(f"  Backup destination: {plan.get('backup_dest')}")
+    print(f"  MANIFEST.json: "
+          + (f"flag {slug!r} retired" if plan.get("manifest_path") else "not present (skip)"))
+
+
+def _cmd_boards_retire(args: argparse.Namespace) -> int:
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards retire: {exc}", file=sys.stderr)
+        return 2
+    if not normed:
+        print("kanban boards retire: slug is required", file=sys.stderr)
+        return 2
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    force = bool(getattr(args, "force", False))
+
+    # Destructive guard: a real run needs --yes (preview safely with --dry-run).
+    if not dry_run and not getattr(args, "yes", False):
+        try:
+            plan = kb.retire_board(normed, force=force, dry_run=True).get("plan", {})
+            _print_retire_plan(plan, dry_run=True)
+        except ValueError as exc:
+            print(f"kanban boards retire: {exc}", file=sys.stderr)
+            return 1
+        print(
+            "\nkanban boards retire: this is destructive. Re-run with --yes to "
+            "proceed, or --dry-run to preview without confirmation.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        result = kb.retire_board(normed, force=force, dry_run=dry_run)
+    except ValueError as exc:
+        print(f"kanban boards retire: {exc}", file=sys.stderr)
+        return 1
+
+    if dry_run:
+        _print_retire_plan(result.get("plan", {}), dry_run=True)
+        print("\nDry run — no changes were made.")
+        return 0
+
+    if not result.get("ok"):
+        # Refusal (pinned profiles without --force): nothing changed.
+        print(result.get("message", "kanban boards retire: refused."), file=sys.stderr)
+        for pin in result.get("pinned_profiles", []):
+            print(f"    - profile {pin['profile']!r}: {pin['env_path']}", file=sys.stderr)
+        return 1
+
+    print(f"Board {normed!r} retired.")
+    for action in result.get("actions", []):
+        print(f"  - {action}")
+    health = result.get("health") or {}
+    if health.get("ok") is True:
+        print("  Health: board↔profile bindings clean after retire.")
+    elif health.get("ok") is False:
+        print("  Health: WARNING — binding issues remain (see `hermes kanban doctor`).",
+              file=sys.stderr)
+    return 0
+
+
 def _cmd_boards_switch(args: argparse.Namespace) -> int:
     try:
         normed = kb._normalize_board_slug(args.slug)
@@ -2196,6 +2328,25 @@ def _print_contract_review_human(result: dict[str, Any], board: str) -> None:
         if summary:
             print("\nOwner summary:")
             print(summary)
+            try:
+                from hermes_cli.kanban_launch_summary import render_contract_sections_table
+
+                contract_obj = result.get("contract")
+                creds = None
+                try:
+                    from hermes_cli import kanban_credentials as kc
+
+                    creds = kc.assess_board_credentials(
+                        board, contract_obj if isinstance(contract_obj, dict) else None,
+                    )
+                except Exception:
+                    pass
+                print("\nContract sections:")
+                print(render_contract_sections_table(
+                    contract_obj, board=board, credentials=creds,
+                ))
+            except Exception:
+                pass
         print(f"\nNext: /approve {board}")
         return
 
@@ -2219,6 +2370,7 @@ def _print_contract_readiness(status: dict[str, Any]) -> None:
     readiness = status.get("readiness") or {}
     print(f"Board:            {status.get('board')}")
     print(f"Launch phase:     {status.get('launch_phase')}")
+    print(f"Contract status:  {readiness.get('contract_status') or '(derived)'}")
     print(f"Contract version: {status.get('contract_version')}")
     print(f"Dispatch enabled: {'yes' if status.get('dispatch_enabled') else 'no'}")
     print(f"Readiness:        {readiness.get('status')}")
@@ -2312,6 +2464,36 @@ def _cmd_boards_contract(args: argparse.Namespace) -> int:
             print(json.dumps(status, indent=2, ensure_ascii=False))
         else:
             _print_contract_readiness(status)
+        return 0
+
+    if sub == "export":
+        if not kb.board_exists(normed):
+            print(f"kanban boards contract export: board {slug!r} does not exist", file=sys.stderr)
+            return 1
+        meta = kb.read_board_metadata(normed)
+        contract = kb._metadata_as_business_contract(meta)
+        fmt = getattr(args, "format", "markdown") or "markdown"
+        try:
+            from hermes_cli import kanban_credentials as kc
+            from hermes_cli.kanban_launch_summary import export_contract_document
+
+            creds = kc.assess_board_credentials(normed, contract)
+            doc = export_contract_document(
+                contract,
+                format=fmt,
+                board=normed,
+                credentials=creds,
+                include_approve_hint=meta.get("launch_phase") != "active",
+            )
+        except Exception as exc:
+            print(f"kanban boards contract export: {exc}", file=sys.stderr)
+            return 2
+        out_path = getattr(args, "output", None)
+        if out_path:
+            Path(out_path).write_text(doc, encoding="utf-8")
+            print(f"Wrote {fmt} export to {out_path}")
+        else:
+            print(doc, end="" if doc.endswith("\n") else "\n")
         return 0
 
     if sub == "review":

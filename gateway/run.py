@@ -14525,7 +14525,16 @@ class GatewayRunner:
                 )
             if reason == "amendment_not_ready":
                 missing = resolution.get("missing") or []
-                tail = ("\nStill missing:\n- " + "\n- ".join(missing)) if missing else ""
+                # Translate the validator's raw missing-field keys into plain
+                # owner sentences (F1); keep the raw keys in the log for debugging.
+                if missing:
+                    logger.info(
+                        "/approve %s amendment_not_ready missing(raw)=%r", slug, missing
+                    )
+                friendly = kb.owner_facing_error_sentences(missing)
+                tail = (
+                    "\nBefore I can launch it, I still need:\n- " + "\n- ".join(friendly)
+                ) if friendly else ""
                 return (
                     f"⛔ `/approve {slug}` refused — the pending amendment "
                     f"(`{resolution.get('amendment_id')}`) is not launch-ready yet, "
