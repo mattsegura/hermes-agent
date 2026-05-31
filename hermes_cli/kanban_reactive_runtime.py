@@ -25,6 +25,27 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
+# FIX 5: bind the closed-vocabulary grammar helper at MODULE LOAD so an
+# unavailable grammar is a hard ImportError at startup, never a per-call silent
+# downgrade that strips declared classes off every opted-in loop and persists a
+# substring-path schedule. Mirrors kanban_launch_invariants' module-load import
+# of the same grammar. kanban_launch_grammar is a pure leaf module (no internal
+# imports), so this cannot introduce a circular import.
+from hermes_cli.kanban_launch_grammar import (
+    loop_declared_terminal_classes as _grammar_loop_declared_terminal_classes,
+    loop_opts_into_terminal_classes as _grammar_loop_opts_into_terminal_classes,
+)
+
+#: FIX 3 (round-2) compile-time fail-CLOSED marker. ``loop_terminal_classes_for_compile``
+#: returns this (a distinct str sentinel, NOT a dict and NOT None) when a loop
+#: OPTED IN to declared terminal classes but its declaration carried NO surviving
+#: ``win`` class (every declared class was unknown and dropped by the grammar).
+#: Such a loop must NOT silently revert to the legacy 'won'-substring reward path
+#: -- the compile path persists this marker so the read-back / reward rail fails
+#: CLOSED (credits 0.0, non-conversion) and emits a loud error, instead of
+#: crediting on a substring guess the loop opted in precisely to suppress.
+TERMINAL_CLASSES_DROPPED_SENTINEL: str = "__terminal_classes_dropped__"
+
 # --------------------------------------------------------------------------
 # Untrusted-inbound sanitization boundary.
 # --------------------------------------------------------------------------
@@ -287,12 +308,54 @@ def cadence_seconds(trigger: dict) -> Optional[int]:
 
 
 def _coerce_int(value: Any) -> Optional[int]:
+    # ROUND-5/6 FIX 2 (byte-identity by construction): this helper is on the
+    # SHARED, NON-OPTED code path -- ``loop_max_nudges`` uses it, and max_nudges
+    # is NOT opt-in-gated. Its behavior must therefore be BYTE-FOR-BYTE base
+    # 019271994, including the base CRASH characteristic:
+    #
+    #   * a ``.isdigit()``-True char that ``int()`` rejects ('³' SUPERSCRIPT
+    #     THREE, '①' CIRCLED ONE) RAISES ValueError;
+    #   * a non-finite float (float('inf')/float('nan')) RAISES on ``int()``.
+    #
+    # That raise is the BASE default-off behavior: the per-loop compile
+    # try/except (_compile_one_reactive_loop) catches it and DROPS the loop while
+    # recording an error -> schedule row count 0. Swallowing the crash here would
+    # CHANGE that default-off decision (the round-4/5 regression). The crash-safe
+    # parser lives in ``_coerce_int_safe`` and is used EXCLUSIVELY by the opt-in
+    # ``loop_max_defers`` bound, never on this shared path.
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
         return int(value)
     if isinstance(value, str) and value.strip().lstrip("-").isdigit():
         return int(value.strip())
+    return None
+
+
+def _coerce_int_safe(value: Any) -> Optional[int]:
+    """Crash-safe integer coercion for the OPT-IN ``max_defers`` bound ONLY.
+
+    Identical acceptance set to :func:`_coerce_int`, but wraps the ``int()``
+    parse so the rare ``.isdigit()``-True-but-unparseable inputs ('³', '①') and
+    non-finite floats (inf/nan) become ``None`` instead of raising. This is used
+    EXCLUSIVELY by :func:`loop_max_defers`, which the contract opts into
+    explicitly (``loop_opts_into_defer_bound``); the shared, non-opted
+    ``loop_max_nudges`` path keeps the base-verbatim crashing ``_coerce_int`` so
+    a NON-OPTED loop's compile decision is byte-identical to base by
+    construction.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
+            return None
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        try:
+            return int(value.strip())
+        except (ValueError, TypeError):
+            return None
     return None
 
 
@@ -338,4 +401,83 @@ def loop_max_nudges(loop: dict, tunables: Optional[dict] = None) -> Optional[int
                 best = (priority, n)
         if best is not None:
             return best[1]
+    return None
+
+
+def loop_declared_terminal_classes(loop: dict) -> dict[str, str]:
+    """Resolve a loop's DECLARED terminal-state -> outcome-class map (9b, opt-in).
+
+    Delegates to the closed-vocabulary grammar so the reward rail and the intake
+    validator agree on what a declared class is. Returns an empty dict when the
+    loop did not opt in (no declared classes) -- the caller keeps the legacy
+    substring reward behavior, byte-identical to today.
+
+    FIX 5: the grammar is imported at MODULE LOAD (see the top-of-module
+    ``_grammar_loop_declared_terminal_classes`` binding), NOT per-call inside a
+    swallow-everything ``try``. A per-call ``except Exception: return {}`` was a
+    silent fail-OPEN: if the grammar were unavailable at compile time it stripped
+    the declared map from EVERY opted-in loop and persisted a NULL column, so the
+    board permanently reverted to the substring path with no error trail. With a
+    module-load import, an unavailable grammar is a hard ImportError at startup
+    (the board never compiles a stripped schedule), exactly like
+    ``kanban_launch_invariants`` does for ``TERMINAL_OUTCOME_CLASSES``.
+    """
+    return _grammar_loop_declared_terminal_classes(loop)
+
+
+def loop_terminal_classes_for_compile(loop: dict):
+    """Resolve what to PERSIST in a schedule row's ``terminal_classes`` column.
+
+    FIX 3 (round-2) fail-CLOSED at compile. Three outcomes:
+
+    * **Not opted in** -> ``None``. The loop declared no class; the schedule row
+      keeps a NULL column and the reward rail uses the byte-identical legacy
+      substring path. (Unchanged from base for every legacy loop.)
+    * **Opted in, declaration survives** -> the ``{state: class}`` map. The reward
+      rail is governed ONLY by the declared closed-vocabulary map.
+    * **Opted in, but the WHOLE declaration was dropped** -> the
+      :data:`TERMINAL_CLASSES_DROPPED_SENTINEL`. The loop DID opt in (it carried a
+      class declaration), but every declared class was unknown/dropped by the
+      grammar (e.g. ``terminal_classes={closed_won: 'victory'}``), so the declared
+      map is empty -- there is no valid ``win`` to credit. Persisting this
+      sentinel makes the read-back fail CLOSED (credit 0.0 + loud error) rather
+      than silently reverting to the 'won' substring path the loop opted in to
+      suppress. The matching intake invariant (``_check_loop_terminal_classes``)
+      already ERRORS on this shape; this is the runtime belt that holds even on a
+      path that reaches compile without the intake gate (the default-off
+      completeness posture).
+
+    Note: a loop that opts in WITH at least one valid class still returns the
+    (filtered) map -- any sibling unknown classes are dropped as before, but the
+    loop is not fail-closed because the declared map is non-empty (the substring
+    path is already suppressed). The fail-closed marker fires ONLY when the loop
+    opted in yet NOTHING valid survived.
+    """
+    declared = _grammar_loop_declared_terminal_classes(loop)
+    if declared:
+        return declared
+    # Empty declared map: either the loop never opted in (legacy, -> None) or it
+    # opted in but every class was dropped (fail CLOSED).
+    if _grammar_loop_opts_into_terminal_classes(loop):
+        return TERMINAL_CLASSES_DROPPED_SENTINEL
+    return None
+
+
+def loop_max_defers(loop: dict) -> Optional[int]:
+    """Resolve a loop's bound on approval-deferral ticks (9c, opt-in).
+
+    Looks at the loop itself (``max_defers`` / ``max_deferrals``). ``None`` means
+    NO declared bound -> unbounded deferral, byte-identical to today's behavior.
+    Only a loop that explicitly declares a non-negative bound gets the anti-zombie
+    cap. A bare ``0`` is honored (terminate on the first unapproved fire attempt).
+    """
+    if isinstance(loop, dict):
+        for key in ("max_defers", "max_deferrals", "max_defer"):
+            # OPT-IN path: use the crash-safe parser so a malformed declared
+            # bound ('³'/'①'/inf/nan) clamps to None (unbounded -> graceful)
+            # instead of crashing the compile. The shared non-opted max_nudges
+            # path keeps the base-verbatim crashing ``_coerce_int``.
+            n = _coerce_int_safe(loop.get(key))
+            if n is not None and n >= 0:
+                return n
     return None
