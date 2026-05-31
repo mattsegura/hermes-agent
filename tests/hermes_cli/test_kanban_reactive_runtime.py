@@ -1262,3 +1262,150 @@ def test_runtime_declared_win_terminal_in_won_lost_pair_still_converts(fresh_hom
             o["reward_kind"] == "conversion" and o["reward_value"] == 1.0
             for o in outcomes
         ), "the win side of a won/lost pair must still earn the conversion reward"
+
+
+# ---------------------------------------------------------------------------
+# N. Dispatch-gate short-circuit: a gate-CLOSED board must NOT keep firing its
+#    timer follow-up loops (nudge-budget waste + reward-ledger pollution).
+#
+#    reactive_tick used to drive timer loops without consulting
+#    board_dispatch_gate -- so a MANAGED board frozen out of dispatch (e.g.
+#    launch_completeness_failed / launch_readiness_failed under enforcement)
+#    still spent a nudge, advanced next_fire_at, and emitted event_loop nudge
+#    signals every tick, even though no worker can run (trigger_watch demotes
+#    the woken task to 'blocked'). recompute_ready/claim_task already
+#    short-circuit on the closed gate; these tests pin that reactive_tick now
+#    does too -- while the gate-OPEN / default-off path stays byte-identical.
+# ---------------------------------------------------------------------------
+
+
+def _event_loop_nudge_signals(conn, board):
+    return conn.execute(
+        "SELECT * FROM board_signals WHERE board = ? AND primitive_kind = 'event_loop' "
+        "AND action LIKE '%nudge%'",
+        (board,),
+    ).fetchall()
+
+
+def test_reactive_tick_fires_on_gate_open_board(fresh_home):
+    """Back-compat: a gate-OPEN board (the normal, default-off case) fires the
+    follow-up loop exactly as before -- nudge spent, schedule advanced, event_loop
+    nudge signal emitted. Proves the short-circuit does NOT touch the open path."""
+    _approve("serious", _contract())
+    with kb.connect(board="serious") as conn:
+        # Gate is OPEN with enforcement unset (the default for every board today).
+        assert kb.board_dispatch_gate("serious")["ok"] is True
+
+        row = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        base = int(row["next_fire_at"])
+
+        res = kb.reactive_tick(conn, now=base, board="serious")
+        # Fires exactly as the legacy path does.
+        assert res["fired"] == [{"loop_key": "seller_follow_up", "nudge": 1}]
+        assert "skipped_gate_closed" not in res
+
+        sched = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        assert int(sched["nudges_used"]) == 1  # a nudge WAS spent
+        assert int(sched["next_fire_at"]) > base  # schedule advanced
+        # And the event_loop nudge signal the optimizer learns from was emitted.
+        assert _event_loop_nudge_signals(conn, "serious"), \
+            "gate-OPEN board must still emit its event_loop nudge signal"
+
+
+def test_reactive_tick_short_circuits_on_gate_closed_board(fresh_home, monkeypatch):
+    """A gate-CLOSED managed board fires NOTHING: no nudge spent, schedule not
+    advanced, no event_loop nudge signal emitted.
+
+    Mutation check: WITHOUT the short-circuit reactive_tick would fire (this is
+    a normal due timer on a managed board) -- the nudges_used==0 / next_fire_at
+    unchanged / no-signal assertions below all go red on the unfixed code."""
+    # Approve the managed board with enforcement OFF (so launch can complete and
+    # the timer schedule arms), then flip enforcement on to CLOSE the gate.
+    monkeypatch.delenv("HERMES_LAUNCH_COMPLETENESS_ENFORCE", raising=False)
+    _approve("serious", _contract())
+    with kb.connect(board="serious") as conn:
+        row = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        base = int(row["next_fire_at"])
+        # Snapshot pre-tick state for the mutation/effect comparison.
+        assert int(row["nudges_used"]) == 0
+        assert row["last_fired_at"] is None
+
+        # Flip enforcement -> the managed board's dispatch gate is now CLOSED.
+        monkeypatch.setenv("HERMES_LAUNCH_COMPLETENESS_ENFORCE", "all")
+        gate = kb.board_dispatch_gate("serious")
+        assert gate["ok"] is False, "enforcement must close the managed board's gate"
+
+        # The timer is DUE (now >= next_fire_at) -> on the unfixed code this fires.
+        res = kb.reactive_tick(conn, now=base, board="serious")
+
+        # EFFECT 1: nothing fired.
+        assert res["fired"] == []
+        assert res["stopped"] == []
+        assert res["deferred"] == []
+        assert res.get("skipped_gate_closed") is True
+
+        # EFFECT 2: no nudge spent, schedule NOT advanced, never marked fired.
+        sched = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        assert int(sched["nudges_used"]) == 0
+        assert int(sched["next_fire_at"]) == base
+        assert sched["last_fired_at"] is None
+        assert int(sched["active"]) == 1  # not deactivated, just frozen
+
+        # EFFECT 3: NO event_loop nudge signal emitted (no reward-ledger pollution).
+        assert _event_loop_nudge_signals(conn, "serious") == []
+
+
+def test_reactive_tick_gate_closed_does_not_pollute_across_many_ticks(fresh_home, monkeypatch):
+    """A persistently gate-closed board never bleeds its finite nudge budget no
+    matter how many ticks the gateway drives -- the per-tick waste is the bug."""
+    monkeypatch.delenv("HERMES_LAUNCH_COMPLETENESS_ENFORCE", raising=False)
+    _approve("serious", _contract())
+    with kb.connect(board="serious") as conn:
+        row = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        base = int(row["next_fire_at"])
+        cadence = int(row["cadence_seconds"])
+
+        monkeypatch.setenv("HERMES_LAUNCH_COMPLETENESS_ENFORCE", "all")
+        # Drive several cadence steps; each one would fire on the unfixed code.
+        for step in range(5):
+            res = kb.reactive_tick(conn, now=base + step * cadence, board="serious")
+            assert res["fired"] == []
+            assert res.get("skipped_gate_closed") is True
+
+        sched = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        assert int(sched["nudges_used"]) == 0  # budget untouched across all ticks
+        assert _event_loop_nudge_signals(conn, "serious") == []
+
+
+def test_reactive_tick_defensive_when_gate_call_raises(fresh_home, monkeypatch):
+    """Defensive: if the gate check itself raises, the tick must NOT crash --
+    it falls through to the legacy firing path (the gate-skip is a safety
+    improvement, never a new failure mode)."""
+    _approve("serious", _contract())
+    with kb.connect(board="serious") as conn:
+        row = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        base = int(row["next_fire_at"])
+
+        def _boom(_board=None):
+            raise RuntimeError("gate exploded")
+
+        monkeypatch.setattr(kb, "board_dispatch_gate", _boom)
+
+        # The tick survives the raising gate and fires as the legacy path would.
+        res = kb.reactive_tick(conn, now=base, board="serious")
+        assert res["fired"] == [{"loop_key": "seller_follow_up", "nudge": 1}]
+        assert "skipped_gate_closed" not in res

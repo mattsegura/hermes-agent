@@ -17921,6 +17921,32 @@ def reactive_tick(
         "stopped": [],
         "deferred": [],
     }
+    # A board whose dispatch gate is CLOSED (e.g. launch_completeness_failed /
+    # launch_readiness_failed under enforcement) is frozen out of dispatch --
+    # recompute_ready/claim_task already short-circuit on it. Mirror that here so
+    # a gate-closed board does NOT keep spending its finite nudge budget,
+    # advancing next_fire_at, or emitting event_loop nudge signals (which would
+    # pollute the optimizer reward ledger). No worker would run on a fired loop
+    # anyway (the woken task is demoted to 'blocked'), so this is pure waste.
+    #
+    # Default-off is byte-identical: with enforcement unset the gate is OK for
+    # every board, so we fall through to the legacy path untouched. Defensive:
+    # if the gate call raises we MUST NOT break the tick -- fall through to
+    # legacy behavior (the gate-skip is a safety improvement, not a new failure
+    # mode).
+    try:
+        gate = board_dispatch_gate(board_slug)
+        if not gate.get("ok"):
+            _emit_dispatch_blocked_signal(conn, board_slug, gate)
+            result["skipped_gate_closed"] = True
+            return result
+    except Exception:  # pragma: no cover - defensive: never break the tick
+        _log.warning(
+            "reactive_tick dispatch-gate check failed on board %s; "
+            "falling through to legacy behavior",
+            board_slug,
+            exc_info=True,
+        )
     rows = conn.execute(
         "SELECT * FROM reactive_timer_schedules "
         "WHERE active = 1 AND board = ? AND next_fire_at <= ? "
