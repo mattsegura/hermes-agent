@@ -6,10 +6,14 @@ Target architecture for enforced launch flow, portable contracts, and owner-read
 
 ```mermaid
 flowchart TD
-  match[Match / create board] --> intake[Launch intake Q&A]
+  intent[Layer 1 intent gate kanban_match_board] -->|no_board_needed| inline[Answer inline]
+  intent -->|maybe_board| clarify[One natural clarifying question]
+  clarify --> intent
+  intent -->|board_required| match[Match / create board]
+  match --> intake[Layer 2 Launch Intake Interview skill]
   intake --> research[Pre-interview web research]
   research --> intake
-  intake --> synth[Contract synthesis]
+  intake --> synth[Contract synthesis workflow.stages ranked]
   synth --> review[Contract review + rich summary]
   review --> modelRoute[Model Route skill]
   modelRoute --> creds[Credentials collection]
@@ -17,6 +21,33 @@ flowchart TD
   payment --> approve[Owner approve CLI or Telegram]
   approve --> active[active dispatch]
 ```
+
+### Layer 1 — Intent gate
+
+Tool: `kanban_match_board` (call **before** `kanban_business_launch_review`).
+
+| Intent | Router behavior |
+| --- | --- |
+| `no_board_needed` | Answer inline; no launch review |
+| `maybe_board` | ONE natural clarifying question; re-run match after reply |
+| `board_required` | Route to existing board or start launch review |
+
+Module: `hermes_cli.kanban_launch_intent.classify_launch_intent`
+
+### Layer 2 — Launch Intake Interview skill
+
+Path: `skills/autonomous-ai-agents/launch-intake-interview/SKILL.md`
+
+Drives how the agent conducts intake (domain playbooks, coverage mapping, anti-loops). Server tools generate questions, assess answers, and synthesize contracts; the skill controls interview UX and contract field mapping.
+
+Loop hardening:
+
+- Duplicate `intake_answers` rejected with `intake_loop_detected`
+- Max clarification rounds (`HERMES_LAUNCH_INTAKE_MAX_CLARIFICATION_ROUNDS`, default 4) escalates to partial draft
+- Tool results include `intake_interview_guidance` pointing at the skill
+
+Coverage rubric adds `workflow_stages` and `integration_points` (8 dimensions total).
+
 
 Hard gates (no shortcuts):
 

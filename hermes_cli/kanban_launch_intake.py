@@ -174,6 +174,9 @@ The questions should help Hermes understand:
 - the concrete outcome and measurable success/failure signals
 - the people, items, accounts, or opportunities involved
 - domain-specific channels, platforms, and constraints (infer from research)
+- the end-to-end workflow as ranked stages (source -> qualify -> negotiate -> close)
+- conversation/negotiation points where Hermes waits on replies
+- integrations and systems (GitHub, CRM, SMS, ad platforms, analytics)
 - where work should start and what systems or channels are allowed
 - the real-world path from first signal through done, paused, or disqualified
 - what Hermes may do autonomously versus what requires owner approval
@@ -202,8 +205,8 @@ recursive intake loop: weak answers must produce better follow-up questions
 instead of a guessed contract.
 
 Assess against measurable success/failure signals, subject scope, allowed
-context, the real-world workflow path, autonomous-vs-approval boundaries, and
-proof/stop conditions.
+context, the real-world workflow path, ranked workflow stages, integration
+points, autonomous-vs-approval boundaries, and proof/stop conditions.
 
 Rules:
 - If answers are vague, incomplete, risky, or contradictory, set
@@ -234,7 +237,9 @@ must include every one of these top-level keys:
   "allowed_side_effects","required_proof"}, ...with >=3 distinct named roles}}
 - "workflow": {"id","goal_id","require_semantics": true,
   "workstreams": [...], "stages": [>=5 stages, each with domain-specific
-  "actions" and "exit_criteria" carrying "evidence_required". Any stage
+  "rank" (integer order, 1=first), "key", "actions" and "exit_criteria"
+  carrying "evidence_required". Rank stages so the owner can read the A-to-Z
+  pipeline at a glance. Any stage
   "triggers" must be TYPED objects (see the trigger grammar below). A
   CONVERSATIONAL stage -- one that consumes an inbound trigger AND either holds
   "substates" or emits an external side effect (it waits on an outside party,
@@ -472,8 +477,9 @@ a "query", and "results" with "title", "url", and "snippet"). Synthesize a
 grounded research brief using ONLY the information in those provided results.
 
 Identify the 2 to 4 highest-value things to learn about this domain BEFORE
-talking to the owner -- the things that, if known, let Hermes skip generic
-questions and instead confirm assumptions. For each, write a concise factual
+talking to the owner -- including a typical workflow stage breakdown (ranked
+steps from first signal to terminal outcome) and standard integrations.
+For each, write a concise factual
 summary grounded in the provided search results, and cite the concrete
 real-world systems, channels, data sources, compliance regimes, standard
 metrics, or stop conditions that the results mention by name.
@@ -502,8 +508,9 @@ NOTE: no live web search results are available right now, so this is a
 best-effort, UNGROUNDED brief drawn from general domain knowledge.
 
 Identify the 2 to 4 highest-value things to learn about this domain BEFORE
-talking to the owner -- the things that, if known, let Hermes skip generic
-questions and instead confirm assumptions. For each, write a concise factual
+talking to the owner -- including a typical workflow stage breakdown (ranked
+steps from first signal to terminal outcome) and standard integrations.
+For each, write a concise factual
 summary of what is generally true for this kind of work, and list the concrete
 real-world systems, channels, data sources, compliance regimes, standard
 metrics, or stop conditions that typically apply.

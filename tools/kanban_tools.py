@@ -49,6 +49,20 @@ KANBAN_LIST_MAX_LIMIT = 200
 KANBAN_FULL_TOOLSET = "kanban"
 KANBAN_LAUNCH_INTAKE_TOOLSET = "kanban_launch_intake"
 KANBAN_OWNER_LAUNCH_INTAKE_PROFILES = {"default", "personal-assistant"}
+LAUNCH_INTAKE_INTERVIEW_SKILL = "launch-intake-interview"
+
+
+def _intake_interview_guidance_block(*, reason: str) -> dict[str, str]:
+    return {
+        "skill": LAUNCH_INTAKE_INTERVIEW_SKILL,
+        "load_before": reason,
+        "path": "skills/autonomous-ai-agents/launch-intake-interview/SKILL.md",
+        "instruction": (
+            "Load the launch-intake-interview skill before relaying intake "
+            "questions, conducting follow-ups, or mapping owner answers to the "
+            "contract. Do not re-ask questions already answered; do not loop."
+        ),
+    }
 
 
 def _configured_toolsets() -> set[str]:
@@ -623,6 +637,26 @@ def _attach_launch_intake_followup(payload: dict[str, Any]) -> None:
     questions = payload.get("questions")
     question_list = [str(q) for q in questions] if isinstance(questions, list) else []
     intake = payload.get("launch_intake")
+    if isinstance(intake, dict) and intake.get("intake_loop_detected"):
+        payload["intake_interview_guidance"] = _intake_interview_guidance_block(
+            reason="Recovering from repeated identical intake answers",
+        )
+        payload["assistant_next_action"] = {
+            "type": "launch_intake_loop_recovery",
+            "required": True,
+            "instruction": (
+                "The owner submitted the same intake answers again. Tell them "
+                "clearly you already have those answers. Do NOT re-ask the same "
+                "questions. Either summarize what you understood and ask for ONE "
+                "new missing detail, or proceed to contract synthesis if coverage "
+                "is sufficient. Load launch-intake-interview skill."
+            ),
+        }
+        return
+    if isinstance(intake, dict) and intake.get("partial_escalation"):
+        payload["intake_interview_guidance"] = _intake_interview_guidance_block(
+            reason="Presenting partial draft after max clarification rounds",
+        )
     if not question_list and isinstance(intake, dict):
         for key in ("generated_questions", "questions"):
             stored = intake.get(key)
@@ -743,6 +777,9 @@ def _attach_launch_intake_followup(payload: dict[str, Any]) -> None:
             "instruction": instruction,
             "questions": question_list[:6],
         }
+        payload["intake_interview_guidance"] = _intake_interview_guidance_block(
+            reason="Relaying server-generated launch intake questions",
+        )
         return
     if not generation:
         return
@@ -1363,17 +1400,44 @@ def _handle_match_board(args: dict, **kw) -> str:
             key=lambda c: (c["match_score"], c["slug"] or ""),
             reverse=True,
         )
+        top_score = int(candidates[0]["match_score"]) if candidates else 0
+        top_slug = str(candidates[0]["slug"]) if candidates else None
+        from hermes_cli.kanban_launch_intent import classify_launch_intent
+
+        intent_result = classify_launch_intent(
+            goal,
+            top_match_score=top_score,
+            candidate_count=len(candidates),
+        )
+        intent_block = intent_result.as_dict()
+        if top_slug and top_score >= 2:
+            intent_block["top_board_slug"] = top_slug
+        intent_guidance = {
+            "no_board_needed": (
+                "Answer inline — do NOT call kanban_business_launch_review for this message."
+            ),
+            "maybe_board": (
+                "Ask exactly ONE natural clarifying question from "
+                "intent.clarifying_question (rephrase for tone, not yes/no). "
+                "Wait for the owner's reply before launch review."
+            ),
+            "board_required": (
+                "If an existing board clearly fits, route through it. Otherwise call "
+                "kanban_business_launch_review(create_if_missing=true, rough_goal=...) "
+                "and load the launch-intake-interview skill during intake."
+            ),
+        }
         return json.dumps({
             "ok": True,
             "goal": goal,
             "count": len(candidates),
             "candidates": candidates,
+            "intent": intent_block,
             "guidance": (
-                "match_score is a coarse lexical hint only. Decide the actual "
-                "match by reasoning over each board's name/description/objective. "
-                "If a board clearly covers this goal, work in it. If none fit, "
-                "clarify with the owner, then propose a new board via "
-                "kanban_business_launch_review(create_if_missing=true)."
+                "Layer 1 intent gate: follow intent.suggested_next_action. "
+                "match_score is a coarse lexical hint only — reason over each "
+                "board's name/description/objective for the actual match. "
+                + intent_guidance.get(intent_result.intent, "")
             ),
         }, ensure_ascii=False)
     except Exception as e:
@@ -2461,12 +2525,15 @@ KANBAN_LIST_BOARDS_SCHEMA = {
 KANBAN_MATCH_BOARD_SCHEMA = {
     "name": "kanban_match_board",
     "description": (
-        "Given a free-text description of work, return the existing boards as "
-        "ranked candidates (with a coarse lexical match_score) so you can pick "
-        "the right board to route to. This tool only supplies enumerated board "
-        "metadata — YOU decide the semantic match. If a board clearly fits, "
-        "work in it; if none fit, clarify with the owner then propose a new "
-        "board via kanban_business_launch_review(create_if_missing=true)."
+        "Layer 1 intent gate + board match. Call this FIRST on every message "
+        "before kanban_business_launch_review. Returns intent classification "
+        "(no_board_needed | maybe_board | board_required), ranked board "
+        "candidates, and suggested_next_action. no_board_needed: answer inline. "
+        "maybe_board: ask ONE natural clarifying question (from intent."
+        "clarifying_question) before launch review — not a yes/no checkbox. "
+        "board_required: route to a matching board or start launch review with "
+        "create_if_missing=true and load launch-intake-interview skill. "
+        "match_score is a coarse lexical hint — YOU decide the semantic match."
     ),
     "parameters": {
         "type": "object",
@@ -2543,11 +2610,13 @@ KANBAN_SUBMIT_LAUNCH_CREDENTIALS_SCHEMA = {
 KANBAN_BUSINESS_LAUNCH_REVIEW_SCHEMA = {
     "name": "kanban_business_launch_review",
     "description": (
-        "Hermes built-in board launch wizard (server-orchestrated launch intake). "
+        "Layer 2 launch wizard (after Layer 1 kanban_match_board intent gate). "
         "Review and store a draft business-runtime contract before launch. "
+        "Do NOT call for lightweight questions — kanban_match_board first. "
         "If the owner gives a vague business idea, call with rough_goal and "
         "create_if_missing=true — omit board= for new boards (do not pass a slug "
-        "that does not exist yet). The server runs the kanban_launch_intake "
+        "that does not exist yet). Load launch-intake-interview skill during "
+        "intake Q&A. The server runs the kanban_launch_intake "
         "auxiliary pipeline (research, generated_questions, answer assessment, "
         "contract synthesis) and returns assistant_next_action telling you what "
         "to say next on Telegram. Relay server-generated questions verbatim; "

@@ -522,11 +522,17 @@ def test_match_board_ranks_candidates_and_excludes_default(monkeypatch, tmp_path
         {"goal": "negotiate a land deal with a seller"}
     ))
     assert out["ok"] is True
+    assert out["intent"]["intent"] == "board_required"
     slugs = [c["slug"] for c in out["candidates"]]
     assert kb.DEFAULT_BOARD not in slugs
     # Best lexical match ranks first.
     assert out["candidates"][0]["slug"] == "land-wholesaling"
     assert out["candidates"][0]["match_score"] >= 1
+
+    light = json.loads(kt._handle_match_board(
+        {"goal": "What is a land assignment contract?"}
+    ))
+    assert light["intent"]["intent"] == "no_board_needed"
 
     # Missing goal → error (the tool requires a free-text goal).
     err = json.loads(kt._handle_match_board({}))

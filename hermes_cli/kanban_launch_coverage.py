@@ -1,15 +1,17 @@
 """Deterministic launch-intake coverage rubric (Phase 0 foundation).
 
 This module scores how completely a launch-intake conversation (or a drafted
-board operating contract) covers the six dimensions Hermes needs before it can
+board operating contract) covers the dimensions Hermes needs before it can
 safely synthesize and launch an agentic workflow:
 
     1. outcome_signals     - measurable success / failure conditions
     2. subject_scope       - the people / items / accounts the work is about
     3. allowed_context     - the systems, channels, and tools that are allowed
     4. workflow_path       - the real-world path from first signal to terminal
-    5. approval_boundaries - autonomous vs. owner-approval-gated actions
-    6. proof_and_stops     - proof, status updates, and stop conditions
+    5. workflow_stages     - named stages, ranked steps, conversation points
+    6. integration_points  - GitHub, CRM, ad platforms, messaging APIs, etc.
+    7. approval_boundaries - autonomous vs. owner-approval-gated actions
+    8. proof_and_stops     - proof, status updates, and stop conditions
 
 Design constraints (see Phase 0 of the intake->contract upgrade):
 
@@ -41,6 +43,8 @@ DIMENSIONS: tuple[str, ...] = (
     "subject_scope",
     "allowed_context",
     "workflow_path",
+    "workflow_stages",
+    "integration_points",
     "approval_boundaries",
     "proof_and_stops",
 )
@@ -50,6 +54,8 @@ _DIMENSION_HINTS: dict[str, str] = {
     "subject_scope": "Who or what the work is about (customers, deals, accounts, products).",
     "allowed_context": "Systems, channels, and tools Hermes may use (and any hard bans).",
     "workflow_path": "Real-world path from first signal through done, paused, or disqualified.",
+    "workflow_stages": "Named stages with order: lead, qualify, negotiate, close, etc.",
+    "integration_points": "Concrete integrations: GitHub, CRM, SMS, ad platforms, analytics.",
     "approval_boundaries": "What runs autonomously vs what needs owner approval before acting.",
     "proof_and_stops": "Proof artifacts, status updates, and conditions that stop the board.",
 }
@@ -352,6 +358,14 @@ _DIMENSION_SPECS: dict[str, _DimensionSpec] = {
         "workflow_path", min_chars=60, detectors=("sequence", "named"),
         spec_strong=20, spec_partial=10, markers_for_pass=1,
     ),
+    "workflow_stages": _DimensionSpec(
+        "workflow_stages", min_chars=40, detectors=("sequence", "named", "metric"),
+        spec_strong=15, spec_partial=8, markers_for_pass=2,
+    ),
+    "integration_points": _DimensionSpec(
+        "integration_points", min_chars=25, detectors=("named", "deontic"),
+        spec_strong=12, spec_partial=6, markers_for_pass=1,
+    ),
     "approval_boundaries": _DimensionSpec(
         "approval_boundaries", min_chars=30, detectors=("deontic", "named"),
         spec_strong=20, spec_partial=10, markers_for_pass=2,
@@ -602,10 +616,24 @@ def _contract_dimension_corpus(contract: Any) -> dict[str, str]:
         ]),
         "workflow_path": _flatten_text([
             [s.get("key") for s in stages],
+            [s.get("rank") for s in stages],
             [s.get("actions") for s in stages],
             [s.get("exit_criteria") for s in stages],
             workstreams,
             root.get("event_loops"),
+        ]),
+        "workflow_stages": _flatten_text([
+            [s.get("key") for s in stages],
+            [s.get("rank") for s in stages],
+            [s.get("substates") for s in stages],
+            [s.get("exit_criteria") for s in stages],
+        ]),
+        "integration_points": _flatten_text([
+            provider_policy,
+            channel_policy,
+            tool_policy,
+            root.get("needed_capability_types"),
+            [env.get("toolsets") for env in worker_envelopes.values() if isinstance(env, dict)],
         ]),
         "approval_boundaries": _flatten_text([
             root.get("approval_gates"),

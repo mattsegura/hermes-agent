@@ -150,6 +150,9 @@ LAUNCH_INTAKE_STATE_READY_FOR_OWNER_REVIEW = "ready_for_owner_review"
 LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS = max(
     1, int(os.getenv("HERMES_LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS", "3"))
 )
+LAUNCH_INTAKE_MAX_CLARIFICATION_ROUNDS = max(
+    1, int(os.getenv("HERMES_LAUNCH_INTAKE_MAX_CLARIFICATION_ROUNDS", "4"))
+)
 BOARD_DISPATCH_PHASES = {"active"}
 MANAGED_BOARD_RUNTIME_MODES = {"company", "business", "managed"}
 EXECUTABLE_WORK_STATUSES = {"ready", "review", "running"}
@@ -2776,6 +2779,28 @@ def _build_launch_intake_answer_assessment(
     }
 
 
+def _launch_intake_answer_history_hashes(intake: dict[str, Any]) -> list[str]:
+    hashes: list[str] = []
+    for turn in _contract_list(intake.get("answer_history")):
+        if not isinstance(turn, dict):
+            continue
+        answers = turn.get("answers")
+        h = _launch_intake_answers_hash(answers)
+        if h:
+            hashes.append(h)
+    return hashes
+
+
+def _launch_intake_repeated_answers(intake: dict[str, Any], answers_hash: str) -> bool:
+    if not answers_hash:
+        return False
+    history_hashes = _launch_intake_answer_history_hashes(intake)
+    if answers_hash in history_hashes:
+        return True
+    current = _launch_intake_answers_hash(intake.get("answers"))
+    return bool(current and current == answers_hash)
+
+
 def _merge_launch_intake_answers(
     draft: dict[str, Any],
     *,
@@ -2797,6 +2822,17 @@ def _merge_launch_intake_answers(
         prior_round = 0
     current_hash = _launch_intake_answers_hash(intake.get("answers"))
     current_state = str(intake.get("state") or "").strip().lower()
+    if answers_hash and _launch_intake_repeated_answers(intake, answers_hash):
+        intake_flag = dict(intake)
+        intake_flag["intake_loop_detected"] = True
+        merged_loop = dict(draft)
+        merged_loop["launch_intake"] = intake_flag
+        raise ValueError(
+            "intake_answers duplicate a prior submission for this board; "
+            "do not re-ask the same questions. Summarize what you already "
+            "understood, ask for ONE missing detail if needed, or proceed to "
+            "synthesis when coverage is sufficient. Load launch-intake-interview skill."
+        )
     if (
         prior_round > 0
         and answers_hash
@@ -3447,21 +3483,42 @@ def _maybe_assess_launch_intake_answers(draft: dict[str, Any]) -> dict[str, Any]
             "follow_up_questions": result.follow_up_questions,
         }
         intake["answer_assessment"] = assessment
-        intake["state"] = LAUNCH_INTAKE_STATE_CLARIFYING
-        follow_ups = result.follow_up_questions or _string_list(intake.get("questions"))
-        intake["questions"] = follow_ups[:6]
-        intake["generated_questions"] = follow_ups[:6]
-        intake["answer_quality"] = {
-            "status": "insufficient",
-            "sufficient": False,
-            "round": round_number,
-        }
+        round_number = _launch_intake_latest_answer_round(intake)
+        if round_number >= LAUNCH_INTAKE_MAX_CLARIFICATION_ROUNDS:
+            intake["partial_escalation"] = True
+            intake["state"] = LAUNCH_INTAKE_STATE_ASSESSING
+            intake["answer_quality"] = {
+                "status": "partial_escalation",
+                "sufficient": True,
+                "round": round_number,
+                "answers_hash": _launch_intake_answers_hash(answers),
+                "evidence": (
+                    "Max clarification rounds reached; proceeding with partial "
+                    "coverage for owner review."
+                ),
+                "assessed_by": "server",
+                "coverage_gaps": list(coverage.gaps) if coverage else [],
+            }
+            assessment["result"] = {"sufficient": True, "partial_escalation": True}
+            intake["answer_assessment"] = assessment
+        else:
+            intake["state"] = LAUNCH_INTAKE_STATE_CLARIFYING
+            follow_ups = result.follow_up_questions or _string_list(intake.get("questions"))
+            intake["questions"] = follow_ups[:6]
+            intake["generated_questions"] = follow_ups[:6]
+            intake["answer_quality"] = {
+                "status": "insufficient",
+                "sufficient": False,
+                "round": round_number,
+            }
     merged["launch_intake"] = intake
     return merged
 
 
 def _launch_intake_assessment_allows_synthesis(intake: dict[str, Any]) -> bool:
     """Synthesis gate: a server assessment, if present, must say sufficient."""
+    if intake.get("partial_escalation"):
+        return True
     assessment = _contract_object(intake.get("answer_assessment"))
     result = _contract_object(assessment.get("result"))
     if not result:
@@ -3784,9 +3841,18 @@ def _synthesize_launch_contract_from_intake(draft: dict[str, Any]) -> dict[str, 
         answers, rough_goal=rough_goal, external_research=intake.get("external_research")
     )
     if not coverage.passed:
-        return draft
+        intake_obj = _contract_object(draft.get("launch_intake"))
+        if intake_obj.get("partial_escalation"):
+            _log.info(
+                "launch_intake: partial escalation — synthesizing despite coverage gaps: %s",
+                coverage.gaps,
+            )
+        else:
+            return draft
     if not _launch_intake_assessment_allows_synthesis(intake):
-        return draft
+        intake_obj = _contract_object(draft.get("launch_intake"))
+        if not intake_obj.get("partial_escalation"):
+            return draft
 
     if _launch_intake_aux_enabled():
         from hermes_cli import kanban_launch_intake as kli
