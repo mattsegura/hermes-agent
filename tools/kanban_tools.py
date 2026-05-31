@@ -1417,8 +1417,10 @@ def _handle_match_board(args: dict, **kw) -> str:
                 "Answer inline — do NOT call kanban_business_launch_review for this message."
             ),
             "maybe_board": (
-                "Ask exactly ONE natural clarifying question from "
-                "intent.clarifying_question (rephrase for tone, not yes/no). "
+                "Ask exactly ONE open, contextual clarifying question. Use "
+                "intent.clarifying_question as a guide only — paraphrase in your "
+                "own voice; do not read it verbatim or offer labeled either/or "
+                "choices (intent.clarifying_question_style is open_contextual). "
                 "Wait for the owner's reply before launch review."
             ),
             "board_required": (
@@ -2529,8 +2531,9 @@ KANBAN_MATCH_BOARD_SCHEMA = {
         "before kanban_business_launch_review. Returns intent classification "
         "(no_board_needed | maybe_board | board_required), ranked board "
         "candidates, and suggested_next_action. no_board_needed: answer inline. "
-        "maybe_board: ask ONE natural clarifying question (from intent."
-        "clarifying_question) before launch review — not a yes/no checkbox. "
+        "maybe_board: ask ONE open contextual clarifying question before launch "
+        "review — paraphrase intent.clarifying_question in your own voice; "
+        "never read it verbatim or offer labeled either/or choices. "
         "board_required: route to a matching board or start launch review with "
         "create_if_missing=true and load launch-intake-interview skill. "
         "match_score is a coarse lexical hint — YOU decide the semantic match."

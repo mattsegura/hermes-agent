@@ -8,15 +8,20 @@ structure is clearly needed.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Literal, Optional
 
 LaunchIntent = Literal["no_board_needed", "maybe_board", "board_required"]
 
+logger = logging.getLogger(__name__)
+
 _INTENT_VALUES: frozenset[str] = frozenset(
     {"no_board_needed", "maybe_board", "board_required"}
 )
+
+CLARIFYING_QUESTION_STYLE = "open_contextual"
 
 # Lightweight: questions, lookups, explanations — no durable board.
 _LIGHTWEIGHT_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -72,45 +77,68 @@ _AMBIGUOUS_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
 )
 
+# Open-ended, domain-aware fallbacks — invite scope/outcome description, not A/B picks.
 _CLARIFY_TEMPLATES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"\b(?:tiktok|instagram|youtube|content|followers|audience|page|"
+            r"marketing|social)\b",
+            re.IGNORECASE,
+        ),
+        (
+            "What would success look like for you over the next few weeks — "
+            "growth targets, content cadence, engagement you care about?"
+        ),
+    ),
     (
         re.compile(r"\b(?:app|ios|android|mobile|saas|software)\b", re.IGNORECASE),
         (
-            "Before I set up a tracked plan: do you want ongoing development, "
-            "releases, and ops managed over time, or a one-time roadmap I can "
-            "walk through with you here?"
+            "Tell me more about what you're building and what outcomes you'd "
+            "want tracked over the next few weeks?"
         ),
     ),
     (
-        re.compile(r"\b(?:grow|page|followers|audience|marketing|tiktok|instagram|"
-                   r"youtube|content)\b", re.IGNORECASE),
+        re.compile(
+            r"\b(?:land|wholesale|real estate|parcel|seller|buyer)\b",
+            re.IGNORECASE,
+        ),
         (
-            "To route this well: should I run growth experiments and outreach "
-            "on a schedule with measurable targets, or are you looking for "
-            "strategy advice you can execute yourself?"
+            "Help me understand your land goal — geography, deal flow, and "
+            "what you'd want happening week to week?"
         ),
     ),
     (
-        re.compile(r"\b(?:land|wholesale|real estate|parcel|seller|buyer)\b", re.IGNORECASE),
+        re.compile(r"\b(?:grow|scale|build|start|launch|create|make|project)\b", re.IGNORECASE),
         (
-            "Are you asking for a durable deal pipeline — sourcing, outreach, "
-            "negotiation, and contracts tracked end-to-end — or a one-off analysis "
-            "on a specific property?"
-        ),
-    ),
-    (
-        re.compile(r"\b(?:build|create|make|project)\b", re.IGNORECASE),
-        (
-            "Is this something you want managed as ongoing multi-step work with "
-            "approvals and tracking, or a single planning conversation for now?"
+            "Tell me a bit more about what you're trying to accomplish and "
+            "how hands-on you want this to be?"
         ),
     ),
 )
 
 _DEFAULT_CLARIFY = (
-    "Should I treat this as ongoing tracked work you'll approve before anything "
-    "runs, or answer it as a one-time question here in chat?"
+    "Tell me a bit more about what you're trying to accomplish and how "
+    "hands-on you want this to be?"
 )
+
+# Patterns that make a clarifying question feel like a checkbox — used for validation.
+_BANNED_CLARIFY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bis this\b.*\bor\b", re.IGNORECASE),
+    re.compile(r"\b(?:one-?time|ongoing)\b", re.IGNORECASE),
+    re.compile(r"\b(?:autonomous(?:ly)?|automatic(?:ally)?)\b.*\b(?:manual|yourself)\b", re.IGNORECASE),
+    re.compile(r"\bshould i (?:run|treat|set up)\b.*\bor\b", re.IGNORECASE),
+    re.compile(r"\b(?:advice|strategy)\b.*\bor\b", re.IGNORECASE),
+    re.compile(r"\bare you asking for\b.*\bor\b", re.IGNORECASE),
+)
+
+_CLARIFY_AUX_SYSTEM = """You generate ONE open-ended clarifying question for a kanban launch router.
+
+Rules:
+- Single sentence, conversational — invite the owner to describe scope and desired outcome
+- NO binary choices (never "Is this X or Y", never one-time vs ongoing, never autonomous vs manual)
+- NO multiple-choice or checkbox feel
+- Domain-aware when the message hints at a domain (TikTok/social -> content cadence and growth; app -> features/releases; land -> geography and deal flow)
+- Return JSON only: {"question": "..."}"""
 
 
 @dataclass(frozen=True)
@@ -130,6 +158,7 @@ class LaunchIntentResult:
         }
         if self.clarifying_question:
             out["clarifying_question"] = self.clarifying_question
+            out["clarifying_question_style"] = CLARIFYING_QUESTION_STYLE
         return out
 
 
@@ -137,12 +166,62 @@ def _matches(patterns: tuple[re.Pattern[str], ...], text: str) -> bool:
     return any(p.search(text) for p in patterns)
 
 
-def _suggest_clarifying_question(goal: str) -> str:
+def is_binary_clarifying_question(question: str) -> bool:
+    """True when a question reads like a dichotomy or checkbox."""
+    text = str(question or "").strip()
+    if not text:
+        return True
+    return any(p.search(text) for p in _BANNED_CLARIFY_PATTERNS)
+
+
+def _template_clarifying_question(goal: str) -> str:
     text = str(goal or "").strip()
     for pattern, question in _CLARIFY_TEMPLATES:
         if pattern.search(text):
             return question
     return _DEFAULT_CLARIFY
+
+
+def _try_aux_clarifying_question(goal: str, fallback: str) -> str:
+    """Optional aux-model question; returns fallback when unconfigured or invalid."""
+    try:
+        from hermes_cli.kanban_launch_intake import _call_model, aux_configured
+    except Exception:  # pragma: no cover - defensive import
+        return fallback
+
+    if not aux_configured():
+        return fallback
+
+    raw, degraded = _call_model(
+        _CLARIFY_AUX_SYSTEM,
+        {"owner_message": goal, "fallback_question": fallback},
+        timeout=15,
+        max_tokens=120,
+        temperature=0.3,
+    )
+    if degraded or not raw:
+        return fallback
+
+    try:
+        from hermes_cli.kanban_launch_intake import _extract_json
+    except Exception:  # pragma: no cover
+        return fallback
+
+    parsed = _extract_json(raw)
+    if not isinstance(parsed, dict):
+        return fallback
+
+    question = str(parsed.get("question") or "").strip()
+    if not question or "?" not in question:
+        return fallback
+    if is_binary_clarifying_question(question):
+        return fallback
+    return question
+
+
+def _suggest_clarifying_question(goal: str) -> str:
+    fallback = _template_clarifying_question(goal)
+    return _try_aux_clarifying_question(goal, fallback)
 
 
 def _next_action_for_intent(
@@ -158,13 +237,13 @@ def _next_action_for_intent(
             "kanban_business_launch_review."
         )
     if intent == "maybe_board":
-        q = clarifying_question or _DEFAULT_CLARIFY
         return (
-            "Ask the owner ONE natural clarifying question (not a yes/no checkbox) "
-            f"before launch review. Example shape: {q!r}. After they reply, "
-            "re-run kanban_match_board; if durable work is confirmed, call "
-            "kanban_business_launch_review(create_if_missing=true) and load the "
-            "launch-intake-interview skill."
+            "Ask the owner ONE open, contextual clarifying question before launch "
+            "review. Use intent.clarifying_question as a guide only — paraphrase in "
+            "your own voice; do not read it verbatim or offer labeled either/or "
+            "choices. After they reply, re-run kanban_match_board; if durable work "
+            "is confirmed, call kanban_business_launch_review(create_if_missing=true) "
+            "and load the launch-intake-interview skill."
         )
     if has_strong_board_match and top_board_slug:
         return (
@@ -272,14 +351,15 @@ def classify_launch_intent(
             ),
         )
 
+    question = _suggest_clarifying_question(text)
     return LaunchIntentResult(
         intent="maybe_board",
         confidence="low",
         rationale="No strong lightweight or durable signal — confirm intent before launch.",
-        clarifying_question=_suggest_clarifying_question(text),
+        clarifying_question=question,
         suggested_next_action=_next_action_for_intent(
             "maybe_board",
-            clarifying_question=_suggest_clarifying_question(text),
+            clarifying_question=question,
             has_strong_board_match=False,
             top_board_slug=None,
         ),

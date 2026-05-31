@@ -29,7 +29,7 @@ Tool: `kanban_match_board` (call **before** `kanban_business_launch_review`).
 | Intent | Router behavior |
 | --- | --- |
 | `no_board_needed` | Answer inline; no launch review |
-| `maybe_board` | ONE natural clarifying question; re-run match after reply |
+| `maybe_board` | ONE open contextual clarifying question (`clarifying_question_style: open_contextual`); paraphrase, never binary; re-run match after reply |
 | `board_required` | Route to existing board or start launch review |
 
 Module: `hermes_cli.kanban_launch_intent.classify_launch_intent`

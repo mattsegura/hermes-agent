@@ -75,7 +75,7 @@ Capture: quality metrics (retention, CTR), brand voice boundaries, approval befo
 
 - Do NOT loop the same questions — check `answer_history` and coverage gaps
 - Do NOT skip workflow stages — every durable goal needs A-to-Z stages in the contract
-- Do NOT ask yes/no checkboxes — one natural clarifying question at Layer 1 only
+- Do NOT ask yes/no checkboxes or either/or dichotomies at Layer 1 — one open, contextual clarifying question only; paraphrase `intent.clarifying_question` (style: `open_contextual`), never read it verbatim as a binary choice
 - Do NOT expose schema keys (`side_effect_policy`, enum names) to the owner
 - Do NOT self-approve launch — only `/approve <slug>` from the owner
 
