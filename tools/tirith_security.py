@@ -65,13 +65,96 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+# H3: autonomous-session fail-closed scoping.
+#
+# tirith ships fail-OPEN by default: on a scan spawn/timeout/unknown-exit
+# failure an UNSCANNED command is allowed to run. For INTERACTIVE sessions a
+# human is watching and can react, so fail-open is the right startup-friendly
+# default. For AUTONOMOUS sessions (cron / batch_runner / other headless runners
+# where no human is in the loop) an unscanned command running is an
+# autonomous-action fail-open -- so the DEFAULT posture flips to fail-CLOSED.
+#
+# This flips the DEFAULT only. The posture stays fully overridable at both the
+# env layer (TIRITH_FAIL_OPEN) and the config layer (security.tirith_fail_open),
+# so an operator who explicitly opts an autonomous run back into fail-open can.
+# It does NOT touch interactive sessions (their default is unchanged) and does
+# NOT fail-close the background-install window: the path-unavailable branch in
+# check_command_security keeps allowing while tirith is still being installed
+# (only genuine scan failures -- spawn error, timeout, unknown exit -- honor the
+# fail-closed posture).
+#
+# Autonomy is detected from HERMES_CRON_SESSION, the same process-wide marker the
+# approval system already uses to apply cron_mode (tools/approval.py). The cron
+# scheduler sets it for every job it runs; the batch runner / other headless
+# launchers set it (or TIRITH_FAIL_OPEN=false directly) for their children.
+_AUTONOMOUS_SESSION_ENV_MARKERS: tuple[str, ...] = ("HERMES_CRON_SESSION",)
+
+
+def _is_autonomous_session() -> bool:
+    """True when this process is a headless/autonomous run (no human watching).
+
+    Reuses the established ``HERMES_CRON_SESSION`` marker (the same flag the
+    approval system keys cron_mode on). Truthy values: 1/true/yes/on.
+    """
+    try:
+        from utils import env_var_enabled
+        return any(env_var_enabled(name) for name in _AUTONOMOUS_SESSION_ENV_MARKERS)
+    except Exception:  # pragma: no cover - defensive: never fail the loader
+        # Mirror env_var_enabled's truthiness without the import.
+        truthy = {"1", "true", "yes", "on"}
+        return any(
+            (os.getenv(name) or "").strip().lower() in truthy
+            for name in _AUTONOMOUS_SESSION_ENV_MARKERS
+        )
+
+
+def _default_fail_open(autonomous: "bool | None" = None) -> bool:
+    """The fail-open DEFAULT for this session kind.
+
+    Interactive -> True (fail-open: a human can react). Autonomous -> False
+    (fail-closed: an unscanned command must not run unattended). Callers pass an
+    explicit ``autonomous`` for testability; ``None`` auto-detects from env.
+    """
+    if autonomous is None:
+        autonomous = _is_autonomous_session()
+    return not autonomous
+
+
+def _user_set_fail_open() -> "bool | None":
+    """Whether the user EXPLICITLY set ``security.tirith_fail_open`` on disk.
+
+    Returns the explicit value, or ``None`` when the user did NOT set it (so the
+    session-kind default applies). We read the RAW on-disk config -- not the
+    merged ``load_config()`` -- because ``load_config()`` injects the schema
+    default ``tirith_fail_open: True`` for every install, which would otherwise
+    shadow the autonomous fail-closed default. An explicit user setting must
+    still win; a baked-in schema default must not.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+        raw = read_raw_config()
+        sec = raw.get("security", {}) if isinstance(raw, dict) else {}
+        if isinstance(sec, dict) and "tirith_fail_open" in sec:
+            return bool(sec["tirith_fail_open"])
+    except Exception:  # pragma: no cover - defensive: never fail the loader
+        pass
+    return None
+
+
 def _load_security_config() -> dict:
-    """Load security settings from config.yaml, with env var overrides."""
+    """Load security settings from config.yaml, with env var overrides.
+
+    Precedence for ``tirith_fail_open`` (matches the project flag convention --
+    env > config.yaml security.* > default): an explicit ``TIRITH_FAIL_OPEN`` env
+    wins, else an EXPLICIT ``security.tirith_fail_open`` the user set on disk
+    wins, else the session-kind default (fail-CLOSED for autonomous runs,
+    fail-OPEN otherwise). ``tirith_enabled`` / ``tirith_path`` / ``tirith_timeout``
+    keep using the merged config (their schema defaults are correct).
+    """
     defaults = {
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,
-        "tirith_fail_open": True,
     }
     try:
         from hermes_cli.config import load_config
@@ -79,11 +162,17 @@ def _load_security_config() -> dict:
     except Exception:
         cfg = {}
 
+    # Session-kind aware fail-open resolution. Env always wins; otherwise an
+    # explicit on-disk user setting wins; otherwise the session-kind default
+    # (autonomous -> fail-CLOSED, interactive -> fail-OPEN).
+    user_fail_open = _user_set_fail_open()
+    base_fail_open = user_fail_open if user_fail_open is not None else _default_fail_open()
+
     return {
         "tirith_enabled": _env_bool("TIRITH_ENABLED", cfg.get("tirith_enabled", defaults["tirith_enabled"])),
         "tirith_path": os.getenv("TIRITH_BIN", cfg.get("tirith_path", defaults["tirith_path"])),
         "tirith_timeout": _env_int("TIRITH_TIMEOUT", cfg.get("tirith_timeout", defaults["tirith_timeout"])),
-        "tirith_fail_open": _env_bool("TIRITH_FAIL_OPEN", cfg.get("tirith_fail_open", defaults["tirith_fail_open"])),
+        "tirith_fail_open": _env_bool("TIRITH_FAIL_OPEN", base_fail_open),
     }
 
 
@@ -723,7 +812,15 @@ def check_command_security(command: str) -> dict:
             "tirith_path_none",
             "tirith path resolved to None; scanning disabled",
         )
-        if fail_open:
+        # H3: never fail-close the BACKGROUND-INSTALL window. While the install
+        # thread is still running the binary simply isn't ready yet -- that is a
+        # startup race, not a scan failure, so it stays fail-open even for
+        # autonomous sessions (otherwise a fresh autonomous run would block every
+        # command until tirith finishes downloading). Genuine unavailability
+        # (install failed / explicit path missing) honors the session-kind
+        # fail-open posture.
+        install_window = _install_thread is not None and _install_thread.is_alive()
+        if fail_open or install_window:
             return {"action": "allow", "findings": [], "summary": "tirith path unavailable"}
         return {"action": "block", "findings": [], "summary": "tirith path unavailable (fail-closed)"}
 

@@ -17270,6 +17270,76 @@ def _timer_schedule_terminal_states(row: Any) -> list[str]:
         return []
 
 
+# G6: decouple the conversion reward from the literal 'won' substring. Before,
+# the reward only fired when ``terminal_outcome`` literally contained 'won', so a
+# domain whose win terminal is ``under_contract`` / ``onboarded`` / ``published``
+# / ``closed_won`` earned ZERO reward forever -- the optimizer tuned a string,
+# not the goal. We re-key to the SAME win-class detection the launch_completeness
+# ``win_signal_rail`` spec uses (a conversion loop must declare a win-class
+# terminal). A terminal_outcome now counts as a conversion when EITHER:
+#   (a) it is one of the loop's DECLARED win-class terminal_states (the outcome
+#       matches a declared terminal that itself looks like a win), OR
+#   (b) (backward-compat) it still matches the legacy 'won' substring.
+# Net effect: strictly MORE legitimate wins are recognised; nothing that earned
+# the conversion reward before stops earning it.
+#
+# Win-token vocabulary is sourced from launch_completeness._WIN_TERMINAL_TOKENS
+# (under_contract / onboarded / subscribed / published / closed_won / converted /
+# paid / signed / sold / delivered / completed / approved / ...). If that import
+# fails we fall back to the legacy 'won'-substring-only behavior, never crashing
+# and never silently dropping the existing reward path.
+
+def _looks_like_win_token(token: Optional[str]) -> bool:
+    """True when ``token`` reads as a win-class outcome.
+
+    Mirrors launch_completeness._looks_like_win (the SAME detector the
+    ``win_signal_rail`` spec binds to) so the reward and the spec agree on what a
+    'win' is. Imported defensively; on import failure we degrade to the legacy
+    'won'-substring check so default behavior never regresses.
+    """
+    t = (token or "").strip().lower()
+    if not t:
+        return False
+    try:
+        from hermes_cli.launch_completeness import _looks_like_win as _llw
+        return bool(_llw(t))
+    except Exception:  # pragma: no cover - defensive: degrade to legacy behavior
+        return "won" in t
+
+
+def _terminal_outcome_is_conversion(
+    terminal_outcome: Optional[str], declared_terminal_states: list[str]
+) -> bool:
+    """Decide whether a loop's terminal outcome should emit the conversion reward.
+
+    A conversion is credited when the outcome is a DECLARED win-class terminal
+    for this loop (the outcome matches one of the loop's ``terminal_states`` and
+    that declared terminal itself looks like a win), OR -- backward-compat -- the
+    outcome still contains the legacy 'won' substring. The declared-terminal gate
+    keeps the signal honest: a loop only earns conversion credit for an outcome it
+    actually declared as a win-class terminal, not any string that happens to
+    contain a win token.
+    """
+    if not terminal_outcome:
+        return False
+    outcome = str(terminal_outcome).strip().lower()
+    if not outcome:
+        return False
+    # (b) Legacy backward-compat: the literal 'won' substring always rewards,
+    # exactly as before, regardless of declared terminal_states.
+    if "won" in outcome:
+        return True
+    # (a) Declared win-class terminal: the outcome matches one of the loop's
+    # declared terminal_states AND that declared terminal is itself win-class.
+    for declared in declared_terminal_states or []:
+        d = str(declared).strip().lower()
+        if not d:
+            continue
+        if d == outcome and _looks_like_win_token(d):
+            return True
+    return False
+
+
 def _timer_schedule_stop_conditions(row: Any) -> list[str]:
     raw = row["stop_conditions"] if "stop_conditions" in row.keys() else None
     if not raw:
@@ -19812,7 +19882,13 @@ def _close_timer_schedule(
             (reason, now, int(row["id"])),
         )
         terminal_outcome = entity.terminal_outcome if entity is not None else None
-        won = bool(terminal_outcome and "won" in str(terminal_outcome).lower())
+        # G6: reward a conversion when the outcome is a DECLARED win-class
+        # terminal for THIS loop (resolved from the schedule row's own
+        # terminal_states), OR -- backward-compat -- still matches the legacy
+        # 'won' substring. The schedule row is the single source of truth for the
+        # loop's declared terminal_states, so no extra contract lookup is needed.
+        declared_terminal_states = _timer_schedule_terminal_states(row)
+        won = _terminal_outcome_is_conversion(terminal_outcome, declared_terminal_states)
         reward_kind = "conversion" if won else "loop_closed"
         reward_value = 1.0 if won else 0.0
         _safe_record_board_signal(

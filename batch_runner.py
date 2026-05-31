@@ -1246,7 +1246,20 @@ def main(
     if not run_name:
         print("❌ Error: --run_name is required")
         return
-    
+
+    # H3: a batch run is autonomous/headless (no human watching individual
+    # commands), so tirith must fail-CLOSED for it and its worker children --
+    # an unscanned command must not slip through on a scan failure. We set the
+    # fail-closed posture via the env layer (cleanly wins over a persisted
+    # config default) and also mark the run autonomous via HERMES_CRON_SESSION
+    # (the same marker the approval system keys autonomous behavior on). Both are
+    # set before the worker Pool forks so children inherit them. Overridable: we
+    # never clobber an existing value, so an operator can opt back into fail-open
+    # by exporting TIRITH_FAIL_OPEN before launch. The background-install window
+    # stays fail-open regardless (handled in tools/tirith_security.py).
+    os.environ.setdefault("HERMES_CRON_SESSION", "1")
+    os.environ.setdefault("TIRITH_FAIL_OPEN", "false")
+
     # Parse provider preferences (comma-separated strings to lists)
     providers_allowed_list = [p.strip() for p in providers_allowed.split(",")] if providers_allowed else None
     providers_ignored_list = [p.strip() for p in providers_ignored.split(",")] if providers_ignored else None

@@ -1427,3 +1427,168 @@ class TestIsAppTldFinding:
 
     def test_case_insensitive_match(self):
         assert self.fn({"rule_id": "lookalike_tld", "value": ".APP"})
+
+
+# ---------------------------------------------------------------------------
+# H3: autonomous sessions resolve fail-CLOSED; interactive is unchanged.
+# ---------------------------------------------------------------------------
+
+class TestAutonomousFailClosedPosture:
+    """The fail-open DEFAULT flips to fail-closed for autonomous (cron / batch)
+    sessions while interactive sessions keep the historical fail-open default.
+    The posture stays overridable at the env and config layers."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_autonomy_env(self, monkeypatch):
+        # Start from a known interactive baseline for every test.
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.delenv("TIRITH_FAIL_OPEN", raising=False)
+        yield
+
+    # --- the session-kind posture resolver (unit, no spawn site needed) ---
+
+    def test_interactive_session_defaults_fail_open(self):
+        assert _tirith_mod._default_fail_open(autonomous=False) is True
+
+    def test_autonomous_session_defaults_fail_closed(self):
+        assert _tirith_mod._default_fail_open(autonomous=True) is False
+
+    def test_autonomy_autodetects_from_cron_marker(self, monkeypatch):
+        # Interactive baseline.
+        assert _tirith_mod._is_autonomous_session() is False
+        assert _tirith_mod._default_fail_open() is True
+        # The established autonomous marker flips the default.
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        assert _tirith_mod._is_autonomous_session() is True
+        assert _tirith_mod._default_fail_open() is False
+
+    # --- _load_security_config precedence: env > config > session-kind default ---
+
+    def _patch_no_config(self, monkeypatch):
+        # The root conftest sets TIRITH_ENABLED=false for the whole suite; undo
+        # that here so the REAL _load_security_config runs end-to-end and the
+        # fail-open/closed verdict is actually exercised.
+        monkeypatch.setenv("TIRITH_ENABLED", "true")
+        # Force BOTH config layers empty so we observe only env + session-kind
+        # default: the merged config (load_config) for enabled/path/timeout, and
+        # the RAW on-disk config (read_raw_config) so no explicit user
+        # tirith_fail_open setting shadows the autonomous default. On a real box
+        # the schema default is often persisted to disk, so we must neutralize it
+        # to exercise the session-kind default path.
+        try:
+            import hermes_cli.config as _cfgmod
+            monkeypatch.setattr(
+                _cfgmod, "load_config",
+                lambda *a, **k: {"security": {"tirith_enabled": True,
+                                              "tirith_path": "tirith",
+                                              "tirith_timeout": 5}},
+            )
+            monkeypatch.setattr(_cfgmod, "read_raw_config", lambda *a, **k: {})
+        except Exception:
+            pass
+
+    def test_config_interactive_default_fail_open(self, monkeypatch):
+        self._patch_no_config(monkeypatch)
+        cfg = _tirith_mod._load_security_config()
+        assert cfg["tirith_fail_open"] is True
+
+    def test_config_autonomous_default_fail_closed(self, monkeypatch):
+        self._patch_no_config(monkeypatch)
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        cfg = _tirith_mod._load_security_config()
+        assert cfg["tirith_fail_open"] is False
+
+    def test_env_override_wins_over_autonomous_default(self, monkeypatch):
+        # An operator may explicitly opt an autonomous run back into fail-open.
+        self._patch_no_config(monkeypatch)
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("TIRITH_FAIL_OPEN", "true")
+        cfg = _tirith_mod._load_security_config()
+        assert cfg["tirith_fail_open"] is True
+
+    def test_config_layer_wins_over_autonomous_default(self, monkeypatch):
+        # An EXPLICIT on-disk security.tirith_fail_open: true (read from the RAW
+        # config) beats the autonomous default. This is the operator-override
+        # path: the user genuinely chose fail-open in config.yaml.
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        try:
+            import hermes_cli.config as _cfgmod
+            monkeypatch.setattr(_cfgmod, "load_config", lambda *a, **k: {})
+            monkeypatch.setattr(
+                _cfgmod, "read_raw_config",
+                lambda *a, **k: {"security": {"tirith_fail_open": True}},
+            )
+        except Exception:
+            pytest.skip("hermes_cli.config not importable")
+        cfg = _tirith_mod._load_security_config()
+        assert cfg["tirith_fail_open"] is True
+
+    # --- end-to-end: autonomous fail-closes a scan FAILURE, interactive does not ---
+
+    @patch("tools.tirith_security.subprocess.run")
+    def test_autonomous_spawn_failure_fails_closed(self, mock_run, monkeypatch):
+        self._patch_no_config(monkeypatch)
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        mock_run.side_effect = FileNotFoundError("No such file: tirith")
+        result = check_command_security("echo hi")
+        assert result["action"] == "block"
+        assert "fail-closed" in result["summary"]
+
+    @patch("tools.tirith_security.subprocess.run")
+    def test_interactive_spawn_failure_stays_fail_open(self, mock_run, monkeypatch):
+        # The default/interactive path is UNCHANGED: still fail-open.
+        self._patch_no_config(monkeypatch)
+        mock_run.side_effect = FileNotFoundError("No such file: tirith")
+        result = check_command_security("echo hi")
+        assert result["action"] == "allow"
+        assert "unavailable" in result["summary"]
+
+    @patch("tools.tirith_security.subprocess.run")
+    def test_autonomous_timeout_fails_closed(self, mock_run, monkeypatch):
+        self._patch_no_config(monkeypatch)
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="tirith", timeout=5)
+        result = check_command_security("slow command")
+        assert result["action"] == "block"
+        assert "fail-closed" in result["summary"]
+
+    # --- the BACKGROUND-INSTALL window stays fail-open even for autonomous ---
+
+    def test_install_window_stays_fail_open_for_autonomous(self, monkeypatch):
+        # While the background install thread is still running, the binary is
+        # simply not ready yet -- a startup race, NOT a scan failure. This must
+        # stay fail-open even for autonomous sessions so a fresh autonomous run
+        # doesn't block every command until tirith finishes downloading.
+        self._patch_no_config(monkeypatch)
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+
+        class _AliveThread:
+            def is_alive(self):
+                return True
+
+        monkeypatch.setattr(_tirith_mod, "_install_thread", _AliveThread())
+        with patch("tools.tirith_security._resolve_tirith_path", return_value=None):
+            result = check_command_security("echo hi")
+        assert result["action"] == "allow"
+        assert "tirith path unavailable" in result["summary"]
+
+    def test_path_unavailable_fails_closed_for_autonomous_when_not_installing(self, monkeypatch):
+        # When NO install is in flight (install failed / explicit path missing),
+        # an autonomous session honors the fail-closed posture for the
+        # unavailable path.
+        self._patch_no_config(monkeypatch)
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setattr(_tirith_mod, "_install_thread", None)
+        with patch("tools.tirith_security._resolve_tirith_path", return_value=None):
+            result = check_command_security("echo hi")
+        assert result["action"] == "block"
+        assert "fail-closed" in result["summary"]
+
+    def test_path_unavailable_stays_fail_open_for_interactive(self, monkeypatch):
+        # Interactive unchanged: unavailable path is still fail-open.
+        self._patch_no_config(monkeypatch)
+        monkeypatch.setattr(_tirith_mod, "_install_thread", None)
+        with patch("tools.tirith_security._resolve_tirith_path", return_value=None):
+            result = check_command_security("echo hi")
+        assert result["action"] == "allow"
+        assert "tirith path unavailable" in result["summary"]

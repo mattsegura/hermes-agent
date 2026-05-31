@@ -911,3 +911,224 @@ def test_doctor_cli_exit_code_flags_stale_board(fresh_home, monkeypatch):
     with kb.connect(board="serious") as conn:
         kb.record_tick_health_success(conn, board="serious")
     assert kbc._cmd_doctor(args) == 0
+
+
+# ---------------------------------------------------------------------------
+# G6. Conversion reward is keyed on the DECLARED win-class terminal, not the
+# literal 'won' substring. A domain whose win terminal is `under_contract` /
+# `onboarded` / `published` now earns the conversion reward it never could
+# before; the legacy 'won' substring still rewards; dedupe stays exactly-once.
+# ---------------------------------------------------------------------------
+
+
+def _win_contract(*, terminal_states, states=None):
+    """A contract whose loop + entity declare a custom (possibly non-'won')
+    win-class terminal set, so we can prove the reward keys on the DECLARED
+    terminal rather than the literal 'won' substring."""
+    if states is None:
+        states = list(dict.fromkeys(["open", "watching", *terminal_states]))
+    return _contract(
+        entities=[
+            {
+                "key": "conversation_thread",
+                "type": "conversation",
+                "states": states,
+                "terminal_states": list(terminal_states),
+            }
+        ],
+        event_loops=[
+            {
+                "key": "seller_follow_up",
+                "type": "seller_follow_up",
+                "entity": "conversation_thread",
+                "triggers": [
+                    {"kind": "timer", "detail": "nudge seller", "cadence_hours": 72},
+                    {"kind": "inbound", "detail": "seller replies", "channel": "infobip"},
+                ],
+                "terminal_states": list(terminal_states),
+                "max_nudges": 2,
+            }
+        ],
+    )
+
+
+def _loop_terminal_outcomes(conn, board):
+    return conn.execute(
+        "SELECT reward_kind, reward_value FROM board_signals "
+        "WHERE board = ? AND primitive_kind = 'outcome' AND action LIKE '%loop_terminal%'",
+        (board,),
+    ).fetchall()
+
+
+def test_declared_non_won_win_terminal_now_emits_conversion_reward(fresh_home):
+    # G6 core: 'under_contract' is a real-estate WIN terminal that does NOT
+    # contain the 'won' substring. Before G6 this earned ZERO conversion reward
+    # forever (the optimizer optimized a string). It must now be credited as a
+    # conversion because it is the loop's DECLARED win-class terminal.
+    _approve("serious", _win_contract(terminal_states=["under_contract", "lost"]))
+    with kb.connect(board="serious") as conn:
+        row = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        entity_id = row["entity_id"]
+        base = int(row["next_fire_at"])
+
+        kb.resolve_reactive_entity(
+            conn, entity_id, terminal_outcome="under_contract",
+            state="under_contract", actor="fixture",
+        )
+        res = kb.reactive_tick(conn, now=base, board="serious")
+        assert res["stopped"] == [
+            {"loop_key": "seller_follow_up", "reason": "entity_terminal"}
+        ]
+        outcomes = _loop_terminal_outcomes(conn, "serious")
+        assert any(
+            o["reward_kind"] == "conversion" and o["reward_value"] == 1.0
+            for o in outcomes
+        ), "a declared non-'won' win terminal must now earn the conversion reward"
+
+
+def test_legacy_won_substring_still_rewards_conversion(fresh_home):
+    # G6 backward-compat: the literal 'won' substring still rewards, exactly as
+    # before, EVEN when the loop's declared terminal_states use a different
+    # vocabulary (here the loop declares closed_won/lost). 'won' always wins.
+    _approve("serious", _win_contract(terminal_states=["closed_won", "lost"]))
+    with kb.connect(board="serious") as conn:
+        row = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        entity_id = row["entity_id"]
+        base = int(row["next_fire_at"])
+
+        kb.resolve_reactive_entity(
+            conn, entity_id, terminal_outcome="closed_won",
+            state="closed_won", actor="fixture",
+        )
+        kb.reactive_tick(conn, now=base, board="serious")
+        outcomes = _loop_terminal_outcomes(conn, "serious")
+        assert any(
+            o["reward_kind"] == "conversion" and o["reward_value"] == 1.0
+            for o in outcomes
+        ), "a 'won'-substring terminal must still earn the conversion reward"
+
+
+def test_non_win_terminal_does_not_emit_conversion_reward(fresh_home):
+    # G6 must be STRICTLY more correct, not looser: a declared FAILURE terminal
+    # ('lost') still records the loop-closed (0.0) reward, never a conversion.
+    _approve("serious", _win_contract(terminal_states=["under_contract", "lost"]))
+    with kb.connect(board="serious") as conn:
+        row = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        entity_id = row["entity_id"]
+        base = int(row["next_fire_at"])
+
+        kb.resolve_reactive_entity(
+            conn, entity_id, terminal_outcome="lost", state="lost", actor="fixture",
+        )
+        kb.reactive_tick(conn, now=base, board="serious")
+        outcomes = _loop_terminal_outcomes(conn, "serious")
+        assert outcomes, "a terminal outcome should still be recorded"
+        assert all(o["reward_kind"] != "conversion" for o in outcomes)
+        assert any(
+            o["reward_kind"] == "loop_closed" and o["reward_value"] == 0.0
+            for o in outcomes
+        )
+
+
+def test_declared_win_terminal_conversion_dedupes_exactly_once(fresh_home):
+    # G6 must preserve exactly-once: re-emitting the SAME loop_terminal:<id> is a
+    # no-op (the partial UNIQUE index on dedupe_key drops the replay). The
+    # learner counts the conversion once even if the close path runs twice.
+    _approve("serious", _win_contract(terminal_states=["onboarded", "churned"]))
+    with kb.connect(board="serious") as conn:
+        row = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        entity_id = row["entity_id"]
+        sched_id = int(row["id"])
+        base = int(row["next_fire_at"])
+
+        kb.resolve_reactive_entity(
+            conn, entity_id, terminal_outcome="onboarded",
+            state="onboarded", actor="fixture",
+        )
+        kb.reactive_tick(conn, now=base, board="serious")
+
+        # Re-emit the identical terminal signal directly (same dedupe_key).
+        kb._safe_record_board_signal(
+            conn,
+            board="serious",
+            primitive_kind="outcome",
+            primitive_key=row["loop_key"],
+            entity_ref=row["task_id"],
+            knob_snapshot=None,
+            action={"kind": "loop_terminal", "params": {"reason": "entity_terminal"}},
+            context_features=None,
+            reward_value=1.0,
+            reward_kind="conversion",
+            realized_at=base + 1,
+            dedupe_key=f"loop_terminal:{sched_id}",
+        )
+        n = conn.execute(
+            "SELECT COUNT(*) FROM board_signals WHERE board = ? AND dedupe_key = ?",
+            ("serious", f"loop_terminal:{sched_id}"),
+        ).fetchone()[0]
+        assert n == 1, "exactly-once dedupe must drop the replayed terminal signal"
+
+
+def test_conversion_reward_attribution_preserved_for_declared_win(fresh_home):
+    # G6 must preserve knob_snapshot attribution: the conversion reward for a
+    # declared (non-'won') win terminal is still attributed to the EFFECTIVE
+    # cadence the loop RAN under, not the current contract default.
+    contract = _win_contract(terminal_states=["under_contract", "lost"])
+    contract["tunables"] = {"follow_up_interval_hours": {"default": 72, "range": [24, 240]}}
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        entity_id = row["entity_id"]
+        base = int(row["next_fire_at"])
+        conn.execute(
+            "UPDATE reactive_timer_schedules SET cadence_seconds = ? WHERE id = ?",
+            (30 * 3600, int(row["id"])),
+        )
+        conn.commit()
+
+        kb.resolve_reactive_entity(
+            conn, entity_id, terminal_outcome="under_contract",
+            state="under_contract", actor="fixture",
+        )
+        kb.reactive_tick(conn, now=base, board="serious")
+        outcome = conn.execute(
+            "SELECT reward_kind, knob_snapshot FROM board_signals WHERE board = ? "
+            "AND primitive_kind = 'outcome' AND action LIKE '%loop_terminal%'",
+            ("serious",),
+        ).fetchone()
+        assert outcome["reward_kind"] == "conversion"
+        snap = json.loads(outcome["knob_snapshot"])
+        # Attributed to the cadence in effect when armed (30h), NOT the default.
+        assert snap["follow_up_interval_hours"] == 30
+
+
+def test_terminal_outcome_is_conversion_detector_unit():
+    # Direct unit coverage of the re-keying decision so the win-token contract is
+    # pinned independently of the runtime fixture.
+    f = kb._terminal_outcome_is_conversion
+    # Legacy 'won' substring rewards regardless of declared terminals.
+    assert f("won", []) is True
+    assert f("closed_won", []) is True
+    assert f("WON", ["won", "lost"]) is True
+    # Declared win-class terminal that does NOT contain 'won' now rewards.
+    assert f("under_contract", ["under_contract", "lost"]) is True
+    assert f("onboarded", ["onboarded", "churned"]) is True
+    assert f("published", ["published", "rejected"]) is True
+    # Win-looking outcome that is NOT a declared terminal does not reward
+    # (the declared-terminal gate keeps the signal honest).
+    assert f("under_contract", ["lost", "dead"]) is False
+    # Declared FAILURE/neutral terminals never reward.
+    assert f("lost", ["under_contract", "lost"]) is False
+    assert f("churned", ["onboarded", "churned"]) is False
+    assert f("", ["won"]) is False
+    assert f(None, ["won"]) is False

@@ -1401,6 +1401,16 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # scheduler process — every job this process runs is a cron job.
     os.environ["HERMES_CRON_SESSION"] = "1"
 
+    # H3: a cron job is autonomous (no human watching individual commands), so
+    # tirith must fail-CLOSED here — on a scan spawn/timeout failure an UNSCANNED
+    # command must NOT run unattended. Set the fail-closed posture for this
+    # autonomous run via the env layer (which cleanly wins over a persisted
+    # config default). Overridable: we never clobber an explicit operator value,
+    # so an operator who set TIRITH_FAIL_OPEN can still opt back into fail-open.
+    # Interactive/gateway sessions are untouched. (The background-install window
+    # stays fail-open regardless — handled in tools/tirith_security.py.)
+    os.environ.setdefault("TIRITH_FAIL_OPEN", "false")
+
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
