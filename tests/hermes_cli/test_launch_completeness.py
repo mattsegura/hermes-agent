@@ -487,3 +487,137 @@ def test_answer_coverage_noop_when_inputs_malformed_does_not_raise():
     c["answers"] = "not a dict"  # no usable corpus
     r = assess(c)  # must not raise
     assert r["dimensions"]["answer_coverage"]["findings"] == []
+
+
+# --------------------------------------------------------------------------- #
+# H6: advisory_intent_gap report-mode rail
+#   objective.budget / definition_of_done are normalized+stored but NOT enforced.
+#   This dimension makes that declared-but-advisory gap VISIBLE during soak. It is
+#   a strict no-op unless one of those fields is declared (so it never regresses an
+#   existing contract or either golden), report-mode only by default, and a
+#   declared budget is exempt when a runtime budget sensor is present (the only
+#   budget-consuming mechanism that exists).
+# --------------------------------------------------------------------------- #
+
+def test_advisory_intent_gap_is_in_dimensions_tuple():
+    from hermes_cli.launch_completeness import DIMENSIONS
+
+    assert "advisory_intent_gap" in DIMENSIONS
+
+
+def test_advisory_intent_gap_noop_on_clean_contract():
+    """The clean contract declares neither budget nor definition_of_done -> the
+    dimension is a strict no-op (present, empty, never warns) and ok stays True."""
+    r = assess(_clean())
+    assert r["dimensions"]["advisory_intent_gap"]["findings"] == [], r["dimensions"]["advisory_intent_gap"]
+    assert not _has(r["warnings"], "advisory_intent_gap"), r["warnings"]
+    assert r["ok"], r["errors"]
+
+
+def test_advisory_intent_gap_noop_under_enforce_on_clean_contract():
+    """Even if an owner adds advisory_intent_gap to the enforce set, a contract that
+    declares neither field must not be blocked (no declaration -> no finding)."""
+    r = assess(_clean(), enforce=True)
+    assert r["dimensions"]["advisory_intent_gap"]["findings"] == []
+    assert r["ok"], r["errors"]
+
+
+@pytest.mark.parametrize("fixture", ["grow_app_one_week.contract.json", "land_wholesaling.contract.json"])
+def test_advisory_intent_gap_noop_on_goldens(fixture):
+    """The goldens declare a runtime budget *sensor* but no objective.budget and no
+    definition_of_done -> the dimension is a strict no-op on them (cannot regress a
+    stored golden)."""
+    p = FIXTURES / fixture
+    if not p.exists():
+        pytest.skip(f"fixture {fixture} not present")
+    r = assess(json.loads(p.read_text()))
+    assert r["dimensions"]["advisory_intent_gap"]["findings"] == [], fixture
+    assert not _has(r["warnings"], "advisory_intent_gap"), r["warnings"]
+
+
+def test_advisory_intent_gap_warns_on_declared_budget_without_sensor():
+    """A declared budget ceiling with NO runtime budget sensor is advisory -> a
+    report-mode warning fires (never a hard error; ok stays True)."""
+    c = _clean()
+    c["objective"]["budget"] = {"ceiling": 5000, "currency": "USD", "period": "total"}
+    r = assess(c)
+    assert _has(r["warnings"], "advisory_intent_gap"), r["warnings"]
+    assert _has(r["dimensions"]["advisory_intent_gap"]["findings"], "ADVISORY")
+    assert not _has(r["errors"], "advisory_intent_gap"), r["errors"]
+    assert r["ok"], r["errors"]
+
+
+def test_advisory_intent_gap_warns_on_bare_numeric_budget():
+    """A bare-number budget (a total-spend ceiling) is also a declaration -> warns."""
+    c = _clean()
+    c["objective"]["budget"] = 5000
+    r = assess(c)
+    assert _has(r["warnings"], "advisory_intent_gap"), r["warnings"]
+
+
+def test_advisory_intent_gap_exempt_when_budget_sensor_present():
+    """False-positive guard: a declared budget is NOT flagged when the contract also
+    declares a runtime 'budget'-kind sensor (the sensor IS the consuming mechanism)."""
+    c = _clean()
+    c["objective"]["budget"] = {"ceiling": 5000, "currency": "USD", "period": "total"}
+    c["sensors"] = [{"kind": "budget", "window_hours": 24, "ceiling": 5000}]
+    r = assess(c)
+    # the budget half must not fire; only a declared DoD could, and none is set here
+    budget_find = " ".join(
+        f for f in r["dimensions"]["advisory_intent_gap"]["findings"] if "budget" in f
+    )
+    assert budget_find == "", budget_find
+    assert not _has(r["warnings"], "advisory_intent_gap"), r["warnings"]
+
+
+def test_advisory_intent_gap_exempt_when_budget_sensor_under_runtime():
+    """The sensor exemption also reads a runtime-nested sensors block."""
+    c = _clean()
+    c["objective"]["budget"] = 5000
+    c["runtime"] = {"sensors": [{"kind": "budget", "ceiling": 5000}]}
+    r = assess(c)
+    assert not _has(r["warnings"], "advisory_intent_gap"), r["warnings"]
+
+
+def test_advisory_intent_gap_warns_on_declared_definition_of_done():
+    """A declared definition_of_done has no grading seam -> always advisory; warns."""
+    c = _clean()
+    c["objective"]["definition_of_done"] = "all leads contacted and logged"
+    r = assess(c)
+    assert _has(r["warnings"], "advisory_intent_gap"), r["warnings"]
+    assert _has(r["dimensions"]["advisory_intent_gap"]["findings"], "definition_of_done")
+    assert r["ok"], r["errors"]
+
+
+def test_advisory_intent_gap_warns_on_list_definition_of_done():
+    """A list-shaped definition_of_done is also a declaration -> warns."""
+    c = _clean()
+    c["objective"]["definition_of_done"] = ["leads contacted", "deals logged"]
+    r = assess(c)
+    assert _has(r["warnings"], "advisory_intent_gap"), r["warnings"]
+
+
+def test_advisory_intent_gap_noop_on_empty_or_malformed_budget():
+    """Defensive: an empty / non-positive / malformed budget is NOT a declaration
+    (nothing to enforce) and must not raise or warn."""
+    for bad in ({}, {"ceiling": 0}, {"ceiling": "abc"}, True, {"ceiling": None}):
+        c = _clean()
+        c["objective"]["budget"] = bad
+        r = assess(c)  # must not raise
+        budget_find = " ".join(
+            f for f in r["dimensions"]["advisory_intent_gap"]["findings"] if "budget" in f
+        )
+        assert budget_find == "", (bad, budget_find)
+
+
+def test_advisory_intent_gap_promoted_in_enforce_mode_when_opted_in():
+    """If an owner adds advisory_intent_gap to the enforce set, a declared-but-advisory
+    budget becomes a hard error (fail closed) -- proving it is wired through the same
+    enforce machinery as the other net-new dimensions, while staying off by default."""
+    c = _clean()
+    c["objective"]["budget"] = {"ceiling": 5000, "currency": "USD", "period": "total"}
+    report = assess(c)
+    enforced = assess(copy.deepcopy(c), enforce=True)
+    assert _has(report["warnings"], "advisory_intent_gap"), report["warnings"]
+    assert not enforced["ok"], "enforce mode must fail closed on a declared-but-advisory budget"
+    assert _has(enforced["errors"], "advisory_intent_gap"), enforced["errors"]

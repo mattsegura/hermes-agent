@@ -4278,7 +4278,19 @@ def _normalize_success_entries(values: Optional[Any]) -> list:
 
 
 def normalize_objective_metadata(objective: Optional[Any]) -> Optional[dict]:
-    """Validate and normalize board-level objective metadata."""
+    """Validate and normalize board-level objective metadata.
+
+    ADVISORY FIELDS (owner-facing intent, NOT runtime-enforced): ``budget`` and
+    ``definition_of_done`` are normalized and stored here, but no code reads
+    ``objective.budget`` as a spend cap and nothing grades
+    ``objective.definition_of_done`` against a terminal check. They are owner
+    declarations of intent, not hard rails -- a declared budget ceiling is NOT a
+    runtime cost ceiling (the runtime ``budget`` *sensor* is the separate,
+    per-window spend meter), and a declared definition_of_done does NOT gate
+    completion. They stay advisory until a cost/DoD enforcement seam exists; until
+    then the launch_completeness ``advisory_intent_gap`` dimension surfaces the
+    gap in report mode so it is not mistaken for enforcement.
+    """
     if objective is None:
         return None
     if isinstance(objective, str):

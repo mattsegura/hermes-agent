@@ -251,6 +251,17 @@ def _notify_human(
     notify_channel = config.get("notify", "telegram")
 
     # Format the message
+    #
+    # H4 FIX: the previous text told the owner to reply "/approve <action_id>"
+    # / "/deny <action_id>", but that path silently FAILS: the gateway's
+    # /approve handler routes any non-keyword token to _parse_approve_board_arg,
+    # which treats a numeric token as a BOARD SLUG (board slugs may be all-digit
+    # per kanban_db._BOARD_SLUG_RE), so the action-gate decision never lands.
+    # Numeric routing was rejected as ambiguous (a digit token could be a real
+    # board name), so this is the honest text fix: point the owner at the inline
+    # Approve/Deny buttons (the working, default-on path the gateway watcher
+    # renders), and show the action id for the audit trail only -- never as a
+    # text command that would silently no-op.
     args_preview = json.dumps(tool_args, default=str)[:500]
     message = (
         f"🚨 Action Gate — Approval Required\n\n"
@@ -258,10 +269,8 @@ def _notify_human(
         f"Tool: {tool_name}\n"
         f"Action: {description}\n"
         f"Args: {args_preview}\n\n"
-        f"Reply with:\n"
-        f"  /approve {action_id}\n"
-        f"  /deny {action_id}\n"
-        f"  /deny {action_id} disable_tool"
+        f"Action #{action_id} — approve or deny with the inline buttons on the "
+        f"approval card sent to your chat."
     )
 
     if notify_channel == "telegram":

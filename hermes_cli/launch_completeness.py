@@ -71,6 +71,7 @@ DIMENSIONS: tuple[str, ...] = (
     "stage_reachability",
     "distinct_terminals",
     "answer_coverage",
+    "advisory_intent_gap",
 )
 
 
@@ -359,6 +360,69 @@ def _coverage_inputs(contract: dict) -> Optional[dict]:
             "external_research": contract.get("external_research"),
         }
     return None
+
+
+# --- H6: advisory_intent_gap report-mode rail ------------------------------ #
+# objective.budget ({ceiling, currency, period}) and objective.definition_of_done
+# (str|list) are NORMALIZED + STORED (G4 era) but NOTHING reads budget as a spend
+# cap, and nothing grades definition_of_done against a terminal check. An owner who
+# declares a budget ceiling may FALSELY believe it is enforced -- a fail-open
+# expectation gap. Wiring budget into a real spend guard is out of scope (no
+# cost-tracking seam yet), so the honest move is to make the gap VISIBLE during
+# soak rather than silent. This dimension is:
+#   * a STRICT no-op when neither field is declared (so it never touches an
+#     existing contract or either golden, which declare neither),
+#   * report-mode only by default (added to DIMENSIONS; the gate enforces it ONLY
+#     if an owner explicitly adds "advisory_intent_gap" to the enforce set), and
+#   * false-positive-resistant: a declared budget is NOT flagged when the contract
+#     also declares a runtime ``budget``-kind sensor (the only budget-consuming
+#     mechanism that exists), because then the owner HAS wired a spend meter.
+# definition_of_done has NO grading seam at all, so a declared DoD is always
+# advisory-only and is always surfaced when present.
+def _budget_is_declared(objective: Any) -> bool:
+    """True when objective.budget declares a usable ceiling (a positive number).
+
+    Mirrors kanban_db._normalize_objective_budget: a bare number is a total-spend
+    ceiling; an object carries {ceiling, currency, period}. A budget whose ceiling
+    is absent / non-numeric / <= 0 is treated as not-declared (nothing to enforce),
+    so this never fires on an empty or malformed budget stub.
+    """
+    if not isinstance(objective, dict):
+        return False
+    budget = objective.get("budget")
+    if isinstance(budget, bool) or budget is None:
+        return False
+    if isinstance(budget, (int, float)):
+        return float(budget) > 0
+    if isinstance(budget, dict):
+        return _finite_number(budget.get("ceiling"))
+    return False
+
+
+def _dod_is_declared(objective: Any) -> bool:
+    """True when objective.definition_of_done carries a non-empty str or list."""
+    if not isinstance(objective, dict):
+        return False
+    dod = objective.get("definition_of_done")
+    if isinstance(dod, str):
+        return bool(dod.strip())
+    if isinstance(dod, (list, tuple)):
+        return any(isinstance(x, str) and x.strip() for x in dod)
+    return False
+
+
+def _has_budget_sensor(contract: dict) -> bool:
+    """True when the contract declares a runtime ``budget``-kind sensor.
+
+    The runtime budget sensor (a per-window rolling spend meter) is the ONLY
+    budget-consuming mechanism that exists, so its presence means the owner HAS
+    wired a real cap and objective.budget should NOT be flagged advisory. Reads
+    sensors top-level or under ``runtime`` (the two shapes _section handles) and
+    is stdlib-only (does not import kanban_db, keeping this module standalone)."""
+    for s in _as_list(_section(contract, "sensors")):
+        if isinstance(s, dict) and str(s.get("kind") or "").strip().lower() == "budget":
+            return True
+    return False
 
 
 def assess_launch_completeness(contract: Optional[dict], *, enforce: bool = False) -> dict:
@@ -657,6 +721,29 @@ def assess_launch_completeness(contract: Optional[dict], *, enforce: bool = Fals
         # so the dimension is always present in the report but never fires/regresses
         dims["answer_coverage"] = {"findings": [], "enforced": enforce}
 
+    # --- H6: advisory_intent_gap (report-mode; no-op unless budget/DoD declared) ---
+    # Surfaces the declared-but-advisory expectation gap so it is visible during
+    # soak instead of silently fail-open. NO-OP (clean, no warning) whenever neither
+    # objective.budget nor objective.definition_of_done is declared -- which is the
+    # case for every existing contract and both goldens, so this can never regress
+    # them. A declared budget is exempt when a runtime budget sensor is also present
+    # (that IS the consuming mechanism); a declared definition_of_done is always
+    # surfaced because no DoD-grading seam exists yet.
+    f_advisory: list[str] = []
+    if _budget_is_declared(objective) and not _has_budget_sensor(contract):
+        f_advisory.append(
+            "objective.budget declares a spend ceiling but no budget-consuming "
+            "mechanism is wired (no runtime 'budget' sensor) -> the ceiling is "
+            "ADVISORY (owner-facing intent), NOT a runtime-enforced cap."
+        )
+    if _dod_is_declared(objective):
+        f_advisory.append(
+            "objective.definition_of_done is declared but nothing grades it against "
+            "a terminal check -> it is ADVISORY (owner-facing intent), NOT a "
+            "runtime-enforced completion gate."
+        )
+    emit("advisory_intent_gap", f_advisory)
+
     return {"ok": not errors, "errors": errors, "warnings": warnings, "dimensions": dims}
 
 
@@ -830,6 +917,24 @@ if __name__ == "__main__":
     cE3b = json.loads(json.dumps(cE3)); cE3b["event_loops"][0]["terminal_states"] = ["closed", "paused", "disqualified"]
     rE3b = assess_launch_completeness(cE3b)
     check("distinct terminals do not warn distinct_terminals", not any("distinct_terminals" in w for w in rE3b["warnings"]), str(rE3b["warnings"]))
+
+    print("== H6: advisory_intent_gap report-mode rail (no-op unless budget/DoD declared) ==")
+    # neither field declared -> strict no-op
+    cAdv0 = json.loads(json.dumps(base))
+    rAdv0 = assess_launch_completeness(cAdv0)
+    check("advisory_intent_gap no-op when nothing declared", rAdv0["dimensions"].get("advisory_intent_gap", {}).get("findings") == [], str(rAdv0["dimensions"].get("advisory_intent_gap")))
+    # declared budget, no budget sensor -> report-mode warning (never a hard error)
+    cAdvB = json.loads(json.dumps(base)); cAdvB["objective"]["budget"] = {"ceiling": 5000, "currency": "USD", "period": "total"}
+    rAdvB = assess_launch_completeness(cAdvB)
+    check("declared budget without sensor warns advisory_intent_gap (report-mode, not a hard error)", any("advisory_intent_gap" in w for w in rAdvB["warnings"]) and not any("advisory_intent_gap" in e for e in rAdvB["errors"]), str(rAdvB["warnings"]))
+    # declared budget WITH a budget sensor -> exempt (no warn)
+    cAdvBs = json.loads(json.dumps(cAdvB)); cAdvBs["sensors"] = [{"kind": "budget", "ceiling": 5000}]
+    rAdvBs = assess_launch_completeness(cAdvBs)
+    check("declared budget with budget sensor does NOT warn", not any("advisory_intent_gap" in w for w in rAdvBs["warnings"]), str(rAdvBs["warnings"]))
+    # declared definition_of_done -> always advisory (no DoD seam) -> warns
+    cAdvD = json.loads(json.dumps(base)); cAdvD["objective"]["definition_of_done"] = "all leads contacted"
+    rAdvD = assess_launch_completeness(cAdvD)
+    check("declared definition_of_done warns advisory_intent_gap", any("advisory_intent_gap" in w for w in rAdvD["warnings"]), str(rAdvD["warnings"]))
 
     print(f"\n{'ALL PASS' if failures == 0 else str(failures) + ' FAILURES'}")
     sys.exit(1 if failures else 0)
