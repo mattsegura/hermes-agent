@@ -22,8 +22,19 @@ logic that :mod:`hermes_cli.kanban_db` composes:
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Optional
+
+# FIX 5: bind the closed-vocabulary grammar helper at MODULE LOAD so an
+# unavailable grammar is a hard ImportError at startup, never a per-call silent
+# downgrade that strips declared classes off every opted-in loop and persists a
+# substring-path schedule. Mirrors kanban_launch_invariants' module-load import
+# of the same grammar. kanban_launch_grammar is a pure leaf module (no internal
+# imports), so this cannot introduce a circular import.
+from hermes_cli.kanban_launch_grammar import (
+    loop_declared_terminal_classes as _grammar_loop_declared_terminal_classes,
+)
 
 # --------------------------------------------------------------------------
 # Untrusted-inbound sanitization boundary.
@@ -289,7 +300,18 @@ def cadence_seconds(trigger: dict) -> Optional[int]:
 def _coerce_int(value: Any) -> Optional[int]:
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, float):
+        # FIX 6: a non-finite float (.inf / .nan, which YAML authors can legally
+        # type as ``max_defers: .inf``) cannot become an int -- ``int(float('inf'))``
+        # raises OverflowError and ``int(float('nan'))`` raises ValueError. The
+        # caller's per-loop compile used to swallow that, silently dropping the
+        # ENTIRE timer schedule so the board activated with 0 watchers. Treat a
+        # non-finite bound as "no usable value" (None) so the loop still compiles;
+        # the malformed bound is surfaced separately at intake.
+        if not math.isfinite(value):
+            return None
+        return int(value)
+    if isinstance(value, int):
         return int(value)
     if isinstance(value, str) and value.strip().lstrip("-").isdigit():
         return int(value.strip())
@@ -348,14 +370,18 @@ def loop_declared_terminal_classes(loop: dict) -> dict[str, str]:
     validator agree on what a declared class is. Returns an empty dict when the
     loop did not opt in (no declared classes) -- the caller keeps the legacy
     substring reward behavior, byte-identical to today.
+
+    FIX 5: the grammar is imported at MODULE LOAD (see the top-of-module
+    ``_grammar_loop_declared_terminal_classes`` binding), NOT per-call inside a
+    swallow-everything ``try``. A per-call ``except Exception: return {}`` was a
+    silent fail-OPEN: if the grammar were unavailable at compile time it stripped
+    the declared map from EVERY opted-in loop and persisted a NULL column, so the
+    board permanently reverted to the substring path with no error trail. With a
+    module-load import, an unavailable grammar is a hard ImportError at startup
+    (the board never compiles a stripped schedule), exactly like
+    ``kanban_launch_invariants`` does for ``TERMINAL_OUTCOME_CLASSES``.
     """
-    try:
-        from hermes_cli.kanban_launch_grammar import (
-            loop_declared_terminal_classes as _grammar_classes,
-        )
-        return _grammar_classes(loop)
-    except Exception:  # pragma: no cover - defensive: degrade to legacy (no opt-in)
-        return {}
+    return _grammar_loop_declared_terminal_classes(loop)
 
 
 def loop_max_defers(loop: dict) -> Optional[int]:

@@ -17262,7 +17262,11 @@ def _upsert_timer_schedule(
                 int(cadence_seconds),
                 now + int(cadence_seconds),
                 int(max_nudges) if max_nudges is not None else None,
-                _normalize_funnel_text(side_effect_class),
+                # FIX 3: lower-case at persistence so recognition + the
+                # case-sensitive forbidden/approval_required membership checks
+                # share one canonical vocabulary (External_Irreversible ->
+                # external_irreversible). NULL/sentinel handling is unchanged.
+                _canonical_side_effect_class(side_effect_class),
                 _json_text_or_none(action),
                 json.dumps(terminal_states, ensure_ascii=False) if terminal_states else None,
                 json.dumps(terminal_classes, ensure_ascii=False) if terminal_classes else None,
@@ -17517,6 +17521,27 @@ def record_contract_approval(
     return signal_id
 
 
+def _canonical_side_effect_class(value: Optional[Any]) -> Optional[str]:
+    """Persistence normalizer for ``side_effect_class`` (FIX 3, case canon).
+
+    Identical to :func:`_normalize_funnel_text` (strip + collapse the
+    ``none``/``null``/``-`` sentinels and empty strings to NULL) but ALSO
+    lower-cases the surviving value, so the closed-vocabulary recognition check
+    (which lower-cases internally) and the case-SENSITIVE
+    ``forbidden``/``approval_required`` membership checks share ONE vocabulary.
+
+    Without this, ``External_Irreversible`` persisted verbatim: it read as
+    RECOGNIZED by the recognition check (it lower-cases) yet ESCAPED a
+    ``forbidden``/``approval_required`` entry spelled in canonical lower case --
+    so a class explicitly forbidden still fired under strict. The closed
+    vocabulary is case-insensitive by definition, so lower-casing at persistence
+    loses no authorial intent (verified: no board relies on case-preserved class
+    names -- the live ninaxfinds-growth board declares no event loops at all).
+    """
+    text = _normalize_funnel_text(value)
+    return text.lower() if text is not None else None
+
+
 def _side_effect_strict_enabled(policy: dict) -> bool:
     """9(a): is DEFAULT-DENY side-effect enforcement OPTED IN for this board?
 
@@ -17549,6 +17574,30 @@ def _side_effect_class_is_recognized(side_effect_class: Optional[str]) -> bool:
         return canon in {
             "none", "internal", "external_reversible",
             "external_irreversible", "financial",
+        }
+
+
+def _side_effect_class_is_external(side_effect_class: Optional[str]) -> bool:
+    """True iff ``side_effect_class`` crosses the board boundary (9a fail-closed).
+
+    The EXTERNAL family is ``external_reversible`` / ``external_irreversible`` /
+    ``financial`` (the canonical
+    :data:`kanban_launch_grammar.EXTERNAL_SIDE_EFFECT_CLASSES`). Under STRICT
+    enforcement a class in this family is APPROVAL-REQUIRED-BY-DEFAULT: it must be
+    held (deferred) unless a satisfied approval gate covers it, exactly like an
+    unrecognized class. ``none`` / ``internal`` are SAFE and fire freely. This is
+    what makes strict an allowlist-of-SAFE, not an allowlist-of-recognized: a
+    correctly-spelled dangerous class a board forgot to gate cannot fire under
+    strict. Imported defensively, degrading to the inlined external set on import
+    failure so the fail-closed decision never depends on the import succeeding.
+    """
+    try:
+        from hermes_cli.kanban_launch_grammar import is_external_side_effect_class
+        return bool(is_external_side_effect_class(side_effect_class))
+    except Exception:  # pragma: no cover - defensive: degrade to inlined vocab
+        canon = str(side_effect_class or "").strip().lower()
+        return canon in {
+            "external_reversible", "external_irreversible", "financial",
         }
 
 
@@ -17627,26 +17676,51 @@ def _timer_schedule_terminal_states(row: Any) -> list[str]:
         return []
 
 
+#: Sentinel returned by :func:`_timer_schedule_terminal_classes` when the
+#: ``terminal_classes`` column is PRESENT (non-NULL) but UNPARSEABLE / not a JSON
+#: object. FIX 5: a corrupt declared map must NOT degrade to "never opted in"
+#: (which would fall through to the legacy 'won'-substring path and wrongly
+#: credit a declared NEUTRAL/LOSS terminal). It is a distinct fail-CLOSED state:
+#: the reward rail credits 0.0 (non-conversion) and emits a loud error signal.
+_TERMINAL_CLASSES_CORRUPT: dict[str, str] = {}
+
+
 def _timer_schedule_terminal_classes(row: Any) -> dict[str, str]:
     """Read a schedule row's DECLARED terminal-state -> outcome-class map (9b).
 
-    Empty when the column is absent (legacy DB before the additive migration) or
-    NULL (a loop that did not opt in) -- the caller then keeps the corrected
-    legacy substring reward path. Only a loop that declared closed-vocabulary
-    classes returns a non-empty map.
+    Three distinct states (FIX 5: a broken declaration is NOT the same as no
+    declaration):
+
+    * **No declaration (NULL / absent column).** Returns an empty dict -- the
+      loop did not opt in, so the caller keeps the byte-identical legacy
+      substring reward path.
+    * **Valid declaration.** Returns the ``{state: class}`` map.
+    * **Present-but-broken (non-NULL but unparseable / not a JSON object).**
+      Returns the :data:`_TERMINAL_CLASSES_CORRUPT` sentinel (identity-checked by
+      the caller) so the reward rail fails CLOSED -- credits 0.0 and surfaces an
+      error -- rather than silently falling back to the substring guess the loop
+      opted in precisely to suppress.
     """
     try:
         raw = row["terminal_classes"] if "terminal_classes" in row.keys() else None
     except Exception:
         raw = None
-    if not raw:
+    # NULL / absent -> genuinely no declaration -> legacy path.
+    if raw is None:
+        return {}
+    # A non-NULL but EMPTY string is degenerate; treat it as no declaration
+    # (there is nothing to parse and no class to honor) -- it cannot mis-credit a
+    # declared neutral/loss because no class was declared.
+    if isinstance(raw, str) and not raw.strip():
         return {}
     try:
         parsed = json.loads(raw)
     except Exception:
-        return {}
+        # Present-but-unparseable: FIX 5 fail-CLOSED sentinel.
+        return _TERMINAL_CLASSES_CORRUPT
     if not isinstance(parsed, dict):
-        return {}
+        # Present-but-not-a-map: same fail-CLOSED posture.
+        return _TERMINAL_CLASSES_CORRUPT
     out: dict[str, str] = {}
     for state, cls in parsed.items():
         s = str(state or "").strip().lower()
@@ -17675,35 +17749,15 @@ def _timer_schedule_terminal_classes(row: Any) -> dict[str, str]:
 # fails we fall back to the legacy 'won'-substring-only behavior, never crashing
 # and never silently dropping the existing reward path.
 
-#: The SAME loss-terminal denylist launch_completeness uses, inlined here as a
-#: defensive fallback so the reward rail's loss check never depends on an import
-#: succeeding. Kept byte-identical to launch_completeness._LOSS_TERMINAL_TOKENS.
-_LEGACY_LOSS_TOKENS: tuple[str, ...] = (
-    "lost", "loss", "closed_lost", "unsigned", "incomplete",
-    "not_completed", "not_complete", "disapprov", "disqualif",
-    "reject", "declin", "cancel", "abandon", "churn", "expired",
-    "dead", "failed", "fail", "withdrawn", "bounced",
-)
-
-
-def _outcome_is_loss_token(outcome: str) -> bool:
-    """True when ``outcome`` reads as an explicit LOSS terminal.
-
-    Used to make the legacy 'won'-substring reward shortcut loss-aware: a loss
-    terminal that embeds the 'won' substring (``won_but_lost`` / ``closed_lost``
-    / ...) must NEVER earn the conversion reward. Mirrors the launch_completeness
-    loss denylist (the SAME tokens the spec's win detector applies first);
-    imported defensively, degrading to the inlined copy on import failure so the
-    loss check is never silently skipped (fail-closed for the reward gate).
-    """
-    t = (outcome or "").strip().lower()
-    if not t:
-        return False
-    try:
-        from hermes_cli.launch_completeness import _LOSS_TERMINAL_TOKENS as _loss
-        return any(tok in t for tok in _loss)
-    except Exception:  # pragma: no cover - defensive: never skip the loss check
-        return any(tok in t for tok in _LEGACY_LOSS_TOKENS)
+# NOTE (FIX 1, red-team Sec.2): a free-text loss-token denylist used to gate the
+# LEGACY 'won'-substring reward shortcut. That changed default-off DECISIONS (it
+# denied credit to genuine win-backs/renewals whose label embedded 'churn'/
+# 'cancel'/'expired') with no opt-in flag, and it was itself an infer-from-strings
+# heuristic (merge-gate Sec.4). The loss-denylist helper and its inlined fallback
+# were REMOVED: the legacy path is byte-identical to base, and loss-awareness now
+# lives ONLY in the DECLARED ``terminal_classes`` path (closed vocabulary), where
+# a loss terminal embedding 'won' fails to credit because it was DECLARED a loss
+# class, never because of a substring match.
 
 
 def _looks_like_win_token(token: Optional[str]) -> bool:
@@ -17753,16 +17807,17 @@ def _terminal_outcome_is_conversion(
       consulted, so ``unwon`` / ``wonky`` / an arbitrary string can NEVER credit
       unless the loop literally declared that exact state as a win.
 
-    * **Legacy path (corrected, applies to loops that did NOT opt in).** This
-      completes the G6 loss-denylist fix. The pre-fix code had
-      ``if "won" in outcome: return True`` running BEFORE any loss check, so
-      ``won_but_lost`` / ``closed_lost`` (and any loss terminal embedding the
-      'won' substring) wrongly earned the 1.0 conversion reward. That shortcut
-      now routes through :func:`_looks_like_win_token`, which applies the loss
-      denylist FIRST -- removing credit that should never have existed while
-      preserving every legitimate win (``closed_won`` / a bare ``won`` still
-      credit). A declared win-class terminal also credits (exact match), so a
-      domain whose win terminal has no 'won' substring is still recognised.
+    * **Legacy path (no declared classes -- BYTE-IDENTICAL to base 019271994).**
+      The legacy ``"won"`` substring shortcut is UNCONDITIONAL, exactly as it
+      shipped at base: ``if "won" in outcome: return True``. Loss-awareness is
+      NEVER applied here -- it would change default-off DECISIONS (merge-gate
+      Sec.2), flipping genuine wins whose label embeds a loss substring
+      (``won_back_from_churn`` / ``renewal_after_cancellation_won`` /
+      ``reactivated_expired_subscriber_won``) from 1.0 to 0.0 with no opt-in.
+      The durable fix is DECLARE-DON'T-INFER: a board that wants a loss terminal
+      embedding 'won' to NOT credit OPTS IN via ``terminal_classes`` (the
+      declared path above), where the decision comes from a closed vocabulary
+      and never from a free-text substring denylist.
     """
     if not terminal_outcome:
         return False
@@ -17771,17 +17826,18 @@ def _terminal_outcome_is_conversion(
         return False
     # (a) Declared path (opt-in): a loop that declared closed-vocabulary terminal
     # classes is governed ONLY by those declarations -- no substring inference.
-    # ``unwon`` / ``wonky`` / an arbitrary string can NEVER credit here.
+    # ``unwon`` / ``wonky`` / an arbitrary string can NEVER credit here, and a
+    # loss terminal that embeds 'won' (``won_but_lost``) only fails to credit
+    # because it was DECLARED ``loss`` (not because of a substring denylist).
     if declared_terminal_classes:
         return declared_terminal_classes.get(outcome) == "win"
-    # (b) Legacy path (no declared classes): the SAME 'won'-substring shortcut as
-    # before, but now loss-aware. Previously ``if "won" in outcome: return True``
-    # ran before any loss check, so ``won_but_lost`` (and any loss terminal that
-    # embeds 'won') wrongly earned the conversion reward. Apply the loss denylist
-    # FIRST -- this removes ONLY credit that should never have existed; ``won`` /
-    # ``closed_won`` (and even the pre-existing ``unwon`` / ``wonky`` substring
-    # quirk) still credit exactly as before, so no legitimate win regresses.
-    if "won" in outcome and not _outcome_is_loss_token(outcome):
+    # (b) Legacy path (no declared classes): the literal 'won'-substring shortcut,
+    # UNCONDITIONAL and byte-identical to base 019271994. We do NOT apply a loss
+    # denylist here -- that would change default-off decisions for every legacy
+    # board (denying credit to genuine win-backs/renewals/reactivations whose
+    # label happens to embed 'churn'/'cancel'/'expired') with no opt-in flag,
+    # violating merge-gate Sec.2. Loss-awareness lives ONLY in the declared path.
+    if "won" in outcome:
         return True
     # (c) Legacy declared win-class terminal: the outcome matches one of the
     # loop's declared terminal_states AND that declared terminal looks win-class.
@@ -18131,8 +18187,15 @@ def reactive_tick(
         return result
     contract = _metadata_as_business_contract(read_board_metadata(board_slug))
     policy = _contract_object(contract.get("side_effect_policy"))
-    forbidden = set(_string_list(policy.get("forbidden")))
-    approval_required = set(_string_list(policy.get("approval_required")))
+    # FIX 3: normalize the policy sets to the SAME canonical lower case the
+    # persisted side_effect_class now uses, so forbidden/approval_required
+    # membership and the closed-vocabulary recognition check share one
+    # vocabulary. Without this an 'External_Irreversible' loop read as recognized
+    # (recognition lower-cases) yet escaped a lower-case forbidden/approval entry.
+    forbidden = {s.strip().lower() for s in _string_list(policy.get("forbidden"))}
+    approval_required = {
+        s.strip().lower() for s in _string_list(policy.get("approval_required"))
+    }
     # 9(a): DEFAULT-DENY enforcement is OPT-IN per board (declared on the
     # contract). When unset (every legacy board incl. ninaxfinds) this is False
     # and the gate is byte-identical to today's legacy fall-through.
@@ -18174,25 +18237,45 @@ def reactive_tick(
                 {"loop_key": row["loop_key"], "reason": "side_effect_forbidden"}
             )
             continue
-        # 9(a) FAIL-CLOSED: under strict enforcement an UNRECOGNIZED or MISSING
-        # class (a typo / near-miss / NULL that is not a member of the closed
-        # vocabulary) does NOT fall through and fire. It routes to the same
-        # approval-required deferral path as a gated side effect -- the loop is
-        # held pending an explicit approval rather than performing an unguarded
-        # external action. Default-off (strict False) skips this entirely, so the
-        # legacy fall-through is untouched for every board that did not opt in.
+        # 9(a) FAIL-CLOSED (allowlist-of-SAFE, NOT allowlist-of-recognized):
+        # under strict enforcement the ONLY classes that fire freely are the SAFE
+        # ones (``none`` / ``internal``). Everything else is held (deferred):
+        #   * an UNRECOGNIZED/near-miss/typo class can never be approved (there is
+        #     no declared gate for a class outside the vocabulary), so it always
+        #     defers -- ``side_effect_unrecognized_strict``.
+        #   * a RECOGNIZED EXTERNAL-family class (external_reversible /
+        #     external_irreversible / financial) is APPROVAL-REQUIRED-BY-DEFAULT
+        #     even when the board forgot to list it in ``approval_required``: it
+        #     defers unless a satisfied approval gate covers it. This is the FIX 2
+        #     correction -- previously a correctly-spelled dangerous class not in
+        #     approval_required fired ungated under strict (byte-identical to
+        #     legacy), so strict gave ZERO protection for the two most dangerous
+        #     classes a board forgot to gate.
+        # Default-off (strict False) skips this entirely, so the legacy
+        # fall-through is byte-identical for every board that did not opt in.
         strict_unrecognized = (
             strict_side_effects
             and not _side_effect_class_is_recognized(side_effect_class)
         )
-        if side_effect_class in approval_required or strict_unrecognized:
+        strict_external = (
+            strict_side_effects
+            and not strict_unrecognized
+            and _side_effect_class_is_external(side_effect_class)
+        )
+        if (
+            side_effect_class in approval_required
+            or strict_unrecognized
+            or strict_external
+        ):
             task = get_task(conn, row["task_id"]) if row["task_id"] else None
             satisfied = (
                 _satisfied_approval_gate_keys(conn, board_slug, task) if task else set()
             )
             # An unrecognized class can never be "approved" (there is no declared
             # gate for a class that is not in the vocabulary), so it always
-            # defers under strict mode -- fail-closed by construction.
+            # defers under strict mode -- fail-closed by construction. A recognized
+            # external class CAN be approved (a satisfied approval gate covers it);
+            # absent that it defers (approval-required-by-default under strict).
             approved = (
                 not strict_unrecognized
                 and _reactive_side_effect_approved(
@@ -20394,8 +20477,30 @@ def build_learned_state_read_model(
     return result
 
 
-def _timer_schedule_max_defers(row: Any) -> Optional[int]:
-    """Read a schedule row's defer bound (9c). NULL/absent = unbounded = legacy."""
+#: Sentinel returned by :func:`_timer_schedule_max_defers` when the ``max_defers``
+#: column is PRESENT (non-NULL) but cannot be coerced to a non-negative int. FIX
+#: 5: a corrupt declared bound must NOT degrade to None (unbounded), which would
+#: silently drop the 9(c) anti-zombie cap and let an opted-in loop defer forever.
+#: It is a distinct fail-CLOSED state: the deferral path refuses to defer and
+#: terminates the loop instead.
+_MAX_DEFERS_CORRUPT: str = "__corrupt__"
+
+
+def _timer_schedule_max_defers(row: Any) -> Optional[int] | str:
+    """Read a schedule row's defer bound (9c).
+
+    Three distinct states (FIX 5: a broken bound is NOT the same as no bound):
+
+    * **NULL / absent** -> ``None`` -- no declared bound -> unbounded deferral,
+      byte-identical to the legacy behavior.
+    * **A valid non-negative int** -> that int (the cap).
+    * **Present-but-uncoercible** (a corrupt column, e.g. ``'garbage'``) ->
+      the :data:`_MAX_DEFERS_CORRUPT` sentinel so the deferral path fails CLOSED
+      (terminate / refuse to defer) instead of silently going unbounded.
+
+    A NEGATIVE int is treated as "no bound" (``None``) for byte-identical legacy
+    behavior (a negative cap was never honored).
+    """
     try:
         raw = row["max_defers"] if "max_defers" in row.keys() else None
     except Exception:
@@ -20405,7 +20510,8 @@ def _timer_schedule_max_defers(row: Any) -> Optional[int]:
     try:
         n = int(raw)
     except (TypeError, ValueError):
-        return None
+        # Present-but-uncoercible: FIX 5 fail-CLOSED sentinel.
+        return _MAX_DEFERS_CORRUPT
     return n if n >= 0 else None
 
 
@@ -20443,6 +20549,19 @@ def _defer_timer_schedule(
     """
     max_defers = _timer_schedule_max_defers(row)
     used = _timer_schedule_defers_used(row)
+    # FIX 5 fail-CLOSED: a PRESENT-but-corrupt max_defers column must NOT be read
+    # as "unbounded" (which would let the loop defer forever -- the anti-zombie
+    # cap silently vanishing). Refuse to defer and terminate the loop instead.
+    if max_defers is _MAX_DEFERS_CORRUPT or max_defers == _MAX_DEFERS_CORRUPT:
+        _log.error(
+            "reactive loop %s has a corrupt max_defers column -- failing CLOSED "
+            "(terminating rather than deferring unbounded)", row["loop_key"],
+        )
+        _close_timer_schedule(
+            conn, row, reason="deferral_exhausted", now=now,
+            board=_connection_board(conn, board), entity=entity,
+        )
+        return False
     # This call is the (used+1)-th defer. Under a declared bound, terminate once
     # the attempted defer count exceeds the bound (max_defers=2 -> the 3rd defer
     # terminates; defers 1 and 2 still happen).
@@ -20486,9 +20605,26 @@ def _close_timer_schedule(
         # so no extra contract lookup is needed and dedupe/attribution are intact.
         declared_terminal_states = _timer_schedule_terminal_states(row)
         declared_terminal_classes = _timer_schedule_terminal_classes(row)
-        won = _terminal_outcome_is_conversion(
-            terminal_outcome, declared_terminal_states, declared_terminal_classes
+        # FIX 5 fail-CLOSED: a PRESENT-but-broken terminal_classes column (a loop
+        # that DID opt in, but whose declaration is now unparseable/corrupt) must
+        # NOT silently fall back to the legacy substring guess -- that would
+        # credit a declared NEUTRAL/LOSS terminal it opted in precisely to
+        # suppress. Credit 0.0 (non-conversion) and emit a loud error signal so
+        # the corruption surfaces instead of degrading toward crediting.
+        terminal_classes_corrupt = (
+            declared_terminal_classes is _TERMINAL_CLASSES_CORRUPT
         )
+        if terminal_classes_corrupt:
+            won = False
+            _log.error(
+                "reactive loop %s on board %s has a corrupt terminal_classes "
+                "column -- failing CLOSED (non-conversion) for terminal_outcome %r",
+                row["loop_key"], board, terminal_outcome,
+            )
+        else:
+            won = _terminal_outcome_is_conversion(
+                terminal_outcome, declared_terminal_states, declared_terminal_classes
+            )
         reward_kind = "conversion" if won else "loop_closed"
         reward_value = 1.0 if won else 0.0
         _safe_record_board_signal(
@@ -20517,6 +20653,33 @@ def _close_timer_schedule(
             # Shared key with the max-nudges close path so a loop counts once.
             dedupe_key=f"loop_terminal:{int(row['id'])}",
         )
+        if terminal_classes_corrupt:
+            # Loud, machine-readable error signal so a corrupt opted-in
+            # declaration is visible in the board's signal stream / dashboard,
+            # not just the log. Uses the existing ``dispatch_blocked`` primitive
+            # kind (the board-health/something-is-wrong channel) with a distinct
+            # ``action.kind`` so it cannot be mistaken for the outcome reward
+            # above and never feeds the reward rollup as a conversion.
+            _safe_record_board_signal(
+                conn,
+                board=board,
+                primitive_kind="dispatch_blocked",
+                primitive_key=row["loop_key"],
+                entity_ref=row["task_id"],
+                action={
+                    "kind": "terminal_classes_corrupt",
+                    "params": {
+                        "loop_key": row["loop_key"],
+                        "terminal_outcome": terminal_outcome,
+                        "detail": "non-NULL terminal_classes failed to parse; "
+                                  "reward failed CLOSED (non-conversion).",
+                    },
+                },
+                reward_value=0.0,
+                reward_kind="error",
+                realized_at=now,
+                dedupe_key=f"terminal_classes_corrupt:{int(row['id'])}",
+            )
         if row["task_id"]:
             _append_event(
                 conn,
@@ -20526,6 +20689,11 @@ def _close_timer_schedule(
                     "loop_key": row["loop_key"],
                     "reason": reason,
                     "nudges_used": int(row["nudges_used"]),
+                    **(
+                        {"terminal_classes_corrupt": True}
+                        if terminal_classes_corrupt
+                        else {}
+                    ),
                 },
             )
 

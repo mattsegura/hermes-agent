@@ -287,11 +287,21 @@ def _iter_declared_loop_terminal_classes(loop: dict[str, Any]):
         items = loop.get(src)
         if isinstance(items, (list, tuple)):
             for item in items:
-                if isinstance(item, dict) and (item.get("class") or item.get("kind")):
+                if not isinstance(item, dict):
+                    continue
+                # FIX 7(b): yield whenever the class/kind KEY is PRESENT, even if
+                # its value is falsey (None / "" / 0). Previously the truthiness
+                # gate (``item.get("class") or item.get("kind")``) silently
+                # dropped an inline ``class: null`` so a half-declared shape-1
+                # class escaped validation, while the sibling-map (shape-2)
+                # branch flagged the same defect. Mirror shape-2 here so a
+                # fat-fingered/empty inline class surfaces at intake.
+                if "class" in item or "kind" in item:
                     state = str(
                         item.get("state") or item.get("key") or item.get("outcome") or ""
                     ).strip()
-                    yield (state or "(unnamed)", item.get("class") or item.get("kind"))
+                    raw = item.get("class") if "class" in item else item.get("kind")
+                    yield (state or "(unnamed)", raw)
     classes_map = loop.get("terminal_classes")
     if isinstance(classes_map, dict):
         for state, cls in classes_map.items():
@@ -304,18 +314,186 @@ def _check_loop_terminal_classes(
     """9(b): a DECLARED terminal-outcome class must be in the closed vocabulary.
 
     Opt-in: a loop with no declared classes is unaffected (legacy path). When a
-    loop DOES declare classes, an unknown class is an error -- the reward rail
-    would otherwise silently drop it and the loop would credit on the substring
-    fallback, exactly the infer-from-strings failure this work removes.
+    loop DOES declare classes:
+
+    * an unknown class is an error -- the reward rail would otherwise silently
+      drop it and the loop would credit on the substring fallback, exactly the
+      infer-from-strings failure this work removes.
+    * FIX 7(a) coverage: once a loop opts in, the reward rail is governed ONLY by
+      the declared map (no substring fallback), so a loop that opts in but
+      declares NO ``win`` class can NEVER earn the conversion reward for its real
+      win (silent zero-credit). Require at least one declared ``win`` when the
+      loop opts in, and warn when a declared terminal_state has no class (a
+      partial map leaves the unlisted state crediting nothing).
     """
-    for state, raw in _iter_declared_loop_terminal_classes(loop):
+    declared: list[tuple[str, Any]] = list(_iter_declared_loop_terminal_classes(loop))
+    if not declared:
+        return  # did not opt in -> legacy path, unaffected
+    has_win = False
+    classed_states: set[str] = set()
+    for state, raw in declared:
         canon = str(raw or "").strip().lower()
+        classed_states.add(str(state or "").strip().lower())
+        if canon == "win":
+            has_win = True
         if canon not in TERMINAL_OUTCOME_CLASSES:
             report.errors.append(
                 f"event loop '{name}' terminal state '{state}' declares unknown "
                 f"outcome class {raw!r} -- must be one of {sorted(TERMINAL_OUTCOME_CLASSES)}; "
                 f"an untyped class is silently dropped and the loop credits on the "
                 f"substring fallback instead of the declared win."
+            )
+    # FIX 7(a): an opted-in loop with no declared 'win' can never credit a
+    # conversion -- surface it as an error so the silent zero-credit is caught.
+    if not has_win:
+        report.errors.append(
+            f"event loop '{name}' declares terminal_classes but NONE is a 'win' -- "
+            f"an opted-in loop credits a conversion ONLY from a declared 'win' "
+            f"(no substring fallback), so it would earn zero conversion reward "
+            f"forever. Declare the loop's win terminal as class 'win'."
+        )
+    # FIX 7(a) coverage: a declared terminal_state with no class in a
+    # partially-declared map silently credits nothing (the legacy fallback is
+    # bypassed once the loop opts in). Warn so the gap surfaces.
+    for ts in _as_list(loop.get("terminal_states")):
+        if isinstance(ts, str):
+            key = ts.strip().lower()
+            if key and key not in classed_states:
+                report.warnings.append(
+                    f"event loop '{name}' declares terminal_classes but terminal "
+                    f"state '{ts}' has no declared class -- once a loop opts in, an "
+                    f"unclassed terminal credits nothing (the legacy substring "
+                    f"fallback is bypassed)."
+                )
+
+
+#: The EXACT loop keys the runtime reads for each opt-in safety control (FIX
+#: 7d). A near-miss key (a typo) is silently inert -- the operator believes
+#: protection is on while the board runs unprotected -- so a near-miss surfaces
+#: as a warning at intake. Mirrors kanban_reactive_runtime.loop_max_defers /
+#: loop_max_nudges so the recognized set is the single source of truth.
+_RECOGNIZED_MAX_DEFERS_KEYS: frozenset[str] = frozenset(
+    {"max_defers", "max_deferrals", "max_defer"}
+)
+_RECOGNIZED_MAX_NUDGES_KEYS: frozenset[str] = frozenset(
+    {"max_nudges", "max_follow_ups", "max_followups", "max_retries"}
+)
+
+
+def _near_miss(key: str, recognized: frozenset[str]) -> Optional[str]:
+    """Return the recognized key a near-miss ``key`` most likely meant, else None.
+
+    A "near miss" is an UNRECOGNIZED key that is a small edit away from a
+    recognized one (a shared prefix or a one/two character difference). Used to
+    surface a typo'd safety opt-in (``strict_mode`` for ``strict``,
+    ``max_deferals`` for ``max_defers``) instead of leaving it silently inert.
+    """
+    k = key.strip().lower()
+    if not k or k in recognized:
+        return None
+    for r in recognized:
+        # Shared meaningful prefix (max_defer... / strict...) or a tiny edit
+        # distance: a near-miss the operator almost certainly intended.
+        if k.startswith(r[:6]) or r.startswith(k[:6]) or abs(len(k) - len(r)) <= 2 and (
+            k.replace("_", "") in r.replace("_", "") or r.replace("_", "") in k.replace("_", "")
+        ):
+            return r
+    return None
+
+
+def _check_safety_optin_keys(
+    name: str, loop: dict[str, Any], report: InvariantReport
+) -> None:
+    """FIX 7(d): warn on a typo'd opt-in SAFETY key so it is not silently inert.
+
+    The runtime reads EXACT keys (``max_defers``/aliases for the anti-zombie
+    bound). A near-miss key (``max_deferals`` with one 'r') is ignored, leaving
+    the board on the legacy fall-through with no error -- the operator believes
+    a cap is set while it is fully inert. Surface the near-miss at intake.
+    """
+    for key in loop.keys():
+        if not isinstance(key, str):
+            continue
+        if key in _RECOGNIZED_MAX_DEFERS_KEYS or key in _RECOGNIZED_MAX_NUDGES_KEYS:
+            continue
+        meant = _near_miss(key, _RECOGNIZED_MAX_DEFERS_KEYS)
+        if meant:
+            report.warnings.append(
+                f"event loop '{name}' declares {key!r} which looks like a typo of "
+                f"the anti-zombie bound {meant!r} -- the runtime reads only the exact "
+                f"key, so this defer cap is silently inert. Did you mean {meant!r}?"
+            )
+            continue
+        meant = _near_miss(key, _RECOGNIZED_MAX_NUDGES_KEYS)
+        if meant:
+            report.warnings.append(
+                f"event loop '{name}' declares {key!r} which looks like a typo of the "
+                f"nudge cap {meant!r} -- the runtime reads only the exact key, so this "
+                f"cap is silently inert. Did you mean {meant!r}?"
+            )
+
+
+def _check_loop_bound_values(
+    name: str, loop: dict[str, Any], report: InvariantReport
+) -> None:
+    """FIX 6 intake: a DECLARED but malformed defer/nudge bound must surface.
+
+    ``max_defers: .inf`` / ``.nan`` (a legal YAML float) used to silently drop
+    the whole loop at compile (``int(float('inf'))`` raised, the per-loop compile
+    swallowed it, the board activated with 0 schedules). ``_coerce_int`` now
+    guards non-finite floats, so the loop still compiles -- but a malformed bound
+    is still a bug, so flag it at intake instead of silently ignoring it.
+    """
+    import math as _math
+
+    def _flag_if_bad(keys: frozenset[str], label: str) -> None:
+        for key in keys:
+            if key not in loop:
+                continue
+            val = loop.get(key)
+            bad = False
+            if isinstance(val, bool):
+                bad = True
+            elif isinstance(val, float) and not _math.isfinite(val):
+                bad = True
+            elif isinstance(val, (int, float)):
+                bad = val < 0
+            elif isinstance(val, str):
+                bad = not val.strip().lstrip("-").isdigit()
+            else:
+                bad = val is not None
+            if bad:
+                report.errors.append(
+                    f"event loop '{name}' declares {label} {key}={val!r} which is not "
+                    f"a usable non-negative integer bound -- a malformed bound is "
+                    f"silently dropped at runtime, leaving the loop unbounded."
+                )
+
+    _flag_if_bad(_RECOGNIZED_MAX_DEFERS_KEYS, "defer bound")
+    _flag_if_bad(_RECOGNIZED_MAX_NUDGES_KEYS, "nudge cap")
+
+
+def _check_side_effect_policy_keys(
+    root: dict[str, Any], report: InvariantReport
+) -> None:
+    """FIX 7(d): warn on a typo'd ``side_effect_policy.strict`` opt-in.
+
+    ``_side_effect_strict_enabled`` reads EXACTLY ``policy['strict']``. A
+    near-miss key (``strict_mode``) is silently ignored, leaving DEFAULT-DENY
+    enforcement off while the operator believes it is on. Surface the near-miss.
+    """
+    policy = _as_dict(root.get("side_effect_policy"))
+    _RECOGNIZED_POLICY_KEYS = frozenset(
+        {"strict", "allowed", "forbidden", "approval_required"}
+    )
+    for key in policy.keys():
+        if not isinstance(key, str) or key in _RECOGNIZED_POLICY_KEYS:
+            continue
+        if _near_miss(key, frozenset({"strict"})):
+            report.warnings.append(
+                f"side_effect_policy declares {key!r} which looks like a typo of the "
+                f"DEFAULT-DENY opt-in 'strict' -- the runtime reads only 'strict', so "
+                f"strict enforcement is silently inert. Did you mean 'strict'?"
             )
 
 
@@ -353,6 +531,10 @@ def _check_event_loops(root: dict[str, Any], report: InvariantReport) -> None:
         # otherwise be silently dropped and the loop would fall back to the
         # substring reward path -- so it must surface at intake, not run blind.
         _check_loop_terminal_classes(name, loop, report)
+        # FIX 6 / FIX 7(d): a malformed defer/nudge bound, or a typo'd opt-in
+        # safety key, must surface at intake instead of silently going inert.
+        _check_loop_bound_values(name, loop, report)
+        _check_safety_optin_keys(name, loop, report)
         if _grammar_has_inbound(triggers):
             if not _grammar_has_timer(triggers):
                 report.errors.append(
@@ -553,6 +735,24 @@ def _check_side_effect_classes(root: dict[str, Any], report: InvariantReport) ->
     for where, raw in _iter_declared_side_effect_classes(root):
         checked += 1
         canon = _grammar_normalize_side_effect(raw)
+        # FIX 7(c): a side_effect_class that NORMALIZES AWAY to NULL at
+        # persistence (a sentinel string: ''/whitespace/'null'/'-', but NOT the
+        # benign literal 'none') is silently downgraded to the no-side-effect
+        # 'none' at runtime -- so an author who meant a real side effect gets an
+        # ungoverned, never-deferred loop. Reject it at intake so the authorial
+        # intent is not silently dropped. ('none' is the explicit benign value
+        # and is handled below.)
+        if isinstance(raw, str):
+            sentinel = raw.strip().lower()
+            if sentinel in {"", "null", "-"}:
+                report.errors.append(
+                    f"{where} declares side_effect_class {raw!r} which normalizes "
+                    f"away to NULL at persistence -- it would be silently treated as "
+                    f"the no-side-effect 'none'. Declare an explicit class from "
+                    f"{sorted(SIDE_EFFECT_CLASSES)} (use 'none' if there is truly no "
+                    f"side effect)."
+                )
+                continue
         if not _grammar_is_known_side_effect(raw):
             report.errors.append(
                 f"{where} declares unknown side_effect_class {raw!r} -- must be one of "
@@ -913,6 +1113,7 @@ def check_contract_invariants(contract: Any) -> InvariantReport:
     _check_event_loops(root, report)
     _check_tunables(root, report)
     _check_side_effect_classes(root, report)
+    _check_side_effect_policy_keys(root, report)
     _check_timer_cadence(root, report)
     _check_irreversible_gating(root, report)
     _check_knob_references(root, report)

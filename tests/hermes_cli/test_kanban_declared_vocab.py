@@ -1,23 +1,31 @@
-"""Step 9 regression tests: DECLARED CLOSED VOCABULARIES on the safety paths.
+"""Step 9 regression tests (reworked): DECLARED CLOSED VOCABULARIES, fail-closed.
 
-These prove the three declared-vocabulary hardenings drive the REAL seams
-(``reactive_tick`` / ``_close_timer_schedule`` / the launch invariant checker),
-not the shape of the change, and that every new strict behavior is OPT-IN so an
-undeclared/legacy contract is byte-identical to today (merge-gate Sec.2/3/4).
+These prove the Step-9 hardenings drive the REAL seams, not the shape of the
+change, and that every new strict behavior is OPT-IN so an undeclared/legacy
+contract is BYTE-IDENTICAL to base 019271994 (merge-gate Sec.2/3/4).
 
-Each test is written so that reverting the feature makes it FAIL (mutation
+Two families of seam are exercised here:
+
+* the runtime reward/gate seams (``reactive_tick`` / ``_close_timer_schedule``),
+  driven through the real launch -> compile -> tick pipeline with the reused
+  ``_contract`` / ``_approve`` / ``fresh_home`` fixtures (no monkeypatching of
+  the functions under test); and
+* the intake invariant checker
+  (``kanban_launch_invariants.check_contract_invariants``), driven directly so
+  the 9(b) terminal-class invariant and the FIX-7 coverage checks are asserted
+  at the EFFECT level (``ok`` / the error/warning text), not just emitted. (The
+  PRIOR version of this file falsely claimed in its docstring to drive the
+  launch invariant checker while only importing ``kanban_db`` -- the invariant
+  had ZERO coverage. That gap is closed by the ``test_invariant_*`` cases.)
+
+Each test is written so that reverting the feature makes it FAIL (the mutation
 check): the assertions are on the observable gate decision (fired / deferred /
-stopped) and on the reward credited through the optimizer ledger, with the
-opt-in and the legacy path asserted side-by-side.
-
-The contract / approve / fresh_home fixtures are reused from
-``test_kanban_reactive_runtime`` so these tests exercise the same real launch ->
-compile -> tick pipeline (no monkeypatching of the functions under test).
+stopped), the reward credited through the optimizer ledger, or the invariant
+``ok``/error, with the opt-in and the legacy path asserted side-by-side.
 """
 
 from __future__ import annotations
 
-import copy
 import json
 import sys
 from pathlib import Path
@@ -29,6 +37,9 @@ if str(_WORKTREE) not in sys.path:
     sys.path.insert(0, str(_WORKTREE))
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_launch_grammar as grammar
+from hermes_cli import kanban_launch_invariants as inv
+from hermes_cli import kanban_reactive_runtime as rt
 
 from tests.hermes_cli.test_kanban_reactive_runtime import (  # noqa: E402
     _approve,
@@ -296,24 +307,39 @@ def test_9b_declared_loop_credits_only_declared_win_terminal(
 @pytest.mark.parametrize(
     "outcome,expected_conversion",
     [
-        ("closed_won", True),     # legacy: contains 'won', not a loss -> credits
-        ("won", True),            # legacy: a bare 'won' still credits (no regression)
-        ("closed_lost", False),   # legacy: no 'won' substring -> no credit (unchanged)
-        ("won_but_lost", False),  # THE FIX: embeds 'won' but is a loss -> no credit
+        ("closed_won", True),       # legacy: contains 'won' -> credits (base)
+        ("won", True),              # legacy: a bare 'won' credits (base)
+        ("closed_lost", False),     # legacy: no 'won' substring -> no credit (base)
+        # FIX 1 (byte-identity to base 019271994): the LEGACY 'won'-substring
+        # shortcut is UNCONDITIONAL. A loss terminal that embeds 'won'
+        # (``won_but_lost``) STILL credits on the legacy path -- exactly as base
+        # did. The PRIOR Step-9 made this 0.0 via an un-opted-in loss denylist,
+        # which ALSO flipped genuine win-backs (won_back_from_churn) to 0.0; that
+        # was the critical default-off regression. Loss-suppression now lives
+        # ONLY in the DECLARED path (see test below).
+        ("won_but_lost", True),
+        # The win-backs the regression wrongly denied: all credit on legacy (base).
+        ("won_back_from_churn", True),
+        ("renewal_after_cancellation_won", True),
+        ("reactivated_expired_subscriber_won", True),
     ],
 )
-def test_9b_legacy_loop_corrected_substring_reward(
+def test_9b_legacy_loop_is_byte_identical_to_base(
     fresh_home, outcome, expected_conversion
 ):
-    """LEGACY loop (no declared classes): the corrected 'won'-substring reward.
+    """LEGACY loop (no declared classes): the 'won'-substring shortcut is
+    UNCONDITIONAL and byte-identical to base 019271994.
 
-    closed_won and a bare 'won' still credit (no legit-win regression);
-    closed_lost still does not; and won_but_lost -- which embeds 'won' but is a
-    loss -- NO LONGER credits (the G6 loss-denylist correction).
-
-    Mutation check: revert the loss-aware routing and ``won_but_lost`` returns to
-    crediting 1.0 (the original bug), failing its False row.
+    Mutation check: re-introduce the un-opted-in loss denylist on the legacy
+    branch (``and not _outcome_is_loss_token(outcome)``) and ``won_but_lost`` /
+    ``won_back_from_churn`` / ``renewal_after_cancellation_won`` /
+    ``reactivated_expired_subscriber_won`` flip to 0.0 -- the exact critical
+    default-off regression -- failing their True rows here.
     """
+    states = [
+        "won", "closed_won", "closed_lost", "won_but_lost", "won_back_from_churn",
+        "renewal_after_cancellation_won", "reactivated_expired_subscriber_won",
+    ]
     _approve(
         "serious",
         _contract(
@@ -326,7 +352,7 @@ def test_9b_legacy_loop_corrected_substring_reward(
                         {"kind": "timer", "detail": "nudge seller", "cadence_hours": 72},
                         {"kind": "inbound", "detail": "seller replies", "channel": "infobip"},
                     ],
-                    "terminal_states": ["won", "closed_won", "closed_lost", "won_but_lost"],
+                    "terminal_states": states,
                     "max_nudges": 2,
                 }
             ],
@@ -334,10 +360,99 @@ def test_9b_legacy_loop_corrected_substring_reward(
                 {
                     "key": "conversation_thread",
                     "type": "conversation",
-                    "states": ["open", "won", "closed_won", "closed_lost", "won_but_lost"],
-                    "terminal_states": ["won", "closed_won", "closed_lost", "won_but_lost"],
+                    "states": ["open"] + states,
+                    "terminal_states": states,
                 }
             ],
+        ),
+    )
+    with kb.connect(board="serious") as conn:
+        outcomes = _resolve_and_close(conn, outcome)
+        assert _credited(outcomes) is expected_conversion
+
+
+def test_fix1_legacy_path_byte_identical_to_base_unit():
+    """FIX 1 unit proof: ``_terminal_outcome_is_conversion`` on the LEGACY path
+    (``declared_terminal_classes`` None/empty) is byte-identical to base
+    019271994, whose legacy branch was literally ``if "won" in outcome: return
+    True`` (unconditional, run before the declared_terminal_states loop).
+
+    Mutation check: any loss-denylist gate on the legacy branch makes a
+    'won'-embedding loss/win-back outcome diverge from base, failing here.
+    """
+
+    def base_conversion(outcome, states):
+        # Reconstructed base behavior (git show 019271994:hermes_cli/kanban_db.py).
+        if not outcome:
+            return False
+        o = str(outcome).strip().lower()
+        if not o:
+            return False
+        if "won" in o:                      # base path (b): UNCONDITIONAL
+            return True
+        loss = (
+            "lost", "loss", "closed_lost", "unsigned", "incomplete",
+            "not_completed", "not_complete", "disapprov", "disqualif",
+            "reject", "declin", "cancel", "abandon", "churn", "expired",
+            "dead", "failed", "fail", "withdrawn", "bounced",
+        )
+        for d in states or []:
+            dd = str(d).strip().lower()
+            if dd == o and not any(t in dd for t in loss) and "won" in dd:
+                return True
+        return False
+
+    probes = [
+        "won", "closed_won", "closed_lost", "won_but_lost", "won_lost",
+        "won_then_lost", "won_then_cancelled", "deal_won_but_churned",
+        "won_account_expired", "won_back_from_churn",
+        "renewal_after_cancellation_won", "reactivated_expired_subscriber_won",
+        "won_unexpired", "won_deadline_beat", "won_over_to_competitor",
+        "unwon", "wonky", "renewal_won", "arbitrary", "", None,
+    ]
+    state_variants = [[], ["won", "lost"], ["closed_won", "closed_lost"]]
+    for o in probes:
+        for st in state_variants:
+            base = base_conversion(o, st)
+            assert kb._terminal_outcome_is_conversion(o, st, None) is base, (o, st)
+            assert kb._terminal_outcome_is_conversion(o, st, {}) is base, (o, st)
+
+
+@pytest.mark.parametrize(
+    "outcome,expected_conversion",
+    [
+        ("closed_won", True),    # declared 'win' credits
+        ("won_but_lost", False),  # DECLARED 'loss' -> never credits (loss-aware HERE)
+        ("won_back_from_churn", False),  # declared 'loss' -> never credits
+        ("renewal_after_cancellation_won", True),  # declared 'win' -> credits
+    ],
+)
+def test_declared_path_is_where_loss_awareness_lives(
+    fresh_home, outcome, expected_conversion
+):
+    """Loss-suppression for a 'won'-embedding terminal lives ONLY in the DECLARED
+    path now -- a board OPTS IN via ``terminal_classes`` (closed vocabulary),
+    where the decision is the declared class, never a free-text substring
+    denylist. ``won_but_lost`` declared 'loss' does not credit;
+    ``renewal_after_cancellation_won`` declared 'win' DOES (no substring denylist
+    wrongly suppresses it).
+
+    Mutation check: revert 9(b) declared path and the decision falls back to the
+    legacy substring shortcut, crediting ``won_but_lost`` (fails its False row).
+    """
+    _approve(
+        "serious",
+        _declared_class_contract(
+            terminal_states=[
+                "closed_won", "won_but_lost", "won_back_from_churn",
+                "renewal_after_cancellation_won",
+            ],
+            terminal_classes={
+                "closed_won": "win",
+                "won_but_lost": "loss",
+                "won_back_from_churn": "loss",
+                "renewal_after_cancellation_won": "win",
+            },
         ),
     )
     with kb.connect(board="serious") as conn:
@@ -515,3 +630,632 @@ def test_live_ninaxfinds_contract_has_no_optin_declarations():
     assert _walk_find(bc, "max_defers") == [], "no declared defer bound"
     # And it declares no event_loops at all, so there is nothing to fire/defer.
     assert not bc.get("event_loops")
+
+
+# ===========================================================================
+# FIX 2: strict = allowlist-of-SAFE (not allowlist-of-recognized). A RECOGNIZED
+# external-family class with no satisfied approval gate must DEFER under strict.
+# ===========================================================================
+
+
+@pytest.mark.parametrize("dangerous", ["external_irreversible", "financial"])
+def test_fix2_strict_defers_recognized_external_without_gate(fresh_home, dangerous):
+    """strict + a correctly-spelled EXTERNAL-family class + approval_required=[]
+    + no covering gate -> DEFERS (fail-closed). Previously this FIRED ungated
+    (byte-identical to legacy): strict was allowlist-of-recognized, giving ZERO
+    protection for the two most dangerous classes a board forgot to gate.
+
+    Mutation check: drop the ``strict_external`` branch in reactive_tick and the
+    recognized-dangerous class fires -> ``fired`` non-empty, failing here.
+    """
+    contract = _strict_contract(dangerous, strict=True)
+    contract["side_effect_policy"]["approval_required"] = []  # explicitly empty
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
+        assert res["fired"] == [], f"{dangerous} must NOT fire ungated under strict"
+        assert res["deferred"] == [
+            {"loop_key": "seller_follow_up", "reason": "approval_required"}
+        ]
+
+
+@pytest.mark.parametrize("safe", ["none", "internal"])
+def test_fix2_strict_fires_safe_class(fresh_home, safe):
+    """strict + a SAFE class (none / internal) -> FIRES freely. The allowlist of
+    classes that fire under strict is exactly {none, internal}."""
+    _approve("serious", _strict_contract(safe, strict=True))
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
+        assert res["fired"] == [{"loop_key": "seller_follow_up", "nudge": 1}]
+        assert res["deferred"] == []
+
+
+def test_fix2_strict_external_with_satisfied_gate_fires(fresh_home):
+    """strict + external_irreversible COVERED by an approval gate -> defers until
+    approved, then FIRES (per the gate). Confirms the external-family deferral is
+    approval-required-by-default, not an unconditional block."""
+    contract = _strict_contract("external_irreversible", strict=True)
+    contract["approval_gates"] = [
+        {"key": "owner_irrev_approval", "required_before": ["external_irreversible"]}
+    ]
+    contract["side_effect_policy"]["approval_required"] = ["external_irreversible"]
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        base = int(row["next_fire_at"])
+        res = kb.reactive_tick(conn, now=base, board="serious")
+        assert res["fired"] == [] and res["deferred"], "must defer before approval"
+        kb.record_contract_approval(
+            conn, gate_key="owner_irrev_approval",
+            entity_ref=row["task_id"], approved_by="owner", board="serious",
+        )
+        res2 = kb.reactive_tick(
+            conn, now=base + int(row["cadence_seconds"]), board="serious"
+        )
+        assert res2["fired"] == [{"loop_key": "seller_follow_up", "nudge": 1}]
+
+
+def test_fix2_legacy_external_fires_byte_identical(fresh_home):
+    """NO strict + external_irreversible + approval_required=[] -> FIRES (legacy,
+    byte-identical). The default-off proof for FIX 2: the ONLY difference from
+    the strict test above is the absence of ``side_effect_policy.strict``."""
+    contract = _strict_contract("external_irreversible", strict=False)
+    contract["side_effect_policy"]["approval_required"] = []
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
+        assert res["fired"] == [{"loop_key": "seller_follow_up", "nudge": 1}]
+        assert res["deferred"] == []
+
+
+# ===========================================================================
+# FIX 3: case canonicalization at persistence -- recognition + the
+# case-sensitive forbidden/approval_required checks share ONE vocabulary.
+# ===========================================================================
+
+
+def test_fix3_capitalized_class_persists_lowercase_and_forbidden_catches_it(fresh_home):
+    """A loop declaring ``External_Irreversible`` persists CANONICAL lowercase,
+    so a lower-case ``forbidden`` entry now catches it (stops the loop) instead
+    of the class slipping the case-sensitive set yet reading as recognized.
+
+    Mutation check: revert FIX 3 (persist verbatim case) and the persisted class
+    is 'External_Irreversible', the forbidden membership misses it, and under
+    strict it FIRES ungated -- failing the stop assertion here.
+    """
+    contract = _strict_contract("External_Irreversible", strict=True)
+    contract["side_effect_policy"]["forbidden"] = ["external_irreversible"]
+    contract["side_effect_policy"]["approval_required"] = ["external_irreversible"]
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        assert row["side_effect_class"] == "external_irreversible", (
+            "FIX 3: side_effect_class must persist canonical lowercase"
+        )
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
+        assert res["fired"] == [], "a forbidden class must NOT fire"
+        assert res["stopped"] == [
+            {"loop_key": "seller_follow_up", "reason": "side_effect_forbidden"}
+        ]
+
+
+# ===========================================================================
+# FIX 5: corrupt-column FAIL-CLOSED (a present-but-broken declaration is NOT the
+# same as no declaration).
+# ===========================================================================
+
+
+def test_fix5_corrupt_terminal_classes_fails_closed(fresh_home):
+    """A loop OPTS IN with ``terminal_classes`` (a 'won'-embedding terminal
+    declared NEUTRAL), then the column is corrupted. The reward rail must fail
+    CLOSED -- credit 0.0 (non-conversion) and emit a loud error signal -- NOT
+    silently fall back to the substring guess and credit 1.0.
+
+    Mutation check: revert FIX 5 (corrupt -> {} -> 'never opted in') and the
+    declared-NEUTRAL terminal credits 1.0 via the substring fallback, failing the
+    no-conversion assertion.
+    """
+    _approve(
+        "serious",
+        _declared_class_contract(
+            terminal_states=["won_pending_neutral", "closed_lost"],
+            terminal_classes={"won_pending_neutral": "neutral", "closed_lost": "loss"},
+        ),
+    )
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE reactive_timer_schedules SET terminal_classes = ? WHERE id = ?",
+                ("{not valid json", int(row["id"])),
+            )
+        outcomes = _resolve_and_close(conn, "won_pending_neutral")
+        assert not _credited(outcomes), (
+            "corrupt terminal_classes must fail CLOSED (no conversion credit)"
+        )
+        errs = conn.execute(
+            "SELECT COUNT(*) AS n FROM board_signals WHERE board = ? AND "
+            "primitive_kind = 'dispatch_blocked' AND reward_kind = 'error'",
+            ("serious",),
+        ).fetchone()
+        assert int(errs["n"]) >= 1, "a corrupt declaration must emit a loud error signal"
+
+
+def test_fix5_corrupt_max_defers_fails_closed_not_unbounded(fresh_home):
+    """A loop declares ``max_defers=1`` then the column is corrupted. The defer
+    path must fail CLOSED -- terminate -- NOT silently revert to unbounded
+    (defer forever).
+
+    Mutation check: revert FIX 5 (corrupt -> None -> unbounded) and the loop
+    never terminates across many ticks, failing the termination assertion.
+    """
+    _approve("serious", _deferring_contract(max_defers=1))
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE reactive_timer_schedules SET max_defers = ? WHERE id = ?",
+                ("garbage", int(row["id"])),
+            )
+        cadence = int(row["cadence_seconds"])
+        t = int(row["next_fire_at"])
+        terminated = False
+        for _ in range(8):
+            kb.reactive_tick(conn, now=t, board="serious")
+            if int(_schedule_row(conn)["active"]) == 0:
+                terminated = True
+                break
+            t += cadence
+        assert terminated, "corrupt max_defers must fail CLOSED (terminate), not defer forever"
+        assert _schedule_row(conn)["stop_reason"] == "deferral_exhausted"
+
+
+def test_fix5_null_terminal_classes_is_still_legacy(fresh_home):
+    """A NULL terminal_classes (no opt-in) is NOT corrupt -- it stays on the
+    byte-identical legacy substring path. This pins the NULL-vs-broken
+    distinction: only a NON-NULL unparseable column fails closed."""
+    _approve("serious", _contract())  # legacy loop, terminal_classes NULL
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        assert row["terminal_classes"] is None
+        # legacy 'won' credits unconditionally (byte-identical)
+        outcomes = _resolve_and_close(conn, "won")
+        assert _credited(outcomes)
+
+
+# ===========================================================================
+# FIX 6: _coerce_int non-finite guard + intake surfacing of a malformed bound.
+# ===========================================================================
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+def test_fix6_coerce_int_guards_non_finite(bad):
+    """``_coerce_int`` returns None for a non-finite float instead of raising
+    (which crashed the per-loop compile and silently dropped the schedule)."""
+    assert rt._coerce_int(bad) is None
+    assert rt.loop_max_defers({"max_defers": bad}) is None
+    assert rt.loop_max_nudges({"max_nudges": bad}) is None
+    # A finite value still coerces.
+    assert rt._coerce_int(3.0) == 3
+    assert rt.loop_max_defers({"max_defers": 2}) == 2
+
+
+def test_fix6_inf_max_defers_does_not_silently_drop_loop(fresh_home):
+    """A loop with ``max_defers: .inf`` must NOT silently vanish: the board
+    compiles a real timer schedule (the loop is not dropped), and intake flags
+    the malformed bound.
+
+    Mutation check: revert the isfinite guard and the per-loop compile raises,
+    the schedule is swallowed, and 0 rows exist -- failing the row-count here.
+    """
+    loop = {
+        "key": "seller_follow_up",
+        "type": "seller_follow_up",
+        "entity": "conversation_thread",
+        "triggers": [{"kind": "timer", "detail": "x", "cadence_hours": 72}],
+        "terminal_states": ["won", "lost"],
+        "max_nudges": 5,
+        "max_defers": float("inf"),
+    }
+    contract = _contract(event_loops=[loop])
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        rows = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchall()
+        assert len(rows) == 1, "the loop must still compile (not silently dropped)"
+        # Inf is not a usable bound -> unbounded at runtime (None), byte-identical
+        # to a legacy unbounded loop.
+        assert rows[0]["max_defers"] is None
+    # Intake flags the malformed bound (FIX 6 surfacing).
+    report = inv.check_contract_invariants(contract)
+    assert any("max_defers" in e and "non-negative integer bound" in e
+               for e in report.errors), "intake must flag max_defers=.inf"
+
+
+# ===========================================================================
+# FIX 7: additive intake coverage checks (effect-level, via the real checker).
+# ===========================================================================
+
+
+def _invariant_loop(**extra):
+    loop = {
+        "entity": "conversation_thread",
+        "type": "seller",
+        "triggers": [
+            {"kind": "timer", "cadence_hours": 72},
+            {"kind": "inbound", "channel": "x"},
+        ],
+        "terminal_states": ["closed_won", "closed_lost"],
+        "max_nudges": 2,
+    }
+    loop.update(extra)
+    return loop
+
+
+def _invariant_contract(loop=None, policy=None):
+    return {
+        "objective": {"statement": "x"},
+        "runtime": {"tunables": {"k": {"default": 1, "min": 0, "max": 5}}},
+        "event_loops": [loop if loop is not None else _invariant_loop()],
+        "entities": [
+            {
+                "key": "conversation_thread",
+                "type": "conversation",
+                "terminal_states": ["closed_won", "closed_lost"],
+            }
+        ],
+        "side_effect_policy": policy if policy is not None else {"allowed": ["none"]},
+    }
+
+
+def test_fix7a_optin_without_win_is_error():
+    """FIX 7(a): an opted-in loop whose declared map has NO 'win' class can never
+    credit a conversion -> hard error at intake."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(_invariant_loop(terminal_classes={"closed_lost": "loss"}))
+    )
+    assert report.ok is False
+    assert any("NONE is a 'win'" in e for e in report.errors)
+
+
+def test_fix7a_optin_with_win_is_ok():
+    """FIX 7(a): an opted-in loop WITH a declared 'win' passes (no no-win error)."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(terminal_classes={"closed_won": "win", "closed_lost": "loss"})
+        )
+    )
+    assert report.ok is True
+    assert not any("NONE is a 'win'" in e for e in report.errors)
+
+
+def test_fix7a_partial_map_warns_on_unclassed_terminal():
+    """FIX 7(a) coverage: a declared terminal_state with no class warns (it
+    silently credits nothing once the loop opts in)."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(
+                terminal_states=["closed_won", "closed_lost"],
+                terminal_classes={"closed_won": "win"},
+            )
+        )
+    )
+    assert any("has no declared class" in w for w in report.warnings)
+
+
+def test_fix7b_shape1_inline_none_class_is_flagged():
+    """FIX 7(b): shape-1 inline ``{state, class: None}`` is flagged as unknown,
+    mirroring shape-2 (previously silently dropped)."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(
+                terminal_states=[
+                    {"state": "closed_won", "class": "win"},
+                    {"state": "closed_lost", "class": None},
+                ]
+            )
+        )
+    )
+    assert report.ok is False
+    assert any("closed_lost" in e and "unknown" in e for e in report.errors)
+
+
+def test_fix7c_side_effect_class_normalizing_to_null_is_rejected():
+    """FIX 7(c): a declared side_effect_class that normalizes away ('null') is
+    rejected so authorial intent is not silently downgraded to 'none'."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(
+                side_effect_class="null",
+                terminal_classes={"closed_won": "win", "closed_lost": "loss"},
+            )
+        )
+    )
+    assert report.ok is False
+    assert any("normalizes" in e for e in report.errors)
+
+
+def test_fix7d_near_miss_max_defers_key_warns():
+    """FIX 7(d): a typo'd ``max_deferals`` key warns (silently inert otherwise)."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(
+                terminal_classes={"closed_won": "win", "closed_lost": "loss"},
+                max_deferals=2,
+            )
+        )
+    )
+    assert any("typo" in w and "inert" in w for w in report.warnings)
+
+
+def test_fix7d_near_miss_strict_policy_key_warns():
+    """FIX 7(d): a typo'd ``strict_mode`` policy key warns (strict silently off)."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(
+                terminal_classes={"closed_won": "win", "closed_lost": "loss"}
+            ),
+            policy={"allowed": ["none"], "strict_mode": True},
+        )
+    )
+    assert any("strict" in w and "typo" in w for w in report.warnings)
+
+
+def test_fix7d_exact_keys_do_not_warn():
+    """FIX 7(d): the EXACT recognized keys must NOT trigger a near-miss warning."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(
+                terminal_classes={"closed_won": "win", "closed_lost": "loss"},
+                max_defers=2,
+            ),
+            policy={"allowed": ["none"], "strict": True},
+        )
+    )
+    assert not any("typo" in w for w in report.warnings)
+
+
+# ===========================================================================
+# FIX 8: test gaps -- effect-level intake invariant, shape-1 at both layers, the
+# grammar API helpers, the crash-time fail-closed contract, max_defers=0/aliases.
+# ===========================================================================
+
+
+def test_invariant_unknown_terminal_class_is_blocking_error():
+    """9(b) EFFECT-level: a loop declaring an out-of-vocab terminal class makes
+    ``check_contract_invariants`` return ok=False with the unknown-class error.
+
+    Mutation check: replace the ``_check_loop_terminal_classes`` call site with
+    ``pass`` and this test fails (the prior suite left it at 0 coverage)."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(
+                terminal_classes={"closed_won": "victory", "closed_lost": "loss"}
+            )
+        )
+    )
+    assert report.ok is False
+    assert any("unknown" in e and "victory" in e for e in report.errors)
+
+
+def test_invariant_no_declared_classes_is_ok_default_off():
+    """9(b) default-off: a loop with NO declared terminal classes is unaffected
+    by the terminal-class invariant (ok stays True for that check)."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(_invariant_loop())  # no terminal_classes
+    )
+    # No terminal-class error at all (the loop did not opt in).
+    assert not any("outcome class" in e for e in report.errors)
+    assert not any("NONE is a 'win'" in e for e in report.errors)
+
+
+def test_invariant_shape1_unknown_class_is_blocking_error():
+    """9(b) shape-1: a {state, class} object-list declaration with an out-of-vocab
+    class is also flagged (shape-1 parsing at the intake layer)."""
+    report = inv.check_contract_invariants(
+        _invariant_contract(
+            _invariant_loop(
+                terminal_states=[
+                    {"state": "closed_won", "class": "win"},
+                    {"state": "closed_lost", "class": "looss"},
+                ]
+            )
+        )
+    )
+    assert report.ok is False
+    assert any("looss" in e and "unknown" in e for e in report.errors)
+
+
+def test_reward_rail_shape1_declaration_credits_only_declared_win(fresh_home):
+    """9(b) shape-1 at the REWARD rail: a loop declaring its classes as a
+    {state, class} object list credits ONLY the declared 'win' (exact match)."""
+    contract = _contract(
+        event_loops=[
+            {
+                "key": "seller_follow_up",
+                "type": "seller_follow_up",
+                "entity": "conversation_thread",
+                "triggers": [
+                    {"kind": "timer", "detail": "x", "cadence_hours": 72},
+                    {"kind": "inbound", "detail": "y", "channel": "infobip"},
+                ],
+                "terminal_states": [
+                    {"state": "closed_won", "class": "win"},
+                    {"state": "closed_lost", "class": "loss"},
+                ],
+                "max_nudges": 2,
+            }
+        ],
+        entities=[
+            {
+                "key": "conversation_thread",
+                "type": "conversation",
+                "states": ["open", "closed_won", "closed_lost"],
+                "terminal_states": ["closed_won", "closed_lost"],
+            }
+        ],
+    )
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        # The shape-1 declaration was compiled into the persisted class map.
+        assert json.loads(row["terminal_classes"]) == {
+            "closed_won": "win", "closed_lost": "loss",
+        }
+        assert _credited(_resolve_and_close(conn, "closed_won")) is True
+
+
+def test_reward_rail_shape1_credits_loss_terminal_never(fresh_home):
+    """9(b) shape-1: the declared 'loss' terminal never credits."""
+    contract = _contract(
+        event_loops=[
+            {
+                "key": "seller_follow_up",
+                "type": "seller_follow_up",
+                "entity": "conversation_thread",
+                "triggers": [
+                    {"kind": "timer", "detail": "x", "cadence_hours": 72},
+                    {"kind": "inbound", "detail": "y", "channel": "infobip"},
+                ],
+                "terminal_states": [
+                    {"state": "closed_won", "class": "win"},
+                    {"state": "closed_lost", "class": "loss"},
+                ],
+                "max_nudges": 2,
+            }
+        ],
+        entities=[
+            {
+                "key": "conversation_thread",
+                "type": "conversation",
+                "states": ["open", "closed_won", "closed_lost"],
+                "terminal_states": ["closed_won", "closed_lost"],
+            }
+        ],
+    )
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        assert _credited(_resolve_and_close(conn, "closed_lost")) is False
+
+
+def test_grammar_terminal_outcome_class_api():
+    """FIX 8: the new public grammar helpers have a pinned contract."""
+    assert grammar.TERMINAL_OUTCOME_CLASSES == frozenset({"win", "loss", "neutral"})
+    assert grammar.is_known_terminal_outcome_class("win") is True
+    assert grammar.is_known_terminal_outcome_class(" WIN ") is True  # strip+fold
+    assert grammar.is_known_terminal_outcome_class("victory") is False
+    assert grammar.is_known_terminal_outcome_class(None) is False
+    assert grammar.is_known_terminal_outcome_class(123) is False
+    assert grammar.normalize_terminal_outcome_class(" Win ") == "win"
+    assert grammar.normalize_terminal_outcome_class("victory") is None
+    assert grammar.normalize_terminal_outcome_class(None) is None
+
+
+def test_grammar_loop_declared_terminal_classes_drops_unknown():
+    """FIX 8: the grammar parser drops an unknown class (shape-1 and shape-2)."""
+    out1 = grammar.loop_declared_terminal_classes(
+        {
+            "terminal_states": [
+                {"state": "closed_won", "class": "win"},
+                {"state": "closed_lost", "class": "loss"},
+                {"state": "typo_state", "class": "victory"},
+            ]
+        }
+    )
+    assert out1 == {"closed_won": "win", "closed_lost": "loss"}
+    out2 = grammar.loop_declared_terminal_classes(
+        {"terminal_classes": {"closed_won": "win", "bad": "victory"}}
+    )
+    assert out2 == {"closed_won": "win"}
+
+
+def test_fix3_strict_crash_time_recognition_fails_closed(fresh_home, monkeypatch):
+    """FIX 8 / merge-gate Sec.3: if the strict recognition checker RAISES mid-tick
+    the loop must NOT fire autonomously (fail-closed). We pin the contract: the
+    crash propagates (the tick does not silently swallow-and-fire), and the loop
+    spends no nudge / stays un-fired.
+
+    Mutation check: a future change to swallow the crash and fall through to fire
+    would make ``fired`` non-empty / spend a nudge -- failing here."""
+    _approve("serious", _strict_contract("external_reversible", strict=True))
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        base = int(row["next_fire_at"])
+
+        def _boom(_cls):
+            raise RuntimeError("recognition checker crashed")
+
+        monkeypatch.setattr(kb, "_side_effect_class_is_recognized", _boom)
+        with pytest.raises(RuntimeError):
+            kb.reactive_tick(conn, now=base, board="serious")
+        after = _schedule_row(conn)
+        # Fail-closed BEHAVIOR: no nudge spent, the loop did not fire.
+        assert int(after["nudges_used"]) == 0
+        assert int(after["active"]) == 1
+
+
+@pytest.mark.parametrize("max_defers,terminate_on_tick", [(0, 1), (1, 2), (2, 3)])
+def test_fix8_max_defers_boundary(fresh_home, max_defers, terminate_on_tick):
+    """FIX 8: the max_defers boundary, incl. the 0 case (terminate on the FIRST
+    unapproved fire attempt). The loop deferral_exhausts on ``terminate_on_tick``."""
+    _approve("serious", _deferring_contract(max_defers=max_defers))
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        cadence = int(row["cadence_seconds"])
+        t = int(row["next_fire_at"])
+        terminated_on = None
+        for tick in range(1, terminate_on_tick + 2):
+            res = kb.reactive_tick(conn, now=t, board="serious")
+            if res["stopped"] == [
+                {"loop_key": "seller_follow_up", "reason": "deferral_exhausted"}
+            ]:
+                terminated_on = tick
+                break
+            t += cadence
+        assert terminated_on == terminate_on_tick
+        assert int(_schedule_row(conn)["active"]) == 0
+
+
+def test_fix8_max_defers_alias(fresh_home):
+    """FIX 8: the ``max_deferrals`` alias resolves the bound (terminates)."""
+    loop = {
+        "key": "seller_follow_up",
+        "type": "seller_follow_up",
+        "entity": "conversation_thread",
+        "triggers": [{"kind": "timer", "detail": "x", "cadence_hours": 72}],
+        "terminal_states": ["won", "lost"],
+        "side_effect_class": "external_reversible",
+        "max_nudges": 100,
+        "max_deferrals": 1,  # the alias, not max_defers
+    }
+    contract = _contract(
+        side_effect_class="external_reversible",
+        allowed_side_effects=["external_reversible"],
+        event_loops=[loop],
+        approval_gates=[
+            {"key": "owner_rev", "required_before": ["external_reversible"]}
+        ],
+        side_effect_policy={
+            "allowed": ["none"],
+            "forbidden": ["financial"],
+            "approval_required": ["external_reversible"],
+        },
+    )
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        assert int(row["max_defers"]) == 1, "the max_deferrals alias must resolve"
+        cadence = int(row["cadence_seconds"])
+        t = int(row["next_fire_at"])
+        terminated = False
+        for _ in range(5):
+            res = kb.reactive_tick(conn, now=t, board="serious")
+            if res["stopped"]:
+                terminated = True
+                break
+            t += cadence
+        assert terminated
