@@ -1296,9 +1296,35 @@ def _normalize_worker_envelopes(value: Optional[Any]) -> dict:
     return out
 
 
-def normalize_board_operating_contract(contract: Optional[Any]) -> dict:
-    """Normalize a serious-board operating contract wrapper."""
-    parsed = _json_object(contract, field="contract")
+def normalize_board_operating_contract(
+    contract: Optional[Any], *, error_sink: Optional[list[str]] = None
+) -> dict:
+    """Normalize a serious-board operating contract wrapper.
+
+    With the default ``error_sink=None`` this raises on the first structural
+    defect (historical behaviour every call site relies on). When a list is
+    passed as ``error_sink``, every section's structural errors are collected
+    into it (and the bad section is skipped) instead of raising, so a batched
+    validator can report ALL problems in a single pass.
+    """
+
+    def _section(fn, value):
+        """Run a sub-normalizer, collecting its error in sink mode."""
+        if error_sink is None:
+            return fn(value)
+        try:
+            return fn(value)
+        except ValueError as exc:
+            error_sink.append(str(exc))
+            return None
+
+    try:
+        parsed = _json_object(contract, field="contract")
+    except ValueError as exc:
+        if error_sink is None:
+            raise
+        error_sink.append(str(exc))
+        return {}
     if parsed is None:
         return {}
     if isinstance(parsed.get("operating_contract"), dict):
@@ -1307,11 +1333,17 @@ def normalize_board_operating_contract(contract: Optional[Any]) -> dict:
         parsed = dict(parsed["contract"])
     out: dict[str, Any] = {}
     if parsed.get("objective") is not None:
-        out["objective"] = normalize_objective_metadata(parsed.get("objective"))
+        objective = _section(normalize_objective_metadata, parsed.get("objective"))
+        if objective is not None:
+            out["objective"] = objective
     if parsed.get("runtime") is not None:
-        out["runtime"] = normalize_runtime_metadata(parsed.get("runtime"))
+        runtime = _section(normalize_runtime_metadata, parsed.get("runtime"))
+        if runtime is not None:
+            out["runtime"] = runtime
     if parsed.get("workflow") is not None:
-        out["workflow"] = normalize_workflow_definition(parsed.get("workflow"))
+        out["workflow"] = normalize_workflow_definition(
+            parsed.get("workflow"), error_sink=error_sink
+        )
     # Preserve future contract sections that the runtime does not enforce at
     # task-claim time but that are needed for launch review and amendments.
     for key, value in parsed.items():
@@ -1321,12 +1353,16 @@ def normalize_board_operating_contract(contract: Optional[Any]) -> dict:
     # Upcast the watcher's event-loop triggers to the typed grammar so the
     # reactive control plane reads a closed ``kind`` instead of guessing prose.
     if parsed.get("event_loops") is not None:
-        out["event_loops"] = normalize_event_loops(parsed.get("event_loops"))
+        event_loops = _section(normalize_event_loops, parsed.get("event_loops"))
+        if event_loops is not None:
+            out["event_loops"] = event_loops
     # Normalize the Tier-1 sensor primitives block to the typed grammar (a
     # validated closed ``kind`` + a ``knobs`` binding map) so the sensors tick
     # and dispatch gate read typed sensors, never free text.
     if parsed.get("sensors") is not None:
-        out["sensors"] = normalize_board_sensors(parsed.get("sensors"))
+        sensors = _section(normalize_board_sensors, parsed.get("sensors"))
+        if sensors is not None:
+            out["sensors"] = sensors
     return out
 
 
@@ -1778,7 +1814,11 @@ def _success_entry_is_scoreable(entry: Any) -> bool:
     return bool(_SCOREABLE_SUCCESS_RE.search(text))
 
 
-def validate_business_runtime_contract(contract: Optional[Any]) -> dict[str, Any]:
+def validate_business_runtime_contract(
+    contract: Optional[Any],
+    *,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
     """Validate whether a board contract is clear enough to launch agents.
 
     This is intentionally stricter than the per-task dispatch contract. The
@@ -1898,6 +1938,13 @@ def validate_business_runtime_contract(contract: Optional[Any]) -> dict[str, Any
         missing.append("proof_requirements")
     if not _contract_object(normalized.get("side_effect_policy")):
         missing.append("side_effect_policy")
+
+    runtime_models = runtime.get("models") if isinstance(runtime.get("models"), dict) else None
+    if runtime_models is not None:
+        from hermes_cli.kanban_model_routing import validate_runtime_model_slugs
+
+        for warning in validate_runtime_model_slugs(runtime_models):
+            warnings.append(warning)
     if not _contract_list(normalized.get("escalation_paths")):
         missing.append("escalation_paths")
     if not _contract_has_owner_summary(normalized):
@@ -1941,6 +1988,26 @@ def validate_business_runtime_contract(contract: Optional[Any]) -> dict[str, Any
                 warnings.append(_finding)
     except Exception as _exc:  # pragma: no cover - defensive
         _completeness = {"ok": True, "errors": [], "warnings": [], "dimensions": {}, "unavailable": repr(_exc)}
+
+    credentials: dict[str, Any] = {"ok": True, "missing_keys": [], "inputs": []}
+    try:
+        from hermes_cli import kanban_credentials as _creds
+
+        credentials = _creds.assess_board_credentials(board, normalized)
+        if credentials.get("missing_keys"):
+            for key in credentials["missing_keys"]:
+                missing_field = f"launch_credentials.{key}"
+                if missing_field not in missing:
+                    missing.append(missing_field)
+            cred_questions = _creds.launch_credentials_questions(credentials)
+            for q in cred_questions:
+                if q not in questions:
+                    questions.append(q)
+            if status not in ("invalid",):
+                status = "needs_clarification"
+    except Exception:  # pragma: no cover - defensive
+        _log.warning("launch readiness: credential assessment skipped", exc_info=True)
+
     return {
         "ok": not errors and not missing,
         "status": status,
@@ -1952,6 +2019,7 @@ def validate_business_runtime_contract(contract: Optional[Any]) -> dict[str, Any
         "requires_owner_review": not errors and not missing,
         "owner_summary": normalized.get("owner_summary"),
         "completeness": _completeness,
+        "credentials": credentials,
     }
 
 
@@ -2778,8 +2846,12 @@ def _sync_launch_intake_state(
     return synced
 
 
-def _launch_contract_readiness_for_storage(contract: dict[str, Any]) -> dict[str, Any]:
-    readiness = validate_business_runtime_contract(contract)
+def _launch_contract_readiness_for_storage(
+    contract: dict[str, Any],
+    *,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    readiness = validate_business_runtime_contract(contract, board=board)
     if not _contract_uses_model_generated_intake(contract):
         return readiness
     intake = _contract_object(contract.get("launch_intake"))
@@ -2794,11 +2866,13 @@ def _launch_contract_readiness_for_storage(contract: dict[str, Any]) -> dict[str
 
 def _finalize_business_runtime_contract_for_review(
     draft: dict[str, Any],
+    *,
+    board: Optional[str] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    readiness = validate_business_runtime_contract(draft)
+    readiness = validate_business_runtime_contract(draft, board=board)
     draft = _sync_launch_intake_state(draft, readiness)
     if draft.get("launch_intake") is not None:
-        readiness = _launch_contract_readiness_for_storage(draft)
+        readiness = _launch_contract_readiness_for_storage(draft, board=board)
     return draft, readiness
 
 
@@ -2876,13 +2950,56 @@ def _prepare_business_runtime_contract_for_review(
     *,
     rough_goal: Optional[str] = None,
     intake_answers: Optional[Any] = None,
+    board: Optional[str] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     draft = build_business_runtime_contract_draft(
         contract,
         rough_goal=rough_goal,
         intake_answers=intake_answers,
     )
-    return _finalize_business_runtime_contract_for_review(draft)
+    return _finalize_business_runtime_contract_for_review(draft, board=board)
+
+
+LAUNCH_INTAKE_DEGRADED_HINT = (
+    "Launch intake is in degraded mode — configure the auxiliary model slot "
+    "'kanban_launch_intake' in ~/.hermes/config.yaml (runtime.models) for "
+    "server-generated questions, answer assessment, and contract synthesis. "
+    "Until then Hermes falls back to model-generated questions and the "
+    "deterministic universal drafter."
+)
+
+
+def _emit_launch_cli_progress(message: str) -> None:
+    """Print launch-pipeline progress to stderr when CLI progress is enabled."""
+    flag = str(os.environ.get("HERMES_KANBAN_CLI_PROGRESS") or "").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return
+    try:
+        import sys
+
+        print(f"kanban launch: {message}", file=sys.stderr, flush=True)
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def _board_argument_mismatch_hint(
+    *,
+    requested: Optional[str],
+    pinned: str,
+    context: str = "session",
+) -> str:
+    """Actionable guidance when an explicit board= disagrees with the pinned context."""
+    req = str(requested or "").strip()
+    pin = str(pinned or "").strip()
+    lines = [
+        f"board argument {req!r} does not match pinned {context} board {pin!r}.",
+        "For a board that does not exist yet, omit board= and call "
+        "kanban_business_launch_review with create_if_missing=true, name, "
+        "description, and rough_goal only.",
+        "For an existing board, omit board= to use the pinned board, or pass "
+        f"board={pin!r} explicitly.",
+    ]
+    return " ".join(lines)
 
 
 def _launch_intake_aux_enabled() -> bool:
@@ -2921,6 +3038,7 @@ def _maybe_run_pre_interview_research(draft: dict[str, Any]) -> dict[str, Any]:
     rough_goal = _intake_rough_goal(intake)
     if not rough_goal or not _launch_intake_aux_enabled():
         return draft
+    _emit_launch_cli_progress("running pre-interview research (kanban_launch_intake aux)...")
     try:
         from hermes_cli import kanban_launch_intake as kli
         result = kli.run_pre_interview_research(rough_goal)
@@ -2954,6 +3072,7 @@ def _maybe_generate_launch_intake_questions(draft: dict[str, Any]) -> dict[str, 
     rough_goal = _intake_rough_goal(intake)
     if not rough_goal or not _launch_intake_aux_enabled():
         return draft
+    _emit_launch_cli_progress("generating launch-intake questions (kanban_launch_intake aux)...")
     try:
         from hermes_cli import kanban_launch_intake as kli
         result = kli.run_question_generation(
@@ -3001,6 +3120,7 @@ def _maybe_assess_launch_intake_answers(draft: dict[str, Any]) -> dict[str, Any]
     coverage = _launch_intake_coverage_report(
         answers, rough_goal=rough_goal, external_research=intake.get("external_research")
     )
+    _emit_launch_cli_progress("assessing launch-intake answers (kanban_launch_intake aux)...")
     try:
         from hermes_cli import kanban_launch_intake as kli
         result = kli.run_answer_assessment(
@@ -3399,6 +3519,15 @@ def _synthesize_launch_contract_from_intake(draft: dict[str, Any]) -> dict[str, 
         last_report: Optional[Any] = None
         repair_feedback: Optional[list[str]] = None
         for attempt in range(1, LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS + 1):
+            if attempt == 1:
+                _emit_launch_cli_progress(
+                    "synthesizing board contract (kanban_launch_intake aux)..."
+                )
+            else:
+                _emit_launch_cli_progress(
+                    f"repairing synthesized contract (attempt {attempt}/"
+                    f"{LAUNCH_INTAKE_SYNTH_MAX_ATTEMPTS})..."
+                )
             try:
                 synth = kli.run_contract_synthesis(
                     rough_goal,
@@ -3647,6 +3776,14 @@ def normalize_runtime_metadata(runtime: Optional[Any]) -> Optional[dict]:
         out["require_worker_envelopes"] = _coerce_bool(out.get("require_worker_envelopes"))
     if out.get("require_provider_policy") is not None:
         out["require_provider_policy"] = _coerce_bool(out.get("require_provider_policy"))
+    if out.get("models") is not None:
+        from hermes_cli.kanban_model_routing import normalize_runtime_models
+
+        normalized_models = normalize_runtime_models(out.get("models"))
+        if normalized_models is not None:
+            out["models"] = normalized_models
+        else:
+            out.pop("models", None)
     return out
 
 
@@ -3712,13 +3849,38 @@ def _workflow_list_keys(items: Any, *, field: str) -> list[dict]:
     return out
 
 
-def normalize_workflow_definition(workflow: Optional[Any]) -> Optional[dict]:
+def normalize_workflow_definition(
+    workflow: Optional[Any], *, error_sink: Optional[list[str]] = None
+) -> Optional[dict]:
     """Validate and normalize a board-level semantic workflow definition.
 
     The workflow is deliberately generic: board authors define stage keys,
     substates, actions, triggers, and exit evidence. The kernel enforces
     shape and declared stage/action references, not any domain vocabulary.
+
+    By default (``error_sink=None``) the historical FAIL-FAST behaviour is
+    preserved: the first structural defect raises ``ValueError`` and aborts.
+    When the caller passes a list as ``error_sink``, the normalizer switches to
+    COLLECT mode — every structural problem is appended to the sink and the
+    offending item is skipped instead of raising — so a batched validator can
+    surface ALL errors at once rather than one-per-attempt. All existing call
+    sites keep the default and are unaffected.
     """
+
+    def _fail(msg: str) -> None:
+        if error_sink is None:
+            raise ValueError(msg)
+        error_sink.append(msg)
+
+    def _list_keys(items: Any, *, field: str) -> list[dict]:
+        if error_sink is None:
+            return _workflow_list_keys(items, field=field)
+        try:
+            return _workflow_list_keys(items, field=field)
+        except ValueError as exc:
+            error_sink.append(str(exc))
+            return []
+
     if workflow is None:
         return None
     if isinstance(workflow, str):
@@ -3728,14 +3890,20 @@ def normalize_workflow_definition(workflow: Optional[Any]) -> Optional[dict]:
         try:
             workflow = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"workflow must be a JSON object: {exc}") from exc
+            _fail(f"workflow must be a JSON object: {exc}")
+            return None
     if not isinstance(workflow, dict):
-        raise ValueError(f"workflow must be an object/dict, got {type(workflow).__name__}")
+        _fail(f"workflow must be an object/dict, got {type(workflow).__name__}")
+        return None
     out = dict(workflow)
     out["id"] = str(out.get("id") or "workflow").strip() or "workflow"
-    stages = _workflow_list_keys(out.get("stages"), field="stages")
+    stages = _list_keys(out.get("stages"), field="stages")
     if not stages:
-        raise ValueError("workflow.stages must contain at least one stage")
+        _fail("workflow.stages must contain at least one stage")
+        # Collect mode only (raise mode already aborted): keep linting the rest
+        # of the contract with an empty stage set.
+        out["stages"] = []
+        return out
     stage_keys = {stage["key"] for stage in stages}
     normalized_stages: list[dict] = []
     for stage in stages:
@@ -3745,21 +3913,25 @@ def normalize_workflow_definition(workflow: Optional[Any]) -> Optional[dict]:
         if "allowed_lifecycle_states" in row:
             states = row.get("allowed_lifecycle_states") or []
             if not isinstance(states, list):
-                raise ValueError(
+                _fail(
                     f"workflow stage {row['key']!r} allowed_lifecycle_states must be a list"
                 )
+                states = []
             bad = [str(s) for s in states if str(s) not in VALID_STATUSES]
             if bad:
-                raise ValueError(
+                _fail(
                     f"workflow stage {row['key']!r} has invalid lifecycle states: "
                     + ", ".join(bad)
                 )
-            row["allowed_lifecycle_states"] = [str(s) for s in states]
-        row["substates"] = _workflow_list_keys(row.get("substates"), field=f"stages.{row['key']}.substates")
-        row["actions"] = _workflow_list_keys(row.get("actions"), field=f"stages.{row['key']}.actions")
+            row["allowed_lifecycle_states"] = [
+                str(s) for s in states if str(s) in VALID_STATUSES
+            ]
+        row["substates"] = _list_keys(row.get("substates"), field=f"stages.{row['key']}.substates")
+        row["actions"] = _list_keys(row.get("actions"), field=f"stages.{row['key']}.actions")
         triggers = row.get("triggers") or []
         if not isinstance(triggers, list):
-            raise ValueError(f"workflow stage {row['key']!r} triggers must be a list")
+            _fail(f"workflow stage {row['key']!r} triggers must be a list")
+            triggers = []
         # DECLARE, DON'T INFER: every stage trigger is upcast to a typed object
         # carrying a validated closed ``kind``. Legacy free-text/``type``-only
         # triggers flow through the one-time ingest classifier; genuinely-typed
@@ -3767,35 +3939,39 @@ def normalize_workflow_definition(workflow: Optional[Any]) -> Optional[dict]:
         try:
             row["triggers"] = [normalize_trigger(t) for t in triggers]
         except ValueError as exc:
-            raise ValueError(
-                f"workflow stage {row['key']!r} has an invalid trigger: {exc}"
-            ) from exc
+            _fail(f"workflow stage {row['key']!r} has an invalid trigger: {exc}")
+            row["triggers"] = []
         exits = row.get("exit_criteria") or []
         if not isinstance(exits, list):
-            raise ValueError(f"workflow stage {row['key']!r} exit_criteria must be a list")
+            _fail(f"workflow stage {row['key']!r} exit_criteria must be a list")
+            exits = []
         normalized_exits: list[dict] = []
         for idx, item in enumerate(exits):
             if not isinstance(item, dict):
-                raise ValueError(
+                _fail(
                     f"workflow stage {row['key']!r} exit_criteria[{idx}] must be an object"
                 )
+                continue
             exit_row = dict(item)
             transition = str(exit_row.get("transition") or exit_row.get("to") or "").strip()
             if not transition:
-                raise ValueError(
+                _fail(
                     f"workflow stage {row['key']!r} exit_criteria[{idx}].transition is required"
                 )
+                continue
             if transition not in stage_keys:
-                raise ValueError(
+                _fail(
                     f"workflow stage {row['key']!r} exits to unknown stage {transition!r}"
                 )
+                continue
             evidence = exit_row.get("evidence_required") or []
             if isinstance(evidence, str):
                 evidence = [evidence]
             if not isinstance(evidence, list):
-                raise ValueError(
+                _fail(
                     f"workflow stage {row['key']!r} exit_criteria[{idx}].evidence_required must be a list"
                 )
+                evidence = []
             exit_row["transition"] = transition
             exit_row["evidence_required"] = [str(e).strip() for e in evidence if str(e).strip()]
             normalized_exits.append(exit_row)
@@ -3814,10 +3990,12 @@ def normalize_workflow_definition(workflow: Optional[Any]) -> Optional[dict]:
             if isinstance(schema, str):
                 schema = [schema]
             if not isinstance(schema, list):
-                raise ValueError(
+                _fail(
                     f"workflow stage {row['key']!r} action {action_row.get('key')!r} "
                     "output_schema must be a list of artifact keys"
                 )
+                normalized_actions.append(action_row)
+                continue
             action_row["output_schema"] = [
                 str(item).strip() for item in schema if str(item).strip()
             ]
@@ -3825,7 +4003,7 @@ def normalize_workflow_definition(workflow: Optional[Any]) -> Optional[dict]:
         row["actions"] = normalized_actions
         normalized_stages.append(row)
     out["stages"] = normalized_stages
-    workstreams = _workflow_list_keys(out.get("workstreams"), field="workstreams")
+    workstreams = _list_keys(out.get("workstreams"), field="workstreams")
     if workstreams:
         normalized_workstreams: list[dict] = []
         for ws in workstreams:
@@ -3834,17 +4012,18 @@ def normalize_workflow_definition(workflow: Optional[Any]) -> Optional[dict]:
             if isinstance(stages_allowed, str):
                 stages_allowed = [stages_allowed]
             if not isinstance(stages_allowed, list):
-                raise ValueError(
+                _fail(
                     f"workflow.workstreams.{ws_row['key']!r}.stages must be a list"
                 )
+                stages_allowed = []
             allowed = [str(s).strip() for s in stages_allowed if str(s).strip()]
             bad = [s for s in allowed if s not in stage_keys]
             if bad:
-                raise ValueError(
+                _fail(
                     f"workflow.workstream {ws_row['key']!r} references unknown stages: "
                     + ", ".join(bad)
                 )
-            ws_row["stages"] = allowed
+            ws_row["stages"] = [s for s in allowed if s in stage_keys]
             ws_row.pop("stage_keys", None)
             normalized_workstreams.append(ws_row)
         out["workstreams"] = normalized_workstreams
@@ -4300,6 +4479,7 @@ def create_board(
     contract: Optional[Any] = None,
     business_contract: Optional[Any] = None,
     launch_phase: Optional[str] = None,
+    model_routing: Optional[Any] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -4374,6 +4554,10 @@ def create_board(
         if worker_profile is not None:
             profiles["worker"] = worker_profile
         runtime_meta["profiles"] = profiles
+        if model_routing is not None:
+            from hermes_cli.kanban_model_routing import merge_model_routing_into_runtime
+
+            runtime_meta = merge_model_routing_into_runtime(runtime_meta, model_routing)
         runtime_meta = normalize_runtime_metadata(runtime_meta)
         workflow_meta = workflow if workflow is not None else (contract_workflow if contract_workflow is not None else default_semantic_workflow())
     meta = write_board_metadata(
@@ -4403,7 +4587,8 @@ def validate_board_launch_readiness(board: Optional[str] = None) -> dict[str, An
     """Return launch/readiness state for a board's business runtime contract."""
     meta = read_board_metadata(board)
     contract = _metadata_as_business_contract(meta)
-    readiness = _launch_contract_readiness_for_storage(contract)
+    board_slug = meta.get("slug")
+    readiness = _launch_contract_readiness_for_storage(contract, board=board_slug)
     questions = _launch_review_questions(contract, readiness)
     phase = normalize_board_launch_phase(meta.get("launch_phase"), default="active")
     managed = _board_requires_launch_readiness(meta)
@@ -4435,7 +4620,9 @@ def board_dispatch_gate(board: Optional[str] = None) -> dict[str, Any]:
     meta = read_board_metadata(board)
     phase = normalize_board_launch_phase(meta.get("launch_phase"), default="active")
     managed = _board_requires_launch_readiness(meta)
-    readiness = _launch_contract_readiness_for_storage(_metadata_as_business_contract(meta))
+    readiness = _launch_contract_readiness_for_storage(
+        _metadata_as_business_contract(meta), board=meta.get("slug"),
+    )
     launch_approved = _board_has_approved_launch_review(meta)
     blockers: list[dict[str, Any]] = []
     if meta.get("metadata_error"):
@@ -4584,17 +4771,21 @@ def _review_business_launch_contract_unlocked(
         if normed_for_intake and board_exists(normed_for_intake):
             base_contract = _metadata_as_business_contract(read_board_metadata(normed_for_intake))
     try:
+        review_board = _normalize_board_slug(board) if board else None
         draft, readiness = _prepare_business_runtime_contract_for_review(
             base_contract,
             rough_goal=rough_goal,
             intake_answers=intake_answers,
+            board=review_board,
         )
         if existing_contract_for_intake is not None and contract is not None:
             draft = _reconcile_launch_intake_draft_with_existing(
                 draft,
                 existing_contract_for_intake,
             )
-            draft, readiness = _finalize_business_runtime_contract_for_review(draft)
+            draft, readiness = _finalize_business_runtime_contract_for_review(
+                draft, board=review_board,
+            )
     except ContractNormalizationError as exc:
         # Normalization rejected the contract outright (e.g. a malformed
         # workflow stage exit_criteria, an invalid trigger, or a bad policy
@@ -4821,10 +5012,11 @@ def propose_board_contract_amendment(
     current = _metadata_as_business_contract(meta)
     candidate = normalize_board_operating_contract(_deep_merge_contract(current, patch_obj))
     readiness = validate_business_runtime_contract(candidate)
+    from_version = _normalize_contract_version(meta.get("contract_version"))
     amendment = {
         "id": f"ca_{secrets.token_hex(6)}",
         "status": "pending",
-        "from_version": _normalize_contract_version(meta.get("contract_version")),
+        "from_version": from_version,
         "created_at": int(time.time()),
         "author": str(author or "").strip() or None,
         "reason": str(reason or "").strip(),
@@ -4833,10 +5025,180 @@ def propose_board_contract_amendment(
         "candidate_contract": candidate,
         "readiness": readiness,
     }
+    # SUPERSEDE-DON'T-STACK: a board iterating toward launch produces a chain of
+    # candidate contracts against the SAME base version. Leaving each prior draft
+    # ``pending`` created the "6 competing pending amendments" hazard where a
+    # partial draft could be approved by accident. Mark every prior pending
+    # amendment built on the same ``from_version`` as ``superseded`` so exactly
+    # one live candidate remains pre-launch. (Status is reversible/auditable;
+    # nothing is deleted.)
     amendments = list(meta.get("contract_amendments") or [])
+    now_ts = int(time.time())
+    for prior in amendments:
+        if (
+            isinstance(prior, dict)
+            and prior.get("status") == "pending"
+            and _normalize_contract_version(prior.get("from_version")) == from_version
+        ):
+            prior["status"] = "superseded"
+            prior["superseded_at"] = now_ts
+            prior["superseded_by"] = amendment["id"]
     amendments.append(amendment)
     write_board_metadata(normed, contract_amendments=amendments[-50:])
     return amendment
+
+
+def validate_amendment_candidate(board: str, patch: Any) -> dict[str, Any]:
+    """Non-raising, BATCHED validation of a contract-amendment patch.
+
+    Deep-merges ``patch`` over the board's current contract and returns EVERY
+    structural problem found in one pass — instead of the historical
+    one-error-at-a-time, guess-the-schema loop:
+
+    * ``normalization_errors`` — shape defects collected (not fail-fast) from
+      :func:`normalize_board_operating_contract` in ``error_sink`` mode. When
+      non-empty the candidate cannot be normalized, so downstream checks are
+      skipped and these are the complete blocking set.
+    * ``invariant_errors`` — reactive-grammar violations from
+      :func:`hermes_cli.kanban_launch_invariants.check_contract_invariants`
+      (already batched) plus any hard errors surfaced by readiness.
+    * ``missing`` — launch-readiness gaps from
+      :func:`validate_business_runtime_contract` (e.g. a missing top-level
+      ``side_effect_policy``).
+
+    ``ok`` is True only when there are no errors and nothing missing. This never
+    raises for an expected malformed patch; the raising normalizers are reused
+    in collect mode via ``error_sink``.
+    """
+    from hermes_cli.kanban_launch_invariants import check_contract_invariants
+
+    normed = _normalize_board_slug(board)
+    if not normed:
+        return {"ok": False, "errors": ["board slug is required"], "warnings": [], "missing": []}
+    if not board_exists(normed):
+        return {"ok": False, "errors": [f"board {normed!r} does not exist"], "warnings": [], "missing": []}
+    try:
+        patch_obj = _json_object(patch, field="patch") or {}
+    except ValueError as exc:
+        return {"ok": False, "errors": [str(exc)], "warnings": [], "missing": [], "normalization_errors": [str(exc)]}
+
+    current = _metadata_as_business_contract(read_board_metadata(normed))
+    merged = _deep_merge_contract(current, patch_obj)
+
+    shape_errors: list[str] = []
+    candidate = normalize_board_operating_contract(merged, error_sink=shape_errors)
+
+    invariant_errors: list[str] = []
+    warnings: list[str] = []
+    missing: list[str] = []
+    readiness: dict[str, Any] = {}
+    if not shape_errors:
+        report = check_contract_invariants(candidate)
+        invariant_errors = list(report.errors)
+        warnings.extend(report.warnings)
+        readiness = validate_business_runtime_contract(candidate)
+        missing = list(readiness.get("missing") or [])
+        warnings.extend(readiness.get("warnings") or [])
+        for err in readiness.get("errors") or []:
+            if err not in invariant_errors:
+                invariant_errors.append(err)
+
+    all_errors = list(shape_errors) + [e for e in invariant_errors if e not in shape_errors]
+    return {
+        "ok": not all_errors and not missing,
+        "errors": all_errors,
+        "warnings": warnings,
+        "missing": missing,
+        "normalization_errors": shape_errors,
+        "invariant_errors": invariant_errors,
+        "readiness": readiness,
+        "candidate": candidate if not shape_errors else None,
+    }
+
+
+def resolve_launchable_contract(board: str) -> dict[str, Any]:
+    """Resolve the single contract that ``/approve <board>`` should launch.
+
+    APPROVAL SAFETY: ``/approve`` historically launched the BASE metadata
+    contract and silently ignored pending ``contract_amendments`` — so all the
+    refinement work staged as amendments (e.g. scoreable success criteria, the
+    explicit ``side_effect_policy``) would be dropped at launch. This resolves
+    the contract the owner actually means, FAIL-CLOSED:
+
+    * No live pending amendment on the current version → launch the base
+      contract (``source="base"``).
+    * Exactly one launch-ready pending amendment on the current version → fold
+      it in and launch its candidate (``source="amendment"``).
+    * A pending amendment exists but is NOT launch-ready → refuse
+      (``ok=False``, ``reason="amendment_not_ready"``) with its ``missing`` list,
+      rather than silently launching the un-amended base.
+    * Multiple unreconciled launch-ready pending amendments → refuse
+      (``reason="multiple_pending"``) and list them, rather than guessing.
+
+    Superseded/applied/rejected amendments are ignored. Returns a dict with
+    ``ok``, ``contract``, ``source``, ``amendment_id``, ``reason``, ``missing``,
+    and ``pending`` (ids) for the caller to surface.
+    """
+    normed = _normalize_board_slug(board)
+    if not normed:
+        return {"ok": False, "reason": "invalid_board", "contract": None, "source": None}
+    if not board_exists(normed):
+        return {"ok": False, "reason": "missing_board", "contract": None, "source": None}
+    meta = read_board_metadata(normed)
+    base_contract = _metadata_as_business_contract(meta)
+    current_version = _normalize_contract_version(meta.get("contract_version"))
+    live_pending = [
+        a
+        for a in (meta.get("contract_amendments") or [])
+        if isinstance(a, dict)
+        and a.get("status") == "pending"
+        and _normalize_contract_version(a.get("from_version")) == current_version
+    ]
+    if not live_pending:
+        return {
+            "ok": True,
+            "contract": base_contract,
+            "source": "base",
+            "amendment_id": None,
+            "reason": None,
+            "missing": [],
+            "pending": [],
+        }
+    ready = [a for a in live_pending if (a.get("readiness") or {}).get("ok")]
+    pending_ids = [str(a.get("id")) for a in live_pending]
+    if len(ready) > 1:
+        return {
+            "ok": False,
+            "reason": "multiple_pending",
+            "contract": None,
+            "source": None,
+            "amendment_id": None,
+            "missing": [],
+            "pending": [str(a.get("id")) for a in ready],
+        }
+    if len(ready) == 1:
+        chosen = ready[0]
+        return {
+            "ok": True,
+            "contract": normalize_board_operating_contract(chosen.get("candidate_contract")),
+            "source": "amendment",
+            "amendment_id": str(chosen.get("id")),
+            "reason": None,
+            "missing": [],
+            "pending": pending_ids,
+        }
+    # Pending exists but none are launch-ready -> refuse rather than silently
+    # launch the un-amended base and drop the owner's staged work.
+    newest = max(live_pending, key=lambda a: a.get("created_at") or 0)
+    return {
+        "ok": False,
+        "reason": "amendment_not_ready",
+        "contract": None,
+        "source": None,
+        "amendment_id": str(newest.get("id")),
+        "missing": list((newest.get("readiness") or {}).get("missing") or []),
+        "pending": pending_ids,
+    }
 
 
 def apply_board_contract_amendment(
@@ -8772,7 +9134,11 @@ def connect(
         if db_path_board:
             if requested_board and requested_board != db_path_board:
                 raise ValueError(
-                    f"board argument {requested_board!r} does not match pinned DB board {db_path_board!r}"
+                    _board_argument_mismatch_hint(
+                        requested=requested_board,
+                        pinned=db_path_board,
+                        context="DB",
+                    )
                 )
             board_slug = db_path_board
         else:
@@ -9604,7 +9970,11 @@ def _connection_board(conn: sqlite3.Connection, board: Optional[str] = None) -> 
     if attached_slug:
         if explicit and explicit != attached_slug:
             raise ValueError(
-                f"board argument {explicit!r} does not match connected board {attached_slug!r}"
+                _board_argument_mismatch_hint(
+                    requested=explicit,
+                    pinned=attached_slug,
+                    context="connected",
+                )
             )
         return attached_slug
 
@@ -9617,17 +9987,26 @@ def _connection_board(conn: sqlite3.Connection, board: Optional[str] = None) -> 
     if db_path_slug:
         if env_slug and env_slug != db_path_slug:
             raise ValueError(
-                f"pinned board {env_slug!r} does not match pinned DB board {db_path_slug!r}"
+                f"pinned board {env_slug!r} does not match pinned DB board {db_path_slug!r}. "
+                "Run `hermes kanban boards switch` to align the current board pointer."
             )
         if explicit and explicit != db_path_slug:
             raise ValueError(
-                f"board argument {explicit!r} does not match pinned DB board {db_path_slug!r}"
+                _board_argument_mismatch_hint(
+                    requested=explicit,
+                    pinned=db_path_slug,
+                    context="DB",
+                )
             )
         return db_path_slug
     if env_slug and board_exists(env_slug):
         if explicit and explicit != env_slug:
             raise ValueError(
-                f"board argument {explicit!r} does not match pinned board {env_slug!r}"
+                _board_argument_mismatch_hint(
+                    requested=explicit,
+                    pinned=env_slug,
+                    context="session",
+                )
             )
         return env_slug
     return explicit or get_current_board()
@@ -20586,6 +20965,18 @@ def _default_spawn(
     # board slug still forces it to the right directory.
     resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
+    try:
+        from hermes_cli import kanban_credentials as _creds
+
+        for cred_key, cred_val in _creds.board_credentials_env(resolved_board).items():
+            if cred_val:
+                env[cred_key] = cred_val
+    except Exception:  # pragma: no cover - defensive
+        _log.warning(
+            "kanban spawn: credential env injection skipped for board %r",
+            resolved_board,
+            exc_info=True,
+        )
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are
@@ -20628,8 +21019,11 @@ def _default_spawn(
         for sk in task.skills:
             if sk and sk != "kanban-worker":
                 cmd.extend(["--skills", sk])
-    if task.model_override:
-        cmd.extend(["-m", task.model_override])
+    from hermes_cli.kanban_model_routing import resolve_worker_model
+
+    resolved_model = resolve_worker_model(task, board=board)
+    if resolved_model:
+        cmd.extend(["-m", resolved_model])
     cmd.extend([
         "chat",
         "-q", prompt,

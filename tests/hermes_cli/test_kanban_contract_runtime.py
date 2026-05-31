@@ -497,7 +497,7 @@ def test_db_path_pin_without_board_env_cannot_be_mislabeled(fresh_home, monkeypa
     monkeypatch.setenv("HERMES_KANBAN_DB", serious_db)
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
 
-    with pytest.raises(ValueError, match="does not match pinned DB board"):
+    with pytest.raises(ValueError, match="omit board="):
         kb.connect(board="default")
 
     with kb.connect(board="serious") as conn:
@@ -532,7 +532,7 @@ def test_windows_connection_wrapper_preserves_board_identity(fresh_home, monkeyp
     monkeypatch.setenv("HERMES_KANBAN_DB", str(serious_db))
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
 
-    with pytest.raises(ValueError, match="does not match pinned DB board"):
+    with pytest.raises(ValueError, match="omit board="):
         kb.connect(board="default")
 
     with kb.connect() as conn:

@@ -14430,18 +14430,35 @@ class GatewayRunner:
             lines = ["\n\nBoards drafted and awaiting launch — approve with `/approve <board>`:"]
             for slug in sorted(pending):
                 one_liner = ""
-                if render_contract_one_liner is not None:
-                    try:
-                        contract = kb._metadata_as_business_contract(
-                            kb.read_board_metadata(slug)
-                        )
+                amendment_note = ""
+                try:
+                    meta = kb.read_board_metadata(slug)
+                    if render_contract_one_liner is not None:
+                        contract = kb._metadata_as_business_contract(meta)
                         one_liner = render_contract_one_liner(contract)
-                    except Exception:
-                        one_liner = ""
+                    # Annotate the live pending amendment (if any) so the owner
+                    # knows /approve will launch the AMENDED contract, not the
+                    # original draft — and whether it's launch-ready yet.
+                    version = kb._normalize_contract_version(meta.get("contract_version"))
+                    live = [
+                        a
+                        for a in (meta.get("contract_amendments") or [])
+                        if isinstance(a, dict)
+                        and a.get("status") == "pending"
+                        and kb._normalize_contract_version(a.get("from_version")) == version
+                    ]
+                    if live:
+                        ready = sum(1 for a in live if (a.get("readiness") or {}).get("ok"))
+                        if ready >= 1:
+                            amendment_note = f" [+{len(live)} pending amendment(s); ready ✓]"
+                        else:
+                            amendment_note = f" [+{len(live)} pending amendment(s); not launch-ready]"
+                except Exception:
+                    one_liner = one_liner or ""
                 if one_liner:
-                    lines.append(f"• `{slug}` — {one_liner}")
+                    lines.append(f"• `{slug}` — {one_liner}{amendment_note}")
                 else:
-                    lines.append(f"• `{slug}`")
+                    lines.append(f"• `{slug}`{amendment_note}")
             return "\n".join(lines)
         except Exception:
             return ""
@@ -14483,9 +14500,46 @@ class GatewayRunner:
             phase = str(meta.get("launch_phase") or "").strip().lower()
             if phase == "active":
                 return f"✅ Board `{slug}` is already active — nothing to approve."
-            contract = kb._metadata_as_business_contract(meta)
         except Exception as exc:
             return f"⛔ Could not read board `{slug}`: {exc}"
+
+        # APPROVAL SAFETY (P0-2): resolve the single contract the owner actually
+        # means BEFORE minting. /approve used to launch the bare metadata
+        # contract and silently drop every pending amendment; now we fold in the
+        # one launch-ready pending amendment, and FAIL CLOSED (refuse, never
+        # silently launch the un-amended base) when the pending work is
+        # incomplete or ambiguous.
+        try:
+            resolution = kb.resolve_launchable_contract(slug)
+        except Exception as exc:
+            return f"⛔ Could not resolve the launch contract for `{slug}`: {exc}"
+        if not resolution.get("ok"):
+            reason = resolution.get("reason")
+            if reason == "multiple_pending":
+                pend = ", ".join(f"`{p}`" for p in resolution.get("pending") or [])
+                return (
+                    f"⛔ `/approve {slug}` refused — multiple competing pending "
+                    f"amendments are launch-ready ({pend}). Reconcile them into a "
+                    "single candidate (re-propose; the latest supersedes the rest) "
+                    "before approving, so the wrong version can't go live."
+                )
+            if reason == "amendment_not_ready":
+                missing = resolution.get("missing") or []
+                tail = ("\nStill missing:\n- " + "\n- ".join(missing)) if missing else ""
+                return (
+                    f"⛔ `/approve {slug}` refused — the pending amendment "
+                    f"(`{resolution.get('amendment_id')}`) is not launch-ready yet, "
+                    "and launching the un-amended base would silently drop your "
+                    f"staged changes.{tail}\nAsk the agent to finish the amendment, "
+                    f"then `/approve {slug}` again."
+                )
+            return (
+                f"⛔ `/approve {slug}` could not resolve a launchable contract "
+                f"({reason or 'unknown'})."
+            )
+        contract = resolution.get("contract")
+        launch_source = resolution.get("source")
+        launch_amendment_id = resolution.get("amendment_id")
 
         source = event.source
         platform = (
@@ -14501,6 +14555,25 @@ class GatewayRunner:
             "board": slug,
             "approved_at": int(_time.time()),
         }
+
+        # Pre-mint preview: log, in plain words, exactly which contract is about
+        # to go live (base vs. a specific pending amendment) so the resolved
+        # selection is auditable before the one-time token mints.
+        if launch_source == "amendment":
+            preview_source = f"pending amendment `{launch_amendment_id}`"
+        else:
+            preview_source = "the base drafted contract"
+        try:
+            _preview_obj = contract.get("objective") if isinstance(contract, dict) else {}
+            _preview_statement = str((_preview_obj or {}).get("statement") or "").strip()
+        except Exception:
+            _preview_statement = ""
+        logger.info(
+            "Pre-mint launch preview for %s: source=%s objective=%r",
+            slug,
+            launch_source,
+            _preview_statement[:200],
+        )
 
         # 1) Mint the one-time launch token. owner_authority_confirmed=True is
         #    the human authority boundary; owner_acknowledged_coverage=True
@@ -14586,10 +14659,19 @@ class GatewayRunner:
                 owner_summary = summary.strip()
             summary_block = owner_summary
 
-        logger.info("Owner approved + launched board %s via /approve", slug)
+        logger.info(
+            "Owner approved + launched board %s via /approve (source=%s)",
+            slug,
+            launch_source,
+        )
+        source_note = (
+            f" Launched from {preview_source}."
+            if launch_source == "amendment"
+            else ""
+        )
         header = (
             f"✅ Board `{slug}` launched — phase: **active**. "
-            "Runtime compiled and profiles bound."
+            "Runtime compiled and profiles bound." + source_note
         )
         if summary_block:
             return f"{header}{bound_line}\n\n{summary_block}"

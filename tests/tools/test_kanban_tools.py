@@ -882,6 +882,39 @@ def test_business_launch_review_tool_returns_owner_review_action_for_clear_answe
     assert "never dump raw" in payload["assistant_next_action"]["response_style"]
 
 
+def test_sanitize_launch_result_surfaces_degraded_warning(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb._INITIALIZED_PATHS.clear()
+    kt._handle_business_launch_review({
+        "board": "degraded-warn",
+        "rough_goal": "Launch a recruiting workflow",
+        "create_if_missing": True,
+    })
+    meta = kb.read_board_metadata("degraded-warn")
+    intake = meta["business_contract"]["launch_intake"]
+    intake["degraded_mode"] = True
+    kb.write_board_metadata(
+        "degraded-warn",
+        business_contract={**meta["business_contract"], "launch_intake": intake},
+    )
+    result = {
+        "ok": False,
+        "launch_intake": intake,
+        "board": meta,
+        "contract": meta["business_contract"],
+    }
+    sanitized = kt._sanitize_launch_tool_result(kb, result)
+    assert sanitized.get("launch_intake_degraded_warning")
+    assert "kanban_launch_intake" in sanitized["launch_intake_degraded_warning"]
+
+
 def test_business_launch_review_tool_requires_approval_token(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_PROFILE", "test-orchestrator")

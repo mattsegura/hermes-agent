@@ -431,6 +431,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                            help="JSON object or @file path defining the business contract")
     bc_review.add_argument("--intake-answers", default=None,
                            help="Owner answers to generated intake questions, or @file")
+    bc_review.add_argument(
+        "--intake-template",
+        action="store_true",
+        help="Print six-dimension intake JSON skeleton and exit (no board write)",
+    )
     bc_review.add_argument("--create", action="store_true",
                            help="Create the board if it does not exist")
     bc_review.add_argument("--approve", action="store_true",
@@ -584,6 +589,37 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     b_bind.add_argument("slug", nargs="?", default=None,
                         help="Board slug (defaults to current board)")
+
+    b_credentials = boards_sub.add_parser(
+        "credentials",
+        help="Manage encrypted launch credentials for a board",
+    )
+    b_credentials_sub = b_credentials.add_subparsers(dest="credentials_action")
+    cred_status = b_credentials_sub.add_parser("status", help="Show required vs provisioned credentials")
+    cred_status.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    cred_status.add_argument("--json", action="store_true")
+    cred_set = b_credentials_sub.add_parser("set", help="Store one encrypted credential")
+    cred_set.add_argument("key", help="Launch required_input key (e.g. revenuecat_api_key)")
+    cred_set.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    cred_set.add_argument("--value", default=None, help="Secret value (omit to read from TTY)")
+    cred_set.add_argument("--from-env", default=None, dest="from_env",
+                          help="Copy value from an existing env var")
+    cred_set.add_argument("--json", action="store_true")
+    cred_submit = b_credentials_sub.add_parser(
+        "submit",
+        help="Store multiple credentials from a JSON object or @file",
+    )
+    cred_submit.add_argument("inputs", help="JSON object mapping key -> value or @file")
+    cred_submit.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    cred_submit.add_argument("--json", action="store_true")
+    cred_provision = b_credentials_sub.add_parser(
+        "provision",
+        help="Write board secrets into a profile .env for runtime use",
+    )
+    cred_provision.add_argument("--board", default=None, help="Board slug (defaults to current)")
+    cred_provision.add_argument("--profile", default=None,
+                                help="Hermes profile slug (defaults to board worker profile)")
+    cred_provision.add_argument("--json", action="store_true")
 
     # --- P6 conversational CEO steering channel ---
     p_steer = sub.add_parser(
@@ -1626,6 +1662,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_quarantine_orphans(args)
     if sub == "bind-roles":
         return _cmd_boards_bind_roles(args)
+    if sub == "credentials":
+        return _cmd_boards_credentials(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1683,6 +1721,149 @@ def _cmd_boards_bind_roles(args: argparse.Namespace) -> int:
         print(f"  skipped {prof!r}: the default/root profile is never auto-pinned "
               f"to a single board", file=sys.stderr)
     return 0
+
+
+def _resolve_board_slug_arg(args: argparse.Namespace) -> tuple[Optional[str], int]:
+    slug = getattr(args, "board", None) or kb.get_current_board()
+    try:
+        normed = kb._normalize_board_slug(slug)
+    except ValueError as exc:
+        print(f"kanban boards credentials: {exc}", file=sys.stderr)
+        return None, 2
+    if not normed:
+        print("kanban boards credentials: board slug is required", file=sys.stderr)
+        return None, 2
+    if not kb.board_exists(normed):
+        print(f"kanban boards credentials: board {slug!r} does not exist", file=sys.stderr)
+        return None, 1
+    return normed, 0
+
+
+def _cmd_boards_credentials(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_credentials as kc
+
+    action = getattr(args, "credentials_action", None) or "status"
+    board, code = _resolve_board_slug_arg(args)
+    if code != 0:
+        return code
+    as_json = bool(getattr(args, "json", False))
+    meta = kb.read_board_metadata(board)
+    contract = kb._metadata_as_business_contract(meta)
+
+    if action == "status":
+        status = kc.assess_board_credentials(board, contract)
+        if as_json:
+            print(json.dumps(status, indent=2, ensure_ascii=False))
+            return 0
+        if not status.get("inputs"):
+            print(f"Board {board!r}: no launch credentials required.")
+            return 0
+        print(f"Board {board!r} launch credentials:")
+        for row in status["inputs"]:
+            mark = "ok" if row.get("provisioned") else "MISSING"
+            source = row.get("source") or "-"
+            print(
+                f"  [{mark:7s}] {row.get('label') or row['key']} "
+                f"(key={row['key']}, env={row.get('env_var')}, source={source})"
+            )
+        if status.get("missing_keys"):
+            print("\nMissing keys:", ", ".join(status["missing_keys"]))
+        return 0
+
+    if action == "set":
+        key = getattr(args, "key", "")
+        specs = {s["key"]: s for s in kc.launch_required_input_specs(contract)}
+        spec = specs.get(str(key).strip())
+        if spec is None:
+            print(
+                f"kanban boards credentials set: key {key!r} is not in launch_required_inputs",
+                file=sys.stderr,
+            )
+            return 2
+        from_env = getattr(args, "from_env", None)
+        value = getattr(args, "value", None)
+        if from_env:
+            from hermes_cli.config import get_env_value
+            value = get_env_value(from_env) or os.environ.get(from_env)
+        elif value is None:
+            from hermes_cli.secret_prompt import masked_secret_prompt
+            value = masked_secret_prompt(f"{spec.get('label') or key}: ")
+        if not str(value or "").strip():
+            print("kanban boards credentials set: value is required", file=sys.stderr)
+            return 2
+        try:
+            result = kc.set_board_credential(board, key, str(value), spec=spec)
+        except ValueError as exc:
+            print(f"kanban boards credentials set: {exc}", file=sys.stderr)
+            return 2
+        if as_json:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print(
+                f"Stored credential {result['key']!r} -> env {result['env_var']!r} "
+                f"(fingerprint {result['fingerprint']})"
+            )
+        return 0
+
+    if action == "submit":
+        text, error = _parse_text_or_file_flag(getattr(args, "inputs", None), "inputs")
+        if error:
+            print(f"kanban boards credentials submit: {error}", file=sys.stderr)
+            return 2
+        try:
+            payload = json.loads(text) if isinstance(text, str) else text
+        except json.JSONDecodeError as exc:
+            print(f"kanban boards credentials submit: invalid JSON: {exc}", file=sys.stderr)
+            return 2
+        try:
+            result = kc.submit_launch_credentials(board, payload, contract=contract)
+        except ValueError as exc:
+            print(f"kanban boards credentials submit: {exc}", file=sys.stderr)
+            return 2
+        if as_json:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print(f"Stored {len(result.get('stored_keys') or [])} credential(s).")
+            creds = result.get("credentials") or {}
+            if creds.get("missing_keys"):
+                print("Still missing:", ", ".join(creds["missing_keys"]))
+        return 0
+
+    if action == "provision":
+        profile = getattr(args, "profile", None)
+        if not profile:
+            runtime = meta.get("runtime") if isinstance(meta.get("runtime"), dict) else {}
+            profiles = runtime.get("profiles") if isinstance(runtime.get("profiles"), dict) else {}
+            profile = (
+                str(profiles.get("worker") or "").strip()
+                or str((runtime.get("dispatcher") or {}).get("profile") or "").strip()
+                or get_active_profile_name()
+            )
+        if not profile:
+            print("kanban boards credentials provision: --profile is required", file=sys.stderr)
+            return 2
+        try:
+            result = kc.provision_board_credentials_to_profile(
+                board, profile, contract=contract,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"kanban boards credentials provision: {exc}", file=sys.stderr)
+            return 2
+        if as_json:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            provisioned = result.get("provisioned") or []
+            if not provisioned:
+                print("No secret credentials to provision (none stored yet).")
+            else:
+                print(
+                    f"Provisioned {len(provisioned)} env var(s) to profile {profile!r}: "
+                    + ", ".join(provisioned)
+                )
+        return 0
+
+    print(f"kanban boards credentials: unknown action {action!r}", file=sys.stderr)
+    return 2
 
 
 def _board_task_counts(slug: str) -> dict[str, int]:
@@ -1955,6 +2136,85 @@ def _cmd_boards_workflow(args: argparse.Namespace) -> int:
     return 2
 
 
+def _print_launch_intake_degraded_warning(intake: dict[str, Any]) -> None:
+    if not isinstance(intake, dict) or not intake.get("degraded_mode"):
+        return
+    try:
+        from hermes_cli.kanban_db import LAUNCH_INTAKE_DEGRADED_HINT
+
+        hint = LAUNCH_INTAKE_DEGRADED_HINT
+    except Exception:
+        hint = (
+            "Launch intake degraded — configure kanban_launch_intake aux slot."
+        )
+    print(f"\nWarning: {hint}", file=sys.stderr)
+
+
+def _print_contract_review_human(result: dict[str, Any], board: str) -> None:
+    """Human-readable output for boards contract review (launch wizard CLI path)."""
+    intake = result.get("launch_intake") or {}
+    if isinstance(intake, dict):
+        _print_launch_intake_degraded_warning(intake)
+        generated = intake.get("generated_questions") or []
+        if generated:
+            print("\nGenerated questions (relay to owner):")
+            for question in generated:
+                print(f"  - {question}")
+    questions = result.get("questions") or []
+    if questions and not (isinstance(intake, dict) and intake.get("generated_questions")):
+        print("\nQuestions:")
+        for question in questions:
+            print(f"  - {question}")
+
+    action = result.get("assistant_next_action")
+    if isinstance(action, dict):
+        instruction = str(action.get("instruction") or "").strip()
+        if instruction:
+            print("\nAssistant next action:")
+            print(f"  {instruction}")
+
+    intake_state = str(intake.get("state") or "").strip().lower() if isinstance(intake, dict) else ""
+    if intake_state == "ready_for_owner_review":
+        summary = result.get("owner_contract_summary")
+        if not summary:
+            try:
+                from hermes_cli.kanban_launch_summary import render_owner_contract_summary
+                from hermes_cli import kanban_credentials as kc
+
+                contract = result.get("contract")
+                creds = kc.assess_board_credentials(
+                    board, contract if isinstance(contract, dict) else None
+                )
+                summary = render_owner_contract_summary(
+                    contract,
+                    board=board,
+                    include_approve_hint=True,
+                    credentials=creds,
+                )
+            except Exception:
+                summary = ""
+        if summary:
+            print("\nOwner summary:")
+            print(summary)
+        print(f"\nNext: /approve {board}")
+        return
+
+    readiness = result.get("readiness") or {}
+    print(f"Readiness: {readiness.get('status')}")
+    assessment = intake.get("answer_assessment") or {} if isinstance(intake, dict) else {}
+    generation = intake.get("question_generation") or {} if isinstance(intake, dict) else {}
+    if assessment.get("required"):
+        print(
+            "Next step: assess owner answers, then re-run contract review with "
+            "a synthesized contract or further intake_answers."
+        )
+    elif generation.get("required"):
+        print(
+            "Next step: ask tailored clarification questions from the rough goal "
+            "before drafting the board contract."
+        )
+
+
 def _print_contract_readiness(status: dict[str, Any]) -> None:
     readiness = status.get("readiness") or {}
     print(f"Board:            {status.get('board')}")
@@ -2055,6 +2315,11 @@ def _cmd_boards_contract(args: argparse.Namespace) -> int:
         return 0
 
     if sub == "review":
+        if getattr(args, "intake_template", False):
+            from hermes_cli.kanban_launch_coverage import intake_answer_template_json
+
+            print(json.dumps(intake_answer_template_json(), indent=2, ensure_ascii=False))
+            return 0
         contract, error = _parse_json_object_flag(getattr(args, "contract", None), "--contract")
         if error:
             print(f"kanban boards contract review: {error}", file=sys.stderr)
@@ -2077,6 +2342,8 @@ def _cmd_boards_contract(args: argparse.Namespace) -> int:
             print("kanban boards contract review: --contract, --rough-goal, or --intake-answers is required", file=sys.stderr)
             return 2
         approve = bool(getattr(args, "approve", False))
+        prev_progress = os.environ.get("HERMES_KANBAN_CLI_PROGRESS")
+        os.environ["HERMES_KANBAN_CLI_PROGRESS"] = "1"
         try:
             result = kb.review_business_launch_contract(
                 normed,
@@ -2098,31 +2365,16 @@ def _cmd_boards_contract(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"kanban boards contract review: {exc}", file=sys.stderr)
             return 2
+        finally:
+            if prev_progress is None:
+                os.environ.pop("HERMES_KANBAN_CLI_PROGRESS", None)
+            else:
+                os.environ["HERMES_KANBAN_CLI_PROGRESS"] = prev_progress
         if getattr(args, "json", False):
             print(json.dumps(result, indent=2, ensure_ascii=False))
         else:
             print(f"Board {normed!r} launch phase: {result.get('launch_phase')}")
-            readiness = result.get("readiness") or {}
-            print(f"Readiness: {readiness.get('status')}")
-            questions = result.get("questions") or []
-            if questions:
-                print("Questions:")
-                for question in questions:
-                    print(f"  - {question}")
-            else:
-                intake = result.get("launch_intake") or {}
-                assessment = intake.get("answer_assessment") or {}
-                generation = intake.get("question_generation") or {}
-                if assessment.get("required"):
-                    print(
-                        "Next step: Hermes must assess these answers and either ask "
-                        "follow-up questions or draft the board contract."
-                    )
-                elif generation.get("required"):
-                    print(
-                        "Next step: Hermes must ask tailored clarification questions "
-                        "from this rough goal before drafting the board contract."
-                    )
+            _print_contract_review_human(result, normed)
         return 0
 
     if sub == "approval-token":

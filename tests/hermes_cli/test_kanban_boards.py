@@ -1569,6 +1569,14 @@ class TestBoardCRUD:
             author="tester",
             risk="low",
         )
+        # Mint the token bound to `first` while it is still the sole live
+        # pending amendment — re-proposing below supersedes it (P0-2), so the
+        # token must be issued first to exercise the binding check.
+        token = _issue_amendment_token(
+            "amend-token-bound",
+            first["id"],
+            evidence_source="first-amendment-approval",
+        )
         second = kb.propose_board_contract_amendment(
             "amend-token-bound",
             patch=patch,
@@ -1576,12 +1584,8 @@ class TestBoardCRUD:
             author="tester",
             risk="low",
         )
-        token = _issue_amendment_token(
-            "amend-token-bound",
-            first["id"],
-            evidence_source="first-amendment-approval",
-        )
 
+        # A token bound to `first` cannot apply the (now-live) `second`.
         with pytest.raises(ValueError, match="different amendment"):
             kb.apply_board_contract_amendment(
                 "amend-token-bound",
@@ -1687,7 +1691,10 @@ class TestBoardCRUD:
                 approval_token=token,
             )
 
-    def test_stale_contract_amendments_are_rejected(self, fresh_home):
+    def test_reproposing_supersedes_prior_pending_amendment(self, fresh_home):
+        # P0-2: a board iterating toward launch must not accumulate competing
+        # pending amendments. Re-proposing on the same base version supersedes
+        # the prior pending draft so exactly one live candidate remains.
         _approve_launch_contract(
             "stale-amend",
             _launch_ready_contract(),
@@ -1708,26 +1715,51 @@ class TestBoardCRUD:
             risk="low",
         )
 
+        meta = kb.read_board_metadata("stale-amend")
+        by_id = {a["id"]: a for a in meta["contract_amendments"]}
+        assert by_id[first["id"]]["status"] == "superseded"
+        assert by_id[first["id"]]["superseded_by"] == second["id"]
+        assert by_id[second["id"]]["status"] == "pending"
+
+        # The superseded draft can no longer be applied.
+        with pytest.raises(ValueError, match="is not pending"):
+            kb.apply_board_contract_amendment("stale-amend", first["id"])
+
+        # The single live candidate applies cleanly, advancing to v2.
         token = _issue_amendment_token(
             "stale-amend",
-            first["id"],
-            evidence_source="first-owner-approval",
+            second["id"],
+            evidence_source="second-owner-approval",
         )
         kb.apply_board_contract_amendment(
             "stale-amend",
-            first["id"],
+            second["id"],
             approval_token=token,
         )
-
-        with pytest.raises(ValueError, match="is stale"):
-            kb.apply_board_contract_amendment(
-                "stale-amend",
-                second["id"],
-            )
-
         meta = kb.read_board_metadata("stale-amend")
         assert meta["contract_version"] == 2
-        assert meta["objective"]["success"] == ["two signed contracts per month"]
+        assert meta["objective"]["success"] == ["three signed contracts per month"]
+
+        # Defense-in-depth: the stale guard still rejects an amendment pinned to
+        # the old from_version (simulated legacy drift), never applying it.
+        candidate = by_id[second["id"]]["candidate_contract"]
+        stale_amendments = list(meta.get("contract_amendments") or [])
+        stale_amendments.append({
+            "id": "ca_stalefixture",
+            "status": "pending",
+            "from_version": 1,
+            "created_at": 0,
+            "author": "tester",
+            "reason": "stale leftover",
+            "risk": "low",
+            "patch": {"objective": {"success": ["four signed contracts per month"]}},
+            "candidate_contract": candidate,
+            "readiness": {"ok": True},
+        })
+        kb.write_board_metadata("stale-amend", contract_amendments=stale_amendments)
+        with pytest.raises(ValueError, match="is stale"):
+            kb.apply_board_contract_amendment("stale-amend", "ca_stalefixture")
+        assert kb.read_board_metadata("stale-amend")["contract_version"] == 2
 
     def test_active_board_review_cannot_overwrite_contract(self, fresh_home):
         original = _launch_ready_contract()

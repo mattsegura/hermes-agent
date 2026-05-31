@@ -36,6 +36,7 @@ from hermes_cli.kanban_launch_grammar import (
 __all__ = [
     "render_owner_contract_summary",
     "render_contract_one_liner",
+    "render_launch_setup_block",
     "contract_summary_facts",
 ]
 
@@ -345,6 +346,38 @@ def _gated_actions(root: dict[str, Any]) -> tuple[list[str], list[str]]:
     return needs_approval, autonomous_external
 
 
+def _model_routing(root: dict[str, Any]) -> list[str]:
+    runtime = _as_dict(root.get("runtime"))
+    models = _as_dict(runtime.get("models"))
+    if not models:
+        return []
+    out: list[str] = []
+    default = str(models.get("default") or "").strip()
+    if default:
+        out.append(f"default → `{default}`")
+    roles = _as_dict(models.get("roles"))
+    for role, slug in sorted(roles.items()):
+        slug_s = str(slug or "").strip()
+        if slug_s:
+            out.append(f"{_humanize(role)} → `{slug_s}`")
+    task_types = _as_dict(models.get("task_types"))
+    for kind, slug in sorted(task_types.items()):
+        slug_s = str(slug or "").strip()
+        if slug_s:
+            out.append(f"{_humanize(kind)} tasks → `{slug_s}`")
+    stages = _as_dict(models.get("stages"))
+    for stage, slug in sorted(stages.items()):
+        slug_s = str(slug or "").strip()
+        if slug_s:
+            out.append(f"stage `{stage}` → `{slug_s}`")
+    actions = _as_dict(models.get("actions"))
+    for action, slug in sorted(actions.items()):
+        slug_s = str(slug or "").strip()
+        if slug_s:
+            out.append(f"action `{action}` → `{slug_s}`")
+    return out[:12]
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -362,7 +395,62 @@ def contract_summary_facts(contract: Any) -> dict[str, Any]:
         "sensors": _sensors(root),
         "needs_approval": needs_approval,
         "autonomous_external": autonomous_external,
+        "model_routing": _model_routing(root),
     }
+
+
+def render_launch_setup_block(
+    contract: Any,
+    *,
+    board: Optional[str] = None,
+    credentials: Optional[dict[str, Any]] = None,
+) -> str:
+    """Numbered launch setup list: required inputs + credential status (no secrets)."""
+    root = _contract_root(contract)
+    specs: list[dict[str, Any]] = []
+    for item in _as_list(root.get("launch_required_inputs")):
+        if isinstance(item, dict) and str(item.get("key") or "").strip():
+            specs.append(item)
+    if not specs and not credentials:
+        return ""
+
+    cred_by_key: dict[str, dict[str, Any]] = {}
+    if isinstance(credentials, dict):
+        for row in _as_list(credentials.get("inputs")):
+            if isinstance(row, dict) and row.get("key"):
+                cred_by_key[str(row["key"])] = row
+    missing = list(credentials.get("missing_keys") or []) if isinstance(credentials, dict) else []
+
+    lines: list[str] = ["\n*Before launch — setup:*"]
+    if specs:
+        for idx, spec in enumerate(specs, start=1):
+            key = str(spec.get("key") or "").strip()
+            label = str(spec.get("label") or _humanize(key) or key).strip()
+            desc = str(spec.get("description") or "").strip()
+            env_var = str(spec.get("env_var") or "").strip()
+            row = cred_by_key.get(key) or {}
+            if row.get("provisioned") or key not in missing:
+                status = "provisioned"
+            else:
+                status = "MISSING"
+            tail = f" — {desc}" if desc else ""
+            env_note = f" (env `{env_var}`)" if env_var else ""
+            lines.append(f"{idx}. `{key}` — {label}{env_note} [{status}]{tail}")
+    elif missing:
+        lines.append(f"Missing credential keys: {', '.join(missing)}")
+
+    if credentials and credentials.get("required_count"):
+        prov = int(credentials.get("provisioned_count") or 0)
+        req = int(credentials.get("required_count") or 0)
+        if prov < req:
+            lines.append(
+                f"\nProvide missing credentials via "
+                f"`hermes kanban boards credentials set` or "
+                f"`kanban_submit_launch_credentials` before `/approve {board or '<board>'}`."
+            )
+        else:
+            lines.append("\nAll declared launch credentials are provisioned.")
+    return "\n".join(lines)
 
 
 def render_contract_one_liner(contract: Any) -> str:
@@ -384,6 +472,7 @@ def render_owner_contract_summary(
     board: Optional[str] = None,
     include_approve_hint: bool = True,
     active: bool = False,
+    credentials: Optional[dict[str, Any]] = None,
 ) -> str:
     """Render a Telegram-friendly Markdown summary of a board contract.
 
@@ -429,6 +518,22 @@ def render_owner_contract_summary(
 
     if facts["sensors"]:
         lines.append(f"\n*Safety sensors:* {', '.join(facts['sensors'])}.")
+
+    if facts["model_routing"]:
+        lines.append("\n*Model routing:*")
+        for row in facts["model_routing"]:
+            lines.append(f"• {row}")
+    else:
+        lines.append(
+            "\n*Model routing:* each agent uses its profile's default model "
+            "(override at launch with `runtime.models`)."
+        )
+
+    setup_block = render_launch_setup_block(
+        contract, board=board, credentials=credentials
+    )
+    if setup_block:
+        lines.append(setup_block)
 
     if not active and include_approve_hint:
         slug = board or "<board>"

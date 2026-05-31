@@ -344,6 +344,99 @@ def _ok(**fields: Any) -> str:
     return json.dumps({"ok": True, **fields})
 
 
+# ---------------------------------------------------------------------------
+# Contract authoring guidance (P0-1 / P0-3)
+#
+# Surfaced in the launch-review / amendment tool descriptions AND returned
+# alongside every batched validation result, so the model sees the schema, the
+# closed enums, and the hard invariants BEFORE/while drafting — instead of
+# reverse-engineering them one validator error at a time. Keep this compact.
+# ---------------------------------------------------------------------------
+_CONTRACT_SCHEMA_HINT = (
+    "READ THE SCHEMA BEFORE WRITING A PATCH — do NOT hand-author contract JSON "
+    "by trial and error. Call `kanban_contract_schema` for the canonical shape "
+    "+ a valid example, or `skill_view kanban-system-architecture "
+    "references/contract-amendment-validator-invariants.md`. "
+    "Required top-level keys: objective{statement,success[],failure[],"
+    "constraints[]}, runtime{mode,dispatcher.profile,profiles{ceo,optimizer,"
+    "worker},require_provider_policy,require_worker_envelopes,provider_policy,"
+    "worker_envelopes}, workflow{require_semantics,workstreams[],stages[]}, "
+    "entities[{key,type,states,terminal_states}], event_loops[], "
+    "approval_gates[], proof_requirements[], escalation_paths[], tunables{}, "
+    "and side_effect_policy (REQUIRED at TOP LEVEL — a sibling of runtime, NOT "
+    "under runtime — declaring {allowed[],approval_required[],forbidden[]} over "
+    "the side_effect_class enum; this is IN ADDITION to runtime.provider_policy "
+    "+ runtime.worker_envelopes, all three are required). "
+    "Closed enums (free-text/near-miss values fail closed): "
+    "side_effect_class ∈ {none, internal, external_reversible, "
+    "external_irreversible, financial}; trigger kind ∈ {timer, inbound, "
+    "state_change, metric, manual}. Hard invariants: every external_*/financial "
+    "side_effect_class used by any action MUST appear in "
+    "side_effect_policy.approval_required or .forbidden; each stage exit_criteria "
+    "entry is an OBJECT {transition,evidence_required[]} whose transition is a "
+    "real stage key; every tunable declares a range/min-max/allowed set; every "
+    "event_loop declares terminal_states or stop_conditions (a conversational "
+    "loop also needs a timer trigger + >=2 stop outcomes). The validator now "
+    "returns ALL errors at once — fix them in a single follow-up patch."
+)
+
+_CONTRACT_EXAMPLE_FIXTURE = "grow_app_one_week.contract.json"
+
+
+def _load_trimmed_contract_example() -> dict[str, Any]:
+    """Return a trimmed, known-valid contract example for the schema helper.
+
+    Reads the shipped ``grow_app_one_week`` launch-intake fixture (the closest
+    analog to a consumer-app growth board) and trims verbose prose so the
+    example fits comfortably in context while still showing every required
+    block and the exact nesting the validator expects. Best-effort: returns a
+    small inline skeleton if the fixture cannot be read.
+    """
+    import os.path
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(here, "tests", "fixtures", "launch_intake", _CONTRACT_EXAMPLE_FIXTURE)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            contract = json.load(handle)
+    except Exception:
+        return {
+            "objective": {"statement": "...", "success": ["..."], "failure": ["..."], "constraints": ["..."]},
+            "runtime": {
+                "mode": "company",
+                "dispatcher": {"profile": "..."},
+                "profiles": {"ceo": "...", "optimizer": "...", "worker": "..."},
+                "require_provider_policy": True,
+                "require_worker_envelopes": True,
+                "provider_policy": {},
+                "worker_envelopes": {},
+            },
+            "workflow": {"require_semantics": True, "workstreams": [], "stages": []},
+            "entities": [{"key": "...", "type": "...", "states": ["..."], "terminal_states": ["..."]}],
+            "event_loops": [],
+            "approval_gates": [],
+            "proof_requirements": [],
+            "escalation_paths": [],
+            "tunables": {},
+            "side_effect_policy": {
+                "allowed": ["none", "internal"],
+                "approval_required": ["external_reversible", "external_irreversible"],
+                "forbidden": ["financial"],
+            },
+        }
+
+    def _truncate(value: Any, depth: int = 0) -> Any:
+        if isinstance(value, str):
+            return value if len(value) <= 160 else value[:157] + "..."
+        if isinstance(value, list):
+            return [_truncate(v, depth + 1) for v in value[:3]]
+        if isinstance(value, dict):
+            return {k: _truncate(v, depth + 1) for k, v in value.items()}
+        return value
+
+    return _truncate(contract)
+
+
 def _public_launch_approval(kb, board: Any, approval: Any) -> Optional[dict[str, Any]]:
     if isinstance(board, dict):
         summary = kb._public_launch_approval_summary(board)
@@ -389,7 +482,16 @@ def _sanitize_launch_tool_result(kb, result: dict[str, Any]) -> dict[str, Any]:
     sanitized["board"] = _public_launch_board(kb, board)
     if approval is not None:
         sanitized["approval"] = _public_launch_approval(kb, board, approval)
+    _attach_launch_degraded_warning(sanitized)
     _attach_launch_intake_followup(sanitized)
+    _attach_launch_credentials_guidance(sanitized)
+    if (
+        isinstance(sanitized.get("assistant_next_action"), dict)
+        and not sanitized.get("owner_contract_summary")
+    ):
+        summary = _render_owner_contract_summary_for_payload(sanitized)
+        if summary:
+            sanitized["owner_contract_summary"] = summary
     return sanitized
 
 
@@ -413,6 +515,18 @@ def _extract_launch_answer_assessment(payload: dict[str, Any]) -> Optional[dict[
     return None
 
 
+def _launch_credentials_public(board: Optional[str], contract: Any) -> Optional[dict[str, Any]]:
+    if not board:
+        return None
+    try:
+        from hermes_cli import kanban_credentials as kc
+
+        return kc.assess_board_credentials(board, contract if isinstance(contract, dict) else None)
+    except Exception:
+        logger.debug("launch credentials assess failed", exc_info=True)
+        return None
+
+
 def _render_owner_contract_summary_for_payload(payload: dict[str, Any]) -> str:
     """Render a deterministic owner-facing contract summary from a tool result.
 
@@ -429,14 +543,79 @@ def _render_owner_contract_summary_for_payload(payload: dict[str, Any]) -> str:
     board_meta = payload.get("board")
     if isinstance(board_meta, dict):
         board_slug = board_meta.get("slug")
+    creds = payload.get("launch_credentials")
+    if not isinstance(creds, dict):
+        creds = _launch_credentials_public(board_slug, contract)
     try:
         from hermes_cli.kanban_launch_summary import render_owner_contract_summary
         return render_owner_contract_summary(
-            contract, board=board_slug, include_approve_hint=True, active=False
+            contract,
+            board=board_slug,
+            include_approve_hint=True,
+            active=False,
+            credentials=creds,
         )
     except Exception:
         logger.debug("owner contract summary render failed", exc_info=True)
         return ""
+
+
+def _attach_launch_degraded_warning(payload: dict[str, Any]) -> None:
+    intake = payload.get("launch_intake")
+    if not isinstance(intake, dict) or not intake.get("degraded_mode"):
+        return
+    try:
+        from hermes_cli.kanban_db import LAUNCH_INTAKE_DEGRADED_HINT
+    except Exception:
+        LAUNCH_INTAKE_DEGRADED_HINT = (
+            "Configure auxiliary model slot 'kanban_launch_intake' for full launch intake."
+        )
+    payload["launch_intake_degraded_warning"] = LAUNCH_INTAKE_DEGRADED_HINT
+    existing = str(payload.get("owner_message") or "").strip()
+    if LAUNCH_INTAKE_DEGRADED_HINT not in existing:
+        payload["owner_message"] = (
+            f"{existing}\n\n{LAUNCH_INTAKE_DEGRADED_HINT}".strip()
+            if existing
+            else LAUNCH_INTAKE_DEGRADED_HINT
+        )
+
+
+def _attach_launch_credentials_guidance(payload: dict[str, Any]) -> None:
+    board_slug = None
+    board_meta = payload.get("board")
+    if isinstance(board_meta, dict):
+        board_slug = board_meta.get("slug")
+    contract = payload.get("contract")
+    if not board_slug:
+        return
+    creds = _launch_credentials_public(
+        board_slug, contract if isinstance(contract, dict) else None
+    )
+    if not creds or not creds.get("required_count"):
+        return
+    payload["launch_credentials"] = creds
+    try:
+        from hermes_cli.kanban_launch_summary import render_launch_setup_block
+        setup = render_launch_setup_block(
+            contract if isinstance(contract, dict) else {},
+            board=board_slug,
+            credentials=creds,
+        )
+    except Exception:
+        setup = ""
+    if setup:
+        payload["launch_setup_block"] = setup
+    missing = creds.get("missing_keys") or []
+    if missing and isinstance(payload.get("assistant_next_action"), dict):
+        action = dict(payload["assistant_next_action"])
+        extra = (
+            " Before asking the owner to `/approve`, collect missing launch "
+            f"credentials for keys: {', '.join(missing)}. Use "
+            "kanban_submit_launch_credentials or tell the owner to run "
+            "`hermes kanban boards credentials set` — never echo secret values."
+        )
+        action["instruction"] = str(action.get("instruction") or "").strip() + extra
+        payload["assistant_next_action"] = action
 
 
 def _attach_launch_intake_followup(payload: dict[str, Any]) -> None:
@@ -457,6 +636,10 @@ def _attach_launch_intake_followup(payload: dict[str, Any]) -> None:
         )
         if intake_state == "ready_for_owner_review" and answer_sufficient:
             owner_summary_text = _render_owner_contract_summary_for_payload(payload)
+            board_slug = None
+            if isinstance(payload.get("board"), dict):
+                board_slug = payload["board"].get("slug")
+            approve_hint = f"/approve {board_slug}" if board_slug else "/approve <board>"
             next_action = {
                 "type": "launch_contract_owner_review",
                 "required": True,
@@ -466,11 +649,13 @@ def _attach_launch_intake_followup(payload: dict[str, Any]) -> None:
                     "operating contract in plain language. A deterministic, owner-ready "
                     "summary is provided in this result as 'owner_contract_summary' -- relay "
                     "it (you may lightly adjust tone, but keep every section: pipeline, what "
-                    "it watches, what needs approval, the auto-tunable dials, and the "
-                    "/approve call to action). State that the board is still in "
-                    "contract_review, dispatch is disabled, and owner approval is required "
-                    "before activation. Do not call intake_answers again. Do not approve or "
-                    "activate launch."
+                    "it watches, what needs approval, the auto-tunable dials, launch setup "
+                    "(if launch_setup_block is present), model routing, and the explicit "
+                    f"{approve_hint} call to action). State that the board is still in "
+                    "contract_review, dispatch is disabled, and ONLY the owner can approve "
+                    f"via {approve_hint} (you cannot self-approve). If launch_credentials "
+                    "shows missing keys, guide the owner to supply them before approval. "
+                    "Do not call intake_answers again. Do not approve or activate launch."
                 ),
                 "response_style": (
                     "Keep it owner-facing and concise. Prefer the provided "
@@ -1236,6 +1421,14 @@ def _handle_business_launch_review(args: dict, **kw) -> str:
         return guard
     board = args.get("board")
     contract = args.get("contract")
+    model_routing = args.get("model_routing")
+    if model_routing is not None:
+        from hermes_cli.kanban_model_routing import merge_model_routing_into_runtime
+
+        base = dict(contract) if isinstance(contract, dict) else {}
+        runtime = base.get("runtime") if isinstance(base.get("runtime"), dict) else {}
+        base["runtime"] = merge_model_routing_into_runtime(runtime, model_routing)
+        contract = base
     rough_goal = args.get("rough_goal")
     intake_answers = args.get("intake_answers")
     if not contract and not rough_goal and intake_answers is None:
@@ -1264,12 +1457,83 @@ def _handle_business_launch_review(args: dict, **kw) -> str:
             approval_token=args.get("approval_token"),
             require_launch_intake=_is_owner_launch_intake_profile(),
         )
-        return json.dumps(_sanitize_launch_tool_result(kb, result), ensure_ascii=False)
+        sanitized = _sanitize_launch_tool_result(kb, result)
+        try:
+            from hermes_cli.kanban_model_routing import build_model_routing_read_model
+
+            board_meta = sanitized.get("board")
+            if isinstance(board_meta, dict):
+                sanitized["model_routing"] = build_model_routing_read_model(board_meta)
+        except Exception:
+            pass
+        return json.dumps(sanitized, ensure_ascii=False)
     except ValueError as e:
-        return tool_error(f"kanban_business_launch_review: {e}")
+        msg = str(e)
+        if "does not match pinned" in msg:
+            msg = f"{msg} Tip: omit board= when creating a new board via create_if_missing."
+        return tool_error(f"kanban_business_launch_review: {msg}")
     except Exception as e:
         logger.exception("kanban_business_launch_review failed")
         return tool_error(f"kanban_business_launch_review: {e}")
+
+
+def _handle_launch_credentials_status(args: dict, **kw) -> str:
+    guard = _require_orchestrator_tool(
+        "kanban_launch_credentials_status",
+        allow_launch_intake=True,
+    )
+    if guard:
+        return guard
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_credentials as kc
+
+        board = args.get("board") or kb.get_current_board()
+        meta = kb.read_board_metadata(board)
+        contract = kb._metadata_as_business_contract(meta)
+        status = kc.assess_board_credentials(board, contract)
+        return json.dumps({"ok": status.get("ok"), "board": board, "credentials": status},
+                          ensure_ascii=False)
+    except ValueError as e:
+        return tool_error(f"kanban_launch_credentials_status: {e}")
+    except Exception as e:
+        logger.exception("kanban_launch_credentials_status failed")
+        return tool_error(f"kanban_launch_credentials_status: {e}")
+
+
+def _handle_submit_launch_credentials(args: dict, **kw) -> str:
+    guard = _require_orchestrator_tool(
+        "kanban_submit_launch_credentials",
+        allow_launch_intake=True,
+    )
+    if guard:
+        return guard
+    board = args.get("board")
+    inputs = args.get("inputs")
+    if not board:
+        return tool_error("board is required")
+    if not isinstance(inputs, dict):
+        return tool_error("inputs must be an object mapping credential key -> value")
+    try:
+        from hermes_cli import kanban_db as kb
+        from hermes_cli import kanban_credentials as kc
+
+        meta = kb.read_board_metadata(board)
+        contract = kb._metadata_as_business_contract(meta)
+        result = kc.submit_launch_credentials(board, inputs, contract=contract)
+        sanitized = {
+            "ok": result.get("ok"),
+            "board": board,
+            "stored_keys": result.get("stored_keys") or [],
+            "ignored_keys": result.get("ignored_keys") or [],
+            "credentials": result.get("credentials") or {},
+        }
+        return json.dumps(sanitized, ensure_ascii=False)
+    except ValueError as e:
+        return tool_error(f"kanban_submit_launch_credentials: {e}")
+    except Exception as e:
+        logger.exception("kanban_submit_launch_credentials failed")
+        return tool_error(f"kanban_submit_launch_credentials: {e}")
 
 
 def _handle_contract_amendment_propose(args: dict, **kw) -> str:
@@ -1291,6 +1555,21 @@ def _handle_contract_amendment_propose(args: dict, **kw) -> str:
         return tool_error("reason is required")
     try:
         from hermes_cli import kanban_db as kb
+        # BATCHED pre-validate (P0-1): collect EVERY structural/invariant/
+        # readiness problem in one pass instead of failing on the first. If the
+        # patch cannot even be normalized, return all shape errors at once and
+        # do NOT store a broken draft (avoids the competing-pending pile-up).
+        validation = kb.validate_amendment_candidate(board, patch)
+        if validation.get("normalization_errors"):
+            return json.dumps(
+                {
+                    "ok": False,
+                    "status": "invalid_patch",
+                    "errors": validation["normalization_errors"],
+                    "hint": _CONTRACT_SCHEMA_HINT,
+                },
+                ensure_ascii=False,
+            )
         amendment = kb.propose_board_contract_amendment(
             board,
             patch=patch,
@@ -1298,12 +1577,67 @@ def _handle_contract_amendment_propose(args: dict, **kw) -> str:
             author=os.environ.get("HERMES_PROFILE") or "orchestrator",
             risk=args.get("risk"),
         )
+        blocking = list(validation.get("errors") or [])
+        missing = list(validation.get("missing") or [])
+        if blocking or missing:
+            return _ok(
+                amendment=amendment,
+                validation={
+                    "errors": blocking,
+                    "missing": missing,
+                    "warnings": validation.get("warnings") or [],
+                    "hint": _CONTRACT_SCHEMA_HINT,
+                },
+            )
         return _ok(amendment=amendment)
     except ValueError as e:
         return tool_error(f"kanban_contract_amendment_propose: {e}")
     except Exception as e:
         logger.exception("kanban_contract_amendment_propose failed")
         return tool_error(f"kanban_contract_amendment_propose: {e}")
+
+
+def _handle_contract_schema(args: dict, **kw) -> str:
+    """Return the canonical board-contract schema + a valid trimmed example.
+
+    Read-only. Call this BEFORE drafting a contract or amendment so the patch
+    matches the validator's strict grammar on the first try, instead of
+    reverse-engineering it one rejection at a time.
+    """
+    guard = _require_orchestrator_tool(
+        "kanban_contract_schema",
+        allow_launch_intake=True,
+    )
+    if guard:
+        return guard
+    try:
+        from hermes_cli.kanban_launch_grammar import (
+            SIDE_EFFECT_CLASSES,
+            TRIGGER_KINDS,
+        )
+        side_effect_classes = sorted(SIDE_EFFECT_CLASSES)
+        trigger_kinds = sorted(TRIGGER_KINDS)
+    except Exception:
+        side_effect_classes = [
+            "none",
+            "internal",
+            "external_reversible",
+            "external_irreversible",
+            "financial",
+        ]
+        trigger_kinds = ["timer", "inbound", "state_change", "metric", "manual"]
+    return _ok(
+        guidance=_CONTRACT_SCHEMA_HINT,
+        enums={
+            "side_effect_class": side_effect_classes,
+            "trigger_kind": trigger_kinds,
+        },
+        reference_skill=(
+            "kanban-system-architecture "
+            "references/contract-amendment-validator-invariants.md"
+        ),
+        example=_load_trimmed_contract_example(),
+    )
 
 
 def _handle_contract_amendment_apply(args: dict, **kw) -> str:
@@ -2077,20 +2411,64 @@ KANBAN_BOARD_LAUNCH_STATUS_SCHEMA = {
     },
 }
 
+KANBAN_LAUNCH_CREDENTIALS_STATUS_SCHEMA = {
+    "name": "kanban_launch_credentials_status",
+    "description": (
+        "Return which launch credentials a board still needs before dispatch "
+        "can start. Shows only public metadata (labels, env var names, "
+        "provisioned/missing) — never secret values."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
+KANBAN_SUBMIT_LAUNCH_CREDENTIALS_SCHEMA = {
+    "name": "kanban_submit_launch_credentials",
+    "description": (
+        "Store owner-supplied launch credentials for a board during contract "
+        "review. Values are encrypted at rest and never written to board.json. "
+        "Only submit keys declared in launch_required_inputs."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "board": _board_schema_prop(),
+            "inputs": {
+                "type": "object",
+                "description": (
+                    "Map of launch_required_inputs key -> secret/value "
+                    "(e.g. revenuecat_api_key)."
+                ),
+                "additionalProperties": {"type": "string"},
+            },
+        },
+        "required": ["board", "inputs"],
+    },
+}
+
 KANBAN_BUSINESS_LAUNCH_REVIEW_SCHEMA = {
     "name": "kanban_business_launch_review",
     "description": (
-        "Review and optionally store a draft business-runtime contract before "
-        "launching a board. If the owner gives a vague business idea, call this "
-        "with rough_goal and create_if_missing=true. For a rough goal, the tool "
-        "returns a mandatory model-generated launch-intake prompt instead of "
-        "hardcoded questions; use that prompt to ask tailored owner clarification "
-        "questions in your next response before drafting the contract. When the "
-        "owner answers, call this with intake_answers so the answer quality is "
-        "assessed recursively before any contract draft. Set "
-        "approve=true only after the owner has approved a launch-ready contract "
-        "through an external approval token; otherwise the board remains in "
-        "contract_review and dispatch is gated."
+        "Hermes built-in board launch wizard (server-orchestrated launch intake). "
+        "Review and store a draft business-runtime contract before launch. "
+        "If the owner gives a vague business idea, call with rough_goal and "
+        "create_if_missing=true — omit board= for new boards (do not pass a slug "
+        "that does not exist yet). The server runs the kanban_launch_intake "
+        "auxiliary pipeline (research, generated_questions, answer assessment, "
+        "contract synthesis) and returns assistant_next_action telling you what "
+        "to say next on Telegram. Relay server-generated questions verbatim; "
+        "submit owner answers via intake_answers; when ready_for_owner_review, "
+        "show owner_contract_summary and tell the owner to `/approve <slug>` "
+        "(only the owner can approve — never set approve=true yourself). "
+        "Use kanban_launch_credentials_status / kanban_submit_launch_credentials "
+        "for launch_required_inputs before approval. Optional model_routing "
+        "merges into runtime.models. Prefer this wizard over hand-authoring JSON; "
+        "if shaping JSON directly, call kanban_contract_schema first."
     ),
     "parameters": {
         "type": "object",
@@ -2113,6 +2491,17 @@ KANBAN_BUSINESS_LAUNCH_REVIEW_SCHEMA = {
                 "description": (
                     "Draft business contract with objective, runtime, workflow, "
                     "entities, event loops, and approval/proof policy."
+                ),
+            },
+            "model_routing": {
+                "type": "object",
+                "description": (
+                    "Optional per-role/per-task model plan merged into "
+                    "runtime.models before review. Shape: "
+                    "{default?: slug, roles?: {ceo|optimizer|worker|...: slug}, "
+                    "task_types?: {triage|implementation|review|...: slug}, "
+                    "stages?: {stage_key: slug}, actions?: {action_key: slug}}. "
+                    "Task-level model_override still wins at dispatch."
                 ),
             },
             "create_if_missing": {
@@ -2160,7 +2549,15 @@ KANBAN_CONTRACT_AMENDMENT_PROPOSE_SCHEMA = {
     "description": (
         "Propose a versioned patch to a board's business contract. This does "
         "not change the active runtime; it stores a pending amendment, validates "
-        "the candidate contract, and returns any missing clarity questions."
+        "the candidate contract, and returns any missing clarity questions. "
+        "The validator now returns ALL errors at once (normalization + reactive "
+        "invariants + readiness gaps) — fix them in ONE follow-up patch rather "
+        "than re-guessing. Proposing again supersedes your prior pending draft "
+        "on the same version, so only one live candidate remains. "
+        "Do NOT hand-author the patch by trial and error: call "
+        "`kanban_contract_schema` (or read the kanban-system-architecture "
+        "contract-amendment-validator-invariants reference) FIRST to get the "
+        "exact shape + enums."
     ),
     "parameters": {
         "type": "object",
@@ -2182,6 +2579,20 @@ KANBAN_CONTRACT_AMENDMENT_PROPOSE_SCHEMA = {
         },
         "required": ["board", "patch", "reason"],
     },
+}
+
+KANBAN_CONTRACT_SCHEMA_SCHEMA = {
+    "name": "kanban_contract_schema",
+    "description": (
+        "Read-only. Return the canonical board operating-contract schema "
+        "(required top-level keys, the closed side_effect_class / trigger-kind "
+        "enums, the hard validator invariants) plus a trimmed, known-valid "
+        "example contract. CALL THIS FIRST, before drafting a contract via "
+        "kanban_business_launch_review or patching one via "
+        "kanban_contract_amendment_propose — never hand-author contract JSON by "
+        "trial and error against validator errors."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
 KANBAN_CONTRACT_AMENDMENT_APPLY_SCHEMA = {
@@ -2755,12 +3166,39 @@ registry.register(
 )
 
 registry.register(
+    name="kanban_launch_credentials_status",
+    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    schema=KANBAN_LAUNCH_CREDENTIALS_STATUS_SCHEMA,
+    handler=_handle_launch_credentials_status,
+    check_fn=_check_kanban_launch_intake_mode,
+    emoji="🔐",
+)
+
+registry.register(
+    name="kanban_submit_launch_credentials",
+    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    schema=KANBAN_SUBMIT_LAUNCH_CREDENTIALS_SCHEMA,
+    handler=_handle_submit_launch_credentials,
+    check_fn=_check_kanban_launch_intake_mode,
+    emoji="🔐",
+)
+
+registry.register(
     name="kanban_contract_amendment_propose",
     toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
     schema=KANBAN_CONTRACT_AMENDMENT_PROPOSE_SCHEMA,
     handler=_handle_contract_amendment_propose,
     check_fn=_check_kanban_launch_intake_mode,
     emoji="🧭",
+)
+
+registry.register(
+    name="kanban_contract_schema",
+    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    schema=KANBAN_CONTRACT_SCHEMA_SCHEMA,
+    handler=_handle_contract_schema,
+    check_fn=_check_kanban_launch_intake_mode,
+    emoji="📐",
 )
 
 registry.register(

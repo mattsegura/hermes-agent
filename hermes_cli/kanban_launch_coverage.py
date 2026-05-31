@@ -45,6 +45,20 @@ DIMENSIONS: tuple[str, ...] = (
     "proof_and_stops",
 )
 
+_DIMENSION_HINTS: dict[str, str] = {
+    "outcome_signals": "Measurable success and failure signals (numbers, thresholds, time horizons).",
+    "subject_scope": "Who or what the work is about (customers, deals, accounts, products).",
+    "allowed_context": "Systems, channels, and tools Hermes may use (and any hard bans).",
+    "workflow_path": "Real-world path from first signal through done, paused, or disqualified.",
+    "approval_boundaries": "What runs autonomously vs what needs owner approval before acting.",
+    "proof_and_stops": "Proof artifacts, status updates, and conditions that stop the board.",
+}
+
+
+def intake_answer_template_json() -> dict[str, str]:
+    """Six-dimension intake answer skeleton for CLI ``--intake-template``."""
+    return {name: _DIMENSION_HINTS.get(name, "") for name in DIMENSIONS}
+
 # Default gate: every dimension must be at least ``partial`` and the mean score
 # must clear this threshold. Tuned so rich, structured intake passes while
 # generic blather and the placeholder universal contract do not.

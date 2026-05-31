@@ -1874,6 +1874,7 @@ class CreateBoardBody(BaseModel):
     optimizer_profile: Optional[str] = None
     worker_profile: Optional[str] = None
     workflow: Optional[dict] = None
+    model_routing: Optional[dict] = None
 
 
 class RenameBoardBody(BaseModel):
@@ -1935,6 +1936,7 @@ def create_board_endpoint(payload: CreateBoardBody):
             optimizer_profile=payload.optimizer_profile,
             worker_profile=payload.worker_profile,
             workflow=payload.workflow,
+            model_routing=payload.model_routing,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -2280,6 +2282,53 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
 
     # Echo back the resolved state (callers usually re-render from it).
     return get_orchestration_settings()
+
+
+# ---------------------------------------------------------------------------
+# Board model routing (runtime.models on the active board contract)
+# ---------------------------------------------------------------------------
+
+class ModelRoutingBody(BaseModel):
+    default: Optional[str] = None
+    roles: Optional[dict[str, str]] = None
+    task_types: Optional[dict[str, str]] = None
+    stages: Optional[dict[str, str]] = None
+    actions: Optional[dict[str, str]] = None
+
+
+@router.get("/model-routing")
+def get_model_routing(board: Optional[str] = Query(None)):
+    """Return supported model slugs and the board's runtime.models plan."""
+    board = _resolve_board(board)
+    try:
+        from hermes_cli.kanban_model_routing import build_model_routing_read_model
+
+        meta = kanban_db.read_board_metadata(board)
+        return {"board": board, **build_model_routing_read_model(meta)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"failed to read model routing: {exc}")
+
+
+@router.put("/model-routing")
+def set_model_routing(payload: ModelRoutingBody, board: Optional[str] = Query(None)):
+    """Merge model routing into the board's runtime metadata."""
+    board = _resolve_board(board)
+    try:
+        from hermes_cli.kanban_model_routing import (
+            build_model_routing_read_model,
+            merge_model_routing_into_runtime,
+        )
+
+        meta = kanban_db.read_board_metadata(board)
+        runtime = meta.get("runtime") if isinstance(meta.get("runtime"), dict) else {}
+        patch = payload.model_dump(exclude_none=True)
+        updated_runtime = merge_model_routing_into_runtime(runtime, patch)
+        meta = kanban_db.write_board_metadata(board, runtime=updated_runtime)
+        return {"board": board, **build_model_routing_read_model(meta)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"failed to update model routing: {exc}")
 
 
 @router.websocket("/events")

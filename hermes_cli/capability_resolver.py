@@ -116,13 +116,17 @@ def _normalize_required_input(item: Any, inject_path_tmpl: Optional[str],
     inject: Optional[str] = None
     if typ != "secret" and inject_path_tmpl:
         inject = inject_path_tmpl.replace("{capability_type}", capability_type).strip() or None
-    return {
+    env_var = str(item.get("env_var") or "").strip() or None
+    result = {
         "key": key,
         "label": str(item.get("label") or key),
         "type": typ,
         "required": bool(item.get("required", True)),
         "inject_path": inject,
     }
+    if env_var:
+        result["env_var"] = env_var
+    return result
 
 
 # ---------------------------------------------------------------------------

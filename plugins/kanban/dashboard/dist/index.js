@@ -1482,6 +1482,7 @@
     const [expanded, setExpanded] = useState(false);
     const [settings, setSettings] = useState(null);
     const [profiles, setProfiles] = useState([]);
+    const [modelRouting, setModelRouting] = useState(null);
     const [busy, setBusy] = useState({});
     const [msg, setMsg] = useState(null);
 
@@ -1489,9 +1490,11 @@
       Promise.all([
         SDK.fetchJSON(`${API}/orchestration`),
         SDK.fetchJSON(`${API}/profiles`),
+        SDK.fetchJSON(`${API}/model-routing`),
       ]).then(function (results) {
         setSettings(results[0] || null);
         setProfiles((results[1] && results[1].profiles) || []);
+        setModelRouting(results[2] || null);
         setMsg(null);
       }).catch(function (err) {
         setMsg({ ok: false, text: "Failed to load: " + (err.message || String(err)) });
@@ -1516,6 +1519,42 @@
         return res;
       }).catch(function (err) {
         setMsg({ ok: false, text: "Save failed: " + (err.message || String(err)) });
+      });
+    };
+
+    const saveModelRole = function (role, model) {
+      setMsg(null);
+      const roles = Object.assign({}, (modelRouting && modelRouting.models && modelRouting.models.roles) || {});
+      if (model) {
+        roles[role] = model;
+      } else {
+        delete roles[role];
+      }
+      return SDK.fetchJSON(`${API}/model-routing`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ roles: roles }),
+      }).then(function (res) {
+        setModelRouting(res);
+        setMsg({ ok: true, text: "Model routing saved." });
+        return res;
+      }).catch(function (err) {
+        setMsg({ ok: false, text: "Model save failed: " + (err.message || String(err)) });
+      });
+    };
+
+    const saveDefaultModel = function (model) {
+      setMsg(null);
+      return SDK.fetchJSON(`${API}/model-routing`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ default: model || "" }),
+      }).then(function (res) {
+        setModelRouting(res);
+        setMsg({ ok: true, text: "Model routing saved." });
+        return res;
+      }).catch(function (err) {
+        setMsg({ ok: false, text: "Model save failed: " + (err.message || String(err)) });
       });
     };
 
@@ -1680,6 +1719,48 @@
           ),
         ) : h("div", { className: "text-xs text-muted-foreground" },
           "Loading…"),
+
+        modelRouting ? h("div", { className: "border-t pt-3" },
+          h(Label, { className: "text-xs text-muted-foreground" },
+            "Model routing"),
+          h("div", { className: "text-[10px] text-muted-foreground pb-2" },
+            "Assign models per board role or task type. Workers use these at dispatch; profile defaults apply when unset."),
+          h("div", { className: "grid gap-3 sm:grid-cols-2" },
+            h("div", { className: "flex flex-col gap-1" },
+              h(Label, { className: "text-[10px] text-muted-foreground" }, "Board default"),
+              h(Select, Object.assign({
+                value: (modelRouting.models && modelRouting.models.default) || "",
+                className: "h-8",
+              }, selectChangeHandler(function (v) { saveDefaultModel(v); })),
+                h(SelectOption, { value: "" }, "(profile default)"),
+                (modelRouting.supported_slugs || []).slice(0, 40).map(function (slug) {
+                  return h(SelectOption, { key: slug, value: slug }, slug);
+                }),
+              ),
+            ),
+            (modelRouting.role_profiles || []).map(function (row) {
+              const role = row.role;
+              const current = (modelRouting.models && modelRouting.models.roles && modelRouting.models.roles[role]) || "";
+              return h("div", { key: role, className: "flex flex-col gap-1" },
+                h(Label, { className: "text-[10px] text-muted-foreground" },
+                  role + (row.profile ? " → " + row.profile : "")),
+                h(Select, Object.assign({
+                  value: current,
+                  className: "h-8",
+                }, selectChangeHandler(function (v) { saveModelRole(role, v); })),
+                  h(SelectOption, { value: "" }, "(profile default)"),
+                  (modelRouting.supported_slugs || []).slice(0, 40).map(function (slug) {
+                    return h(SelectOption, { key: role + slug, value: slug }, slug);
+                  }),
+                ),
+              );
+            }),
+          ),
+          (modelRouting.warnings && modelRouting.warnings.length)
+            ? h("div", { className: "text-[10px] text-yellow-600 mt-2" },
+                modelRouting.warnings.join(" · "))
+            : null,
+        ) : null,
 
         h("div", { className: "border-t pt-3" },
           h(Label, { className: "text-xs text-muted-foreground" },

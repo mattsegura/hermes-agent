@@ -15,9 +15,11 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli.kanban_launch_coverage import DIMENSIONS, intake_answer_template_json
 from hermes_cli.kanban_launch_summary import (
     contract_summary_facts,
     render_contract_one_liner,
+    render_launch_setup_block,
     render_owner_contract_summary,
 )
 
@@ -179,3 +181,45 @@ def test_autonomous_external_surfaces_when_ungated():
     assert "Send SMS to everyone" in facts["autonomous_external"]
     out = render_owner_contract_summary(contract, board="b")
     assert "WITHOUT approval" in out
+
+
+def test_intake_answer_template_has_six_dimensions():
+    template = intake_answer_template_json()
+    assert set(template.keys()) == set(DIMENSIONS)
+    assert all(isinstance(v, str) for v in template.values())
+
+
+def test_launch_setup_block_lists_required_inputs_without_secrets():
+    contract = {
+        "launch_required_inputs": [
+            {
+                "key": "revenuecat_api_key",
+                "label": "RevenueCat API key",
+                "description": "Read subscription metrics",
+                "env_var": "REVENUECAT_API_KEY",
+            }
+        ]
+    }
+    creds = {
+        "required_count": 1,
+        "provisioned_count": 0,
+        "missing_keys": ["revenuecat_api_key"],
+        "inputs": [
+            {
+                "key": "revenuecat_api_key",
+                "label": "RevenueCat API key",
+                "provisioned": False,
+                "env_var": "REVENUECAT_API_KEY",
+            }
+        ],
+    }
+    block = render_launch_setup_block(contract, board="growth", credentials=creds)
+    assert "revenuecat_api_key" in block
+    assert "MISSING" in block
+    assert "REVENUECAT_API_KEY" not in block or "env" in block.lower()
+
+    summary = render_owner_contract_summary(
+        contract, board="growth", credentials=creds
+    )
+    assert "Before launch" in summary
+    assert "revenuecat_api_key" in summary
