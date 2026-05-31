@@ -22,7 +22,6 @@ logic that :mod:`hermes_cli.kanban_db` composes:
 
 from __future__ import annotations
 
-import math
 import re
 from typing import Any, Optional
 
@@ -309,33 +308,38 @@ def cadence_seconds(trigger: dict) -> Optional[int]:
 
 
 def _coerce_int(value: Any) -> Optional[int]:
+    # ROUND-5 FIX 1 (byte-identity by construction): this helper is on the
+    # LEGACY (non-opted) code path, so its acceptance set must be BYTE-FOR-BYTE
+    # base 019271994. The base implementation was:
+    #
+    #     if isinstance(value, bool): return None
+    #     if isinstance(value, (int, float)): return int(value)
+    #     if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+    #         return int(value.strip())
+    #     return None
+    #
+    # The round-4 rewrite swapped the ``.isdigit()`` gate for a bare
+    # ``int(value.strip())``, which silently WIDENED the acceptance set ('+5',
+    # '1_000', '-0' that base REJECTED now parse), flipping the launch-gate
+    # report.ok / compiled max_nudges for DEFAULT-OFF contracts. We restore the
+    # EXACT base ``.isdigit()`` gate so every input keeps its base decision
+    # ('+5'/'1_000' -> None, '-0' -> 0, '٣' -> 3, '-1' -> -1, 2.7 -> 2).
+    #
+    # The ONLY legitimate concern the prior rounds addressed was a CRASH, not an
+    # acceptance question: a ``.isdigit()``-True char that ``int()`` rejects
+    # ('³' SUPERSCRIPT THREE, '①' CIRCLED ONE) raised ValueError and aborted the
+    # per-loop compile; a non-finite float ('.inf'/'.nan') raised on ``int()``
+    # too. We wrap ONLY the parse calls so those rare crashes become None (no
+    # acceptance-set change for any finite/parseable input -- proven byte-for-byte
+    # against base for the full fuzz vector).
     if isinstance(value, bool):
         return None
-    if isinstance(value, float):
-        # FIX 6: a non-finite float (.inf / .nan, which YAML authors can legally
-        # type as ``max_defers: .inf``) cannot become an int -- ``int(float('inf'))``
-        # raises OverflowError and ``int(float('nan'))`` raises ValueError. The
-        # caller's per-loop compile used to swallow that, silently dropping the
-        # ENTIRE timer schedule so the board activated with 0 watchers. Treat a
-        # non-finite bound as "no usable value" (None) so the loop still compiles;
-        # the malformed bound is surfaced separately at intake.
-        if not math.isfinite(value):
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
             return None
-        return int(value)
-    if isinstance(value, int):
-        return int(value)
-    if isinstance(value, str):
-        # FIX 6 (round-4): the goal is "no isdigit()-True/int()-raises char can
-        # crash the per-loop compile" -- NOT to narrow what int() itself accepts.
-        # A prior round added an ``.isascii()`` gate on top of the try/except;
-        # that gate CHANGED the parse result versus base ``int(value.strip())``
-        # for a non-ASCII but int()-parseable digit string ('٣' Arabic-Indic 3,
-        # '٦' -> 6), so a legacy loop carrying such a bound stopped being a usable
-        # bound and the default-off invariant report drifted from base. Drop the
-        # ascii narrowing: just ``int(value.strip())`` exactly like base, wrapped
-        # so an isdigit()-True/int()-raises char ('³','①') is caught (-> None, no
-        # crash) instead of aborting the compile. The matching change lives in
-        # invariants._coerce_nonneg_int so intake and runtime agree byte-for-byte.
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
         try:
             return int(value.strip())
         except (ValueError, TypeError):

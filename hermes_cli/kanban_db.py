@@ -12222,14 +12222,40 @@ def _side_effect_and_approval_blockers(
     policy flags. An action with a benign/``allowed`` side-effect class is never
     gated here, so declaring an approval gate over a read-only action does not
     silently wedge the board (and existing contract-runtime expectations hold).
+
+    ROUND-5 FIX 6 (close the strict scope gap): 9(a) DEFAULT-DENY enforcement used
+    to bite ONLY on :func:`reactive_tick` (the timer-followup path). The
+    worker-DISPATCH path here never consulted ``strict``, so a board that opted
+    into ``side_effect_policy.strict: true`` still dispatched a worker carrying an
+    EXTERNAL-family / UNRECOGNIZED side-effect class UNGATED if the owner forgot
+    to also list that class in ``approval_required`` -- strict governed
+    follow-ups but not the first dispatch. We now thread the SAME unified strict
+    predicate (:func:`_side_effect_strict_enabled`, which agrees with the opt-in
+    master gate per ROUND-5 FIX 2) into this gate, mirroring reactive_tick: under
+    strict, an external-family or unrecognized class is APPROVAL-REQUIRED-BY-
+    DEFAULT (defers unless a satisfied approval gate covers it). DEFAULT-OFF
+    (non-strict) boards skip this entirely, so the dispatch gate is byte-identical
+    to base for every board that did not opt in.
     """
     blockers: list[dict[str, Any]] = []
     sec = str(side_effect_class).strip() if side_effect_class else ""
     if not sec:
         return blockers
     policy = _contract_object(contract.get("side_effect_policy"))
-    forbidden = set(_string_list(policy.get("forbidden")))
-    approval_required = set(_string_list(policy.get("approval_required")))
+    # ROUND-5 FIX 6: strict opt-in is DEFAULT-OFF. Non-strict boards keep the BASE
+    # case-sensitive sets verbatim (byte-identical). Under strict, mirror
+    # reactive_tick: fold the policy sets AND the resolved class to one canonical
+    # (lower-case) vocabulary so a mixed-case row/declaration matches.
+    strict_side_effects = _side_effect_strict_enabled(policy)
+    if strict_side_effects:
+        sec = sec.strip().lower()
+        forbidden = {s.strip().lower() for s in _string_list(policy.get("forbidden"))}
+        approval_required = {
+            s.strip().lower() for s in _string_list(policy.get("approval_required"))
+        }
+    else:
+        forbidden = set(_string_list(policy.get("forbidden")))
+        approval_required = set(_string_list(policy.get("approval_required")))
     if sec in forbidden:
         blockers.append({
             "code": "side_effect_forbidden",
@@ -12237,8 +12263,46 @@ def _side_effect_and_approval_blockers(
             "message": f"side_effect_policy forbids side-effect class {sec!r}",
         })
         return blockers
-    if sec not in approval_required:
+    # ROUND-5 FIX 6: under strict, an external-family or unrecognized class is
+    # APPROVAL-REQUIRED-BY-DEFAULT even if the owner did not list it -- exactly the
+    # reactive_tick semantics. ``none``/``internal`` are SAFE and dispatch freely.
+    # Non-strict: this is False, so we fall through to the BASE
+    # ``approval_required`` membership check verbatim.
+    strict_unrecognized = (
+        strict_side_effects
+        and not _side_effect_class_is_recognized(sec)
+    )
+    strict_external = (
+        strict_side_effects
+        and not strict_unrecognized
+        and _side_effect_class_is_external(sec)
+    )
+    if sec not in approval_required and not strict_unrecognized and not strict_external:
         return blockers
+    # An unrecognized class can never be approved (no declared gate exists for a
+    # class outside the vocabulary), so under strict it ALWAYS defers. A recognized
+    # external class CAN be approved by a satisfied gate; absent that it defers.
+    if strict_unrecognized:
+        blockers.append({
+            "code": "side_effect_unrecognized_strict",
+            "side_effect_class": sec,
+            "action": task.action_key,
+            "message": (
+                f"side_effect_policy.strict: unrecognized side-effect class {sec!r} "
+                f"defers by default (fail-closed) -- it is outside the closed "
+                f"vocabulary, so no approval gate can cover it."
+            ),
+        })
+        return blockers
+    # ROUND-5 FIX 6: under strict, the HIGHEST-STAKES classes
+    # (external_irreversible / financial) require a gate that NAMES the class --
+    # a broad ``external_action`` wildcard is insufficient, mirroring
+    # reactive_tick's ``require_per_class_gate`` (and the
+    # _PER_CLASS_GATE_REQUIRED_CLASSES set). For the non-strict/legacy path this
+    # is False, so the base behavior (an action-key OR class-name match) is intact.
+    require_per_class_gate = (
+        strict_side_effects and sec in _PER_CLASS_GATE_REQUIRED_CLASSES
+    )
     approval_gates = _contract_list(contract.get("approval_gates"))
     applicable: list[str] = []
     for gate in approval_gates:
@@ -12248,7 +12312,13 @@ def _side_effect_and_approval_blockers(
         if not gate_key:
             continue
         required_before = set(_string_list(gate.get("required_before")))
-        if (task.action_key and task.action_key in required_before) or sec in required_before:
+        if require_per_class_gate:
+            # Highest-stakes class under strict: only a gate that NAMES this
+            # specific class counts (action-key match and the external_action
+            # wildcard are both insufficient).
+            if sec in required_before:
+                applicable.append(gate_key)
+        elif (task.action_key and task.action_key in required_before) or sec in required_before:
             applicable.append(gate_key)
     required_keys = applicable or [f"side_effect:{sec}"]
     satisfied = _satisfied_approval_gate_keys(conn, board, task)
@@ -17437,6 +17507,37 @@ def _serialize_terminal_classes_for_persist(terminal_classes) -> Optional[str]:
     return json.dumps(terminal_classes, ensure_ascii=False)
 
 
+#: ROUND-5 FIX 3: SQLite stores INTEGER columns as a signed 64-bit value. A bound
+#: outside this range raises OverflowError on bind (mirrors
+#: ``kanban_launch_invariants._SQLITE_INTEGER_MAX/MIN``).
+_SQLITE_INTEGER_MAX: int = (1 << 63) - 1
+_SQLITE_INTEGER_MIN: int = -(1 << 63)
+
+
+def _clamp_sqlite_integer(value: Optional[int]) -> Optional[int]:
+    """ROUND-5 FIX 3: fail-CLOSED clamp of a bound to SQLite's INTEGER range.
+
+    A bound that intake REJECTED (out of signed-64-bit range, e.g. ``'9'*25``)
+    must never reach the INSERT bind unclamped -- ``OverflowError`` there aborts
+    the whole INSERT and silently DROPS the timer schedule (the loop vanishes
+    with no terminator). Clamp an out-of-range value to the nearest storable edge
+    so the loop keeps a (huge but finite) cap rather than disappearing. ``None``
+    (no bound) passes through unchanged, and an in-range bound is returned as-is,
+    so this is a NO-OP for every legacy/well-formed row (byte-identical persist).
+    """
+    if value is None:
+        return None
+    try:
+        n = int(value)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if n > _SQLITE_INTEGER_MAX:
+        return _SQLITE_INTEGER_MAX
+    if n < _SQLITE_INTEGER_MIN:
+        return _SQLITE_INTEGER_MIN
+    return n
+
+
 def _upsert_timer_schedule(
     conn: sqlite3.Connection,
     *,
@@ -17489,6 +17590,16 @@ def _upsert_timer_schedule(
         if strict_side_effects
         else _normalize_funnel_text(side_effect_class)
     )
+    # ROUND-5 FIX 3 (persist-side fail-CLOSED): an OPTED-IN bound that is OUTSIDE
+    # SQLite's signed-64-bit INTEGER range (e.g. ``'9'*25``) is rejected at intake,
+    # but a path that reaches persist without the gate must NOT crash and silently
+    # drop the WHOLE schedule (OverflowError aborts the INSERT). Clamp the bound to
+    # the storable maximum so the loop keeps a (huge but finite) terminator rather
+    # than vanishing -- fail-CLOSED toward "the loop still has a stop". A bound
+    # already in range is unchanged, so this is a no-op for every legacy/well-formed
+    # row (byte-identical persisted value).
+    persist_max_nudges = _clamp_sqlite_integer(max_nudges)
+    persist_max_defers = _clamp_sqlite_integer(max_defers)
     with write_txn(conn):
         conn.execute(
             """
@@ -17509,7 +17620,7 @@ def _upsert_timer_schedule(
                 trigger_key,
                 int(cadence_seconds),
                 now + int(cadence_seconds),
-                int(max_nudges) if max_nudges is not None else None,
+                persist_max_nudges,
                 persisted_side_effect_class,
                 _json_text_or_none(action),
                 json.dumps(terminal_states, ensure_ascii=False) if terminal_states else None,
@@ -17517,7 +17628,7 @@ def _upsert_timer_schedule(
                 json.dumps(stop_conditions, ensure_ascii=False) if stop_conditions else None,
                 now,
                 now,
-                int(max_defers) if max_defers is not None else None,
+                persist_max_defers,
             ),
         )
 
@@ -17880,15 +17991,30 @@ def _side_effect_strict_enabled(policy: dict) -> bool:
     believed DEFAULT-DENY was on while the board ran the legacy fall-through with
     ZERO protection. Lower-casing the keys here mirrors the class-value
     canonicalization (``_canonical_side_effect_class``) so a capitalized opt-in
-    is honored as declared. If multiple case-variants of the same key collide,
-    ANY truthy one enables strict (fail-CLOSED toward protection).
+    is honored as declared.
+
+    ROUND-5 FIX 2 (no divergence from the opt-in master gate): the runtime gate
+    MUST agree with the opt-in master gate
+    (:func:`kanban_launch_grammar.side_effect_policy_opts_into_strict`) for EVERY
+    ``strict`` value -- otherwise a contract that does NOT opt into step-9 (so it
+    runs base code verbatim and is byte-identical) can still trip the runtime
+    gate, enforcing default-deny on a base-FIRE class. The previous use of
+    ``_coerce_bool`` was BROADER than the master gate's narrow canonical set:
+    ``_coerce_bool`` treats ``'y'``/``'enabled'`` as truthy AND ``'disabled'``
+    falls through to ``bool('disabled') == True``, so ``strict: 'disabled'``
+    INVERTED the operator's intent into enforcement. We now delegate to the SAME
+    narrow predicate the master gate uses: ``strict`` is enabled ONLY for the
+    canonical truthy set ({'true','1','yes','on'}, case-insensitive, or a bool
+    True, or a truthy number). A non-canonical value ('disabled'/'enabled'/'y')
+    is NOT enabled (so default-off stays byte-identical AND 'disabled' no longer
+    inverts intent); a typo'd/non-canonical strict value is surfaced by the
+    near-miss WARNING at intake (:func:`_check_side_effect_policy_keys`), never
+    silently enforced.
     """
-    if not isinstance(policy, dict):
-        return False
-    for key, value in policy.items():
-        if isinstance(key, str) and key.strip().lower() == "strict" and _coerce_bool(value):
-            return True
-    return False
+    from hermes_cli.kanban_launch_grammar import (
+        side_effect_policy_opts_into_strict as _grammar_strict_optin,
+    )
+    return bool(_grammar_strict_optin(policy))
 
 
 def _side_effect_class_is_recognized(side_effect_class: Optional[str]) -> bool:

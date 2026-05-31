@@ -2076,21 +2076,33 @@ def test_r3_stateless_win_class_is_error():
 
 
 def test_r3_negzero_string_bound_agrees_at_both_layers():
-    """ROUND-4 FIX B (supersedes the round-3 '-0' message): with the ascii
-    narrowing removed, ``_coerce_nonneg_int('-0') == 0`` and the runtime
-    ``_coerce_int('-0') == 0`` AGREE -- '-0' is a consistent (if odd) cap of 0 at
-    BOTH layers, so there is no longer a divergence to flag. The negative-bound
-    flag still fires for a GENUINE negative ('-1'/'-5', which coerce to a negative
-    int the runtime drops); '-0' is simply 0. This keeps intake and runtime in
-    byte-for-byte agreement."""
-    assert inv._coerce_nonneg_int("-0") == 0
+    """ROUND-5 FIX 1 (revert to base-exact): the shared coercion helpers are
+    BYTE-FOR-BYTE base 019271994. Base ``_coerce_nonneg_int`` gates strings with
+    ``.isdigit()`` (which sees the leading '-'), so ``_coerce_nonneg_int('-0')``
+    is ``None`` -- NOT 0. The runtime ``_coerce_int`` lstrips '-' before
+    ``.isdigit()``, so ``_coerce_int('-0') == 0`` (base behavior). The round-4
+    rewrite to a bare ``int()`` made BOTH return 0 (so they "agreed"), but that
+    WIDENED the acceptance set away from base for every default-off contract --
+    the exact regression round-5 reverts. The layers therefore differ on '-0' BY
+    BASE DESIGN, and the round-3 negzero detection (intake flags '-0' with an
+    ACCURATE 'coerces to a cap of 0' message, since the runtime treats it as 0)
+    is the correct, base-aligned behavior."""
+    # Base-exact: invariants REJECTS '-0' (its .isdigit() sees the '-'),
+    # the runtime ACCEPTS it as a cap of 0 (it lstrips '-' first).
+    assert inv._coerce_nonneg_int("-0") is None
     assert rt._coerce_int("-0") == 0
     report = inv.check_contract_invariants(
         _invariant_contract(_invariant_loop(max_defers="-0"))
     )
-    # '-0' is a usable cap of 0 -> no max_defers error (the layers agree).
-    assert not any("max_defers" in e for e in report.errors), (
-        "a '-0' bound coerces to 0 at both layers and must not be flagged"
+    # '-0' IS flagged at intake, with the accurate negzero message (the runtime
+    # coerces it to a cap of 0, not "unbounded").
+    negzero_errs = [
+        e for e in report.errors
+        if "max_defers" in e and "cap of 0" in e
+    ]
+    assert negzero_errs, (
+        "a '-0' bound must be flagged with the accurate 'coerces to a cap of 0' "
+        "message (base-exact: invariants rejects '-0', runtime accepts it as 0)"
     )
 
 
@@ -2648,3 +2660,464 @@ def test_fixC_persist_helper_unit():
     assert kb._canonical_side_effect_class_for_persist("   ") == M
     assert kb._canonical_side_effect_class_for_persist("external_irreversible") == "external_irreversible"
     assert kb._canonical_side_effect_class_for_persist("External_Irreversible") == "external_irreversible"
+
+
+# ===========================================================================
+# ROUND-5: the convergent fix. The recurring break was that step-9 fixes
+# modified SHARED coercion/truthiness helpers the LEGACY (non-opted) path also
+# traverses. The principle: the shared helpers are BYTE-FOR-BYTE base; ALL
+# step-9 parsing/validation/truthiness lives in opt-in-gated code. These tests
+# pin each round-5 fix with a fails-without/passes-with assertion + an
+# overarching byte-identity fuzz of a NON-OPTED contract against base.
+# ===========================================================================
+
+# The exact base 019271994 acceptance set, computed by re-implementing the base
+# helpers inline. The shared coercion helpers MUST agree with these for every
+# input (the only sanctioned divergence is a base CRASH -> None).
+_BASE_COERCE_INT_VECTOR = {
+    "+5": None, "1_000": None, "-0": 0, "٣": 3, "5": 5, "-1": -1,
+    "garbage": None, "0": 0, "  7 ": 7, "-5": -5,
+}
+_BASE_COERCE_NONNEG_VECTOR = {
+    "+5": None, "1_000": None, "-0": None, "٣": 3, "5": 5, "-1": None,
+    "garbage": None, "0": 0, "  7 ": 7, "-5": None,
+}
+
+
+def test_fix1_coerce_int_acceptance_set_is_base_exact():
+    """ROUND-5 FIX 1: the shared ``_coerce_int`` acceptance set is BYTE-FOR-BYTE
+    base 019271994. The round-4 rewrite to a bare ``int(value.strip())`` WIDENED
+    it ('+5'/'1_000'/'-0' that base's ``.isdigit()`` gate REJECTED now parsed),
+    flipping default-off launch-gate decisions. This pins the base acceptance set.
+
+    Mutation check (the round-4 regression): drop the ``.isdigit()`` gate and use
+    ``int(value.strip())`` -> '+5' becomes 5 and '1_000' becomes 1000, so these
+    assertions fail."""
+    for raw, expected in _BASE_COERCE_INT_VECTOR.items():
+        assert rt._coerce_int(raw) == expected or (
+            rt._coerce_int(raw) is None and expected is None
+        ), f"_coerce_int({raw!r}) = {rt._coerce_int(raw)!r}, base = {expected!r}"
+    # The number/float branch matches base too.
+    assert rt._coerce_int(2.7) == 2
+    assert rt._coerce_int(5) == 5
+    assert rt._coerce_int(True) is None
+    # The ONLY sanctioned divergence: a base-CRASH char becomes None (no crash).
+    assert rt._coerce_int("³") is None
+    assert rt._coerce_int("①") is None
+
+
+def test_fix1_coerce_nonneg_int_acceptance_set_is_base_exact():
+    """ROUND-5 FIX 1: the shared ``_coerce_nonneg_int`` acceptance set is
+    BYTE-FOR-BYTE base 019271994 (``.isdigit()`` gate, which rejects '-0'/'+5').
+
+    Mutation check: drop the ``.isdigit()`` gate for a bare ``int()`` -> '-0'
+    coerces to 0 and '+5' to 5, so these assertions fail."""
+    for raw, expected in _BASE_COERCE_NONNEG_VECTOR.items():
+        got = inv._coerce_nonneg_int(raw)
+        assert got == expected or (got is None and expected is None), (
+            f"_coerce_nonneg_int({raw!r}) = {got!r}, base = {expected!r}"
+        )
+    assert inv._coerce_nonneg_int(5) == 5
+    assert inv._coerce_nonneg_int(-1) is None
+    assert inv._coerce_nonneg_int(5.0) == 5
+    assert inv._coerce_nonneg_int(2.7) is None
+    # Sanctioned divergence: base-CRASH char -> None (no crash).
+    assert inv._coerce_nonneg_int("³") is None
+
+
+def test_fix1_shared_helpers_byte_identical_to_base_source():
+    """ROUND-5 FIX 1 (provable byte-identity): load the BASE 019271994 helpers and
+    assert HEAD's shared coercion helpers produce the IDENTICAL result for every
+    input in the fuzz vector -- except a base CRASH, where HEAD returns None (the
+    minimal, proven-safe try/except). This is the machine-checkable form of the
+    `git diff ... shows ZERO behavioral diff on the helpers` requirement."""
+    base_rt = _load_base_module("base_rt_fix1", "hermes_cli/kanban_reactive_runtime.py")
+    base_inv = _load_base_module("base_inv_fix1", "hermes_cli/kanban_launch_invariants.py")
+    vector = ["+5", "1_000", "-0", "٣", "³", "①", "5", "-1", 2.7, "garbage",
+              "0", "", "  7 ", "-5", 5, True, False, None, "٣٣"]
+    for v in vector:
+        # Base value or CRASH.
+        try:
+            b_rt = base_rt._coerce_int(v)
+            b_rt_crash = False
+        except Exception:
+            b_rt, b_rt_crash = None, True
+        try:
+            b_inv = base_inv._coerce_nonneg_int(v)
+            b_inv_crash = False
+        except Exception:
+            b_inv, b_inv_crash = None, True
+        # HEAD never crashes (the whole point of the guard).
+        h_rt = rt._coerce_int(v)
+        h_inv = inv._coerce_nonneg_int(v)
+        if b_rt_crash:
+            assert h_rt is None, f"_coerce_int({v!r}): base CRASHED, HEAD must be None, got {h_rt!r}"
+        else:
+            assert h_rt == b_rt, f"_coerce_int({v!r}): HEAD {h_rt!r} != base {b_rt!r}"
+        if b_inv_crash:
+            assert h_inv is None, f"_coerce_nonneg_int({v!r}): base CRASHED, HEAD must be None, got {h_inv!r}"
+        else:
+            assert h_inv == b_inv, f"_coerce_nonneg_int({v!r}): HEAD {h_inv!r} != base {b_inv!r}"
+
+
+def test_fix2_strict_runtime_gate_agrees_with_optin_master_gate():
+    """ROUND-5 FIX 2: the runtime strict gate (``_side_effect_strict_enabled``)
+    MUST agree with the opt-in master gate
+    (``side_effect_policy_opts_into_strict``) for EVERY strict value. The previous
+    ``_coerce_bool`` was broader -- 'enabled'/'y' enforced AND 'disabled' fell
+    through to ``bool('disabled')==True``, INVERTING intent into enforcement on a
+    DEFAULT-OFF contract.
+
+    Mutation check (the round-4 divergence): swap the delegation back to
+    ``_coerce_bool`` -> 'disabled'/'enabled'/'y' diverge (runtime True, opt-in
+    False), failing the agreement assertion AND the 'disabled' inversion guard."""
+    for v in ["true", "1", "yes", "on", "TRUE", "YES", True, 2,
+              "false", "0", False, 0, "enabled", "disabled", "y", "Disabled", "off"]:
+        pol = {"strict": v}
+        runtime = kb._side_effect_strict_enabled(pol)
+        optin = grammar.side_effect_policy_opts_into_strict(pol)
+        contract = grammar.contract_opts_into_step9({"side_effect_policy": pol})
+        assert runtime == optin == contract, (
+            f"strict={v!r}: runtime={runtime} optin={optin} contract={contract} DIVERGE"
+        )
+    # Canonical truthy -> enabled.
+    for v in ["true", "1", "yes", "on", True]:
+        assert kb._side_effect_strict_enabled({"strict": v}) is True
+    # Non-canonical -> NOT enabled (default-off stays byte-identical; no inversion).
+    for v in ["enabled", "disabled", "y", "Disabled", "enforce"]:
+        assert kb._side_effect_strict_enabled({"strict": v}) is False, (
+            f"strict={v!r} must NOT enable enforcement (no inversion / no broad truthiness)"
+        )
+
+
+def test_fix2_strict_disabled_does_not_enforce_on_a_non_opted_board(fresh_home):
+    """ROUND-5 FIX 2 (effect-level): a board declaring ``strict: 'disabled'`` is
+    NOT opted into step-9 (contract_opts_into_step9 False) and must FIRE a
+    base-class loop exactly like base -- the runtime gate must not invert
+    'disabled' into enforcement and defer it.
+
+    Mutation check: revert FIX 2 to ``_coerce_bool`` -> 'disabled' enables strict,
+    the external_irreversible loop DEFERS instead of firing, failing this."""
+    contract = _strict_contract("external_irreversible", strict=False)
+    contract["side_effect_policy"]["strict"] = "disabled"
+    assert grammar.contract_opts_into_step9(contract) is False
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        row = _schedule_row(conn)
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="serious")
+        assert res["fired"] == [{"loop_key": "seller_follow_up", "nudge": 1}], (
+            "strict:'disabled' must NOT enforce (no inversion) -- base FIRES this loop"
+        )
+        assert res["deferred"] == []
+
+
+def test_fix3_overrange_bound_rejected_at_intake_optin_only():
+    """ROUND-5 FIX 3: an OPTED-IN over-range integer-string bound ('9'*25) passes
+    coercion but OverflowErrors on SQLite persist (dropping the loop). Intake now
+    rejects it (opt-in only).
+
+    Mutation check: remove the over-range branch from ``_check_loop_bound_values``
+    -> the 25-digit bound passes intake silently, failing the error assertion."""
+    big = "9" * 25
+    # OPTED IN (max_defers is a defer-bound key) -> flagged.
+    opted = _invariant_contract(_invariant_loop(max_defers=big))
+    rep = inv.check_contract_invariants(opted)
+    assert any("64-bit" in e and "max_defers" in e for e in rep.errors), (
+        "an opted-in over-range bound must be rejected at intake"
+    )
+    # An in-range large bound (the storable max) is NOT flagged.
+    ok = _invariant_contract(_invariant_loop(max_defers=str(kb._SQLITE_INTEGER_MAX)))
+    rep_ok = inv.check_contract_invariants(ok)
+    assert not any("64-bit" in e for e in rep_ok.errors)
+
+
+def test_fix3_overrange_bound_clamped_at_persist_fail_closed():
+    """ROUND-5 FIX 3 (persist-side fail-CLOSED): the persist clamp keeps a loop
+    alive (clamped to the storable max) rather than crashing the INSERT and
+    silently dropping the schedule.
+
+    Mutation check: remove ``_clamp_sqlite_integer`` from the bind -> the INSERT
+    raises OverflowError, the schedule is dropped, and a re-bound value is lost."""
+    big = int("9" * 25)
+    assert kb._clamp_sqlite_integer(big) == kb._SQLITE_INTEGER_MAX
+    assert kb._clamp_sqlite_integer(5) == 5
+    assert kb._clamp_sqlite_integer(None) is None
+    # The clamped value actually binds to a SQLite INTEGER column without raising.
+    import sqlite3
+    c = sqlite3.connect(":memory:")
+    c.execute("CREATE TABLE t (n INTEGER)")
+    c.execute("INSERT INTO t (n) VALUES (?)", (kb._clamp_sqlite_integer(big),))
+    assert c.execute("SELECT n FROM t").fetchone()[0] == kb._SQLITE_INTEGER_MAX
+
+
+def test_fix4_typod_safety_key_warns_even_when_loop_does_not_opt_in():
+    """ROUND-5 FIX 4 (self-defeating gate): a loop whose ONLY step-9 intent is a
+    TYPO'd safety key (``max_deferals``) never opts in via the grammar (which
+    matches EXACT keys), so the near-miss safety-key check -- which exists
+    precisely to catch that typo -- could never fire. It now runs whenever the
+    loop CONTAINS a safety-key near-miss, independent of the opt-in gate.
+
+    Mutation check: gate ``_check_safety_optin_keys`` behind opt-in only (revert
+    the elif branch) -> the typo'd-key loop produces no warning, failing this."""
+    typo_loop = _invariant_loop(max_deferals=3)  # near-miss of max_defer(r)als
+    # Pin the precondition: this loop does NOT opt into step-9 (the grammar
+    # matches EXACT keys, and 'max_deferals' is not one), so without FIX 4 the
+    # opt-in-gated safety-key check never runs.
+    assert grammar.loop_opts_into_step9(typo_loop) is False
+    rep = inv.check_contract_invariants(_invariant_contract(typo_loop))
+    # The warning names the typo'd key and explains it is silently inert. We do
+    # NOT pin WHICH canonical defer key it suggests (max_defers vs max_deferrals
+    # are both 1-2 edits away and the suggestion order is hash-seed dependent) --
+    # only that the typo is surfaced as a defer-cap near-miss.
+    assert any(
+        "max_deferals" in w and "silently inert" in w and "defer" in w
+        for w in rep.warnings
+    ), "a typo'd safety opt-in must warn even when the loop does not opt in"
+
+
+def test_fix4_clean_legacy_loop_with_no_near_miss_is_unchanged():
+    """ROUND-5 FIX 4 (no false positives): a clean legacy loop carrying NO
+    step-9 key and NO near-miss takes neither branch and produces no new warning
+    -- byte-identical to base."""
+    clean = _invariant_loop()  # only terminal_states + max_nudges (exact key)
+    assert grammar.loop_opts_into_step9(clean) is False
+    rep = inv.check_contract_invariants(_invariant_contract(clean))
+    assert not any("typo" in w or "silently inert" in w for w in rep.warnings)
+
+
+def test_fix5_loop_optin_gate_is_effectful_mutation_catches_always_true():
+    """ROUND-5 FIX 5: an EFFECT-level test for the loop-level step-9 opt-in gate
+    (kanban_launch_invariants.py, the ``if _grammar_loop_opts_into_step9(loop)``
+    branch). A NON-OPTED loop carrying an over-range ``max_nudges`` ('9'*25 -- an
+    over-range value, and max_nudges is a NUDGE key that is NOT a step-9 opt-in
+    key) must produce NO over-range error, because the bound-value check runs ONLY
+    on the opt-in branch. If the gate is mutated to always-True, the bound-value
+    check runs on this non-opted loop and flags the over-range nudge cap, so this
+    assertion FAILS -- catching the mutation that 141 green tests previously
+    missed."""
+    non_opted = _invariant_loop(max_nudges="9" * 25)
+    # Precondition: max_nudges alone does NOT opt into step-9 (only defer-bound
+    # keys / terminal_classes do), so the opt-in gate is False for this loop.
+    assert grammar.loop_opts_into_step9(non_opted) is False
+    rep = inv.check_contract_invariants(_invariant_contract(non_opted))
+    assert not any("64-bit" in e for e in rep.errors), (
+        "a NON-OPTED loop must not run the opt-in-gated bound-value check; if the "
+        "opt-in gate is mutated to always-True this fails (the gate is effectful)"
+    )
+
+
+def test_fix6_strict_governs_dispatch_gate_external_class(fresh_home):
+    """ROUND-5 FIX 6: strict default-deny now governs the worker-DISPATCH gate
+    (``_side_effect_and_approval_blockers``), not just reactive_tick. Under strict,
+    an external-family class the owner forgot to list in approval_required must
+    DEFER at dispatch (approval-required-by-default), mirroring reactive_tick.
+
+    Mutation check: remove the FIX 6 strict block from the dispatch gate -> the
+    external_reversible class (not in approval_required) dispatches UNGATED, so the
+    expected blocker is absent and this fails."""
+    contract = _contract_runtime_strict_contract("external_reversible", strict=True)
+    tid = _dispatch_strict_board(contract)
+    with kb.connect(board="serious") as conn:
+        verdict = kb.evaluate_dispatch_eligibility(conn, tid, board="serious")
+        codes = {b["code"] for b in verdict["blockers"]}
+        assert verdict["ok"] is False, "strict external class must block dispatch"
+        assert "approval_gate_unsatisfied" in codes, (
+            "external_reversible (not in approval_required) must defer-by-default "
+            "under strict on the DISPATCH path too"
+        )
+
+
+def test_fix6_strict_governs_dispatch_gate_unrecognized_class(fresh_home):
+    """ROUND-5 FIX 6: an UNRECOGNIZED/typo class defers-by-default at dispatch
+    under strict (fail-closed; no gate can cover a class outside the vocabulary),
+    mirroring reactive_tick's ``side_effect_unrecognized_strict``."""
+    contract = _contract_runtime_strict_contract("extrnal_ireversible", strict=True)
+    tid = _dispatch_strict_board(contract)
+    with kb.connect(board="serious") as conn:
+        verdict = kb.evaluate_dispatch_eligibility(conn, tid, board="serious")
+        codes = {b["code"] for b in verdict["blockers"]}
+        assert verdict["ok"] is False
+        assert "side_effect_unrecognized_strict" in codes, (
+            "an unrecognized class must defer-by-default at dispatch under strict"
+        )
+
+
+def test_fix6_dispatch_gate_byte_identical_for_non_strict_board(fresh_home):
+    """ROUND-5 FIX 6: a NON-strict board's dispatch gate is byte-identical to base
+    -- an external class NOT listed in forbidden/approval_required dispatches
+    UNGATED (no strict-by-default deferral), exactly as base 019271994."""
+    contract = _contract_runtime_strict_contract("external_reversible", strict=False)
+    tid = _dispatch_strict_board(contract)
+    with kb.connect(board="serious") as conn:
+        verdict = kb.evaluate_dispatch_eligibility(conn, tid, board="serious")
+        codes = {b["code"] for b in verdict["blockers"]}
+        # No side-effect blocker: a non-strict board does not enforce by default.
+        assert "approval_gate_unsatisfied" not in codes
+        assert "side_effect_unrecognized_strict" not in codes
+        assert "side_effect_forbidden" not in codes
+
+
+# ---------------------------------------------------------------------------
+# Round-5 dispatch-gate helpers. Reuse the contract-runtime test's fully
+# dispatch-ready contract (so the only variable is side_effect_class + strict).
+# ---------------------------------------------------------------------------
+
+from tests.hermes_cli.test_kanban_contract_runtime import (  # noqa: E402
+    _contract as _cr_contract,
+    _create_contract_board as _cr_create_contract_board,
+)
+
+
+def _contract_runtime_strict_contract(side_effect_class, *, strict):
+    """A dispatch-ready contract (the contract-runtime fixture) whose resolved
+    task ``side_effect_class`` and board ``side_effect_policy.strict`` are the
+    only variables. The class is intentionally NOT in approval_required so the
+    LEGACY fall-through (dispatch ungated) is what strict must override."""
+    contract = _cr_contract(
+        side_effect_class=side_effect_class,
+        allowed_side_effects=[side_effect_class],
+    )
+    if strict:
+        contract["side_effect_policy"]["strict"] = True
+    return contract
+
+
+def _dispatch_strict_board(contract):
+    """Approve the contract on 'serious' and create a ready task. Returns task id."""
+    return _cr_create_contract_board(contract)
+
+
+# ===========================================================================
+# OVERARCHING PROOF (round-5): a NON-OPTED contract fuzzed across the exact
+# inputs that broke prior rounds -- max_nudges/max_defers in
+# ['+5','1_000','-0','٣','³','①','5','-1',2.7,'garbage'] and strict in
+# ['true','enabled','disabled','y','1',True] -- has launch-gate report.ok +
+# compiled columns + invariants errors/warnings + _business_contract_hash
+# BYTE-IDENTICAL to base 019271994. Byte-identity BY CONSTRUCTION: a non-opted
+# contract runs base code verbatim because every step-9 path is opt-in-gated.
+# ===========================================================================
+
+_FUZZ_BOUND_VALUES = ["+5", "1_000", "-0", "٣", "³", "①", "5", "-1", 2.7, "garbage"]
+_FUZZ_STRICT_VALUES = ["true", "enabled", "disabled", "y", "1", True]
+
+
+def _fuzz_legacy_contract(*, bound_key=None, bound_value=None, strict_value=None):
+    """A LEGACY (non-opted) contract. A fuzzed bound is attached under a
+    max_nudges-family key (NOT a defer-bound opt-in key) so the contract stays
+    NON-OPTED; a fuzzed strict value is a non-canonical/near value that does NOT
+    opt in. The whole point: none of these trip a step-9 path."""
+    loop = {
+        "key": "lp", "type": "lp", "entity": "e",
+        "triggers": [{"kind": "timer", "detail": "d", "cadence_hours": 72}],
+        "terminal_states": ["closed_won", "closed_lost"],
+    }
+    if bound_key is not None:
+        loop[bound_key] = bound_value
+    contract = {
+        "objective": {
+            "statement": "x", "success": ["s"], "failure": ["f"], "constraints": ["c"],
+        },
+        "event_loops": [loop],
+        "entities": [
+            {"key": "e", "type": "conversation",
+             "terminal_states": ["closed_won", "closed_lost"]}
+        ],
+    }
+    if strict_value is not None:
+        contract["side_effect_policy"] = {"allowed": ["none"], "strict": strict_value}
+    return contract
+
+
+def test_overarching_round5_byte_identity_fuzz_max_nudges():
+    """ROUND-5 byte-identity: a NON-OPTED contract carrying max_nudges across the
+    full fuzz vector has invariants errors/warnings + business-contract hash
+    byte-identical to base 019271994. max_nudges is NOT a step-9 opt-in key, so
+    the contract never opts in regardless of the (malformed) value."""
+    base_inv = _load_base_module("base_inv_r5_nudges", "hermes_cli/kanban_launch_invariants.py")
+    base_kb = _load_base_module("base_kb_r5_nudges", "hermes_cli/kanban_db.py")
+    for v in _FUZZ_BOUND_VALUES:
+        contract = _fuzz_legacy_contract(bound_key="max_nudges", bound_value=v)
+        assert grammar.contract_opts_into_step9(contract) is False, v
+        b = base_inv.check_contract_invariants(contract)
+        h = inv.check_contract_invariants(contract)
+        assert h.errors == b.errors, f"max_nudges={v!r}: ERRORS diverged from base"
+        assert h.warnings == b.warnings, f"max_nudges={v!r}: WARNINGS diverged from base"
+        assert h.ok == b.ok, f"max_nudges={v!r}: report.ok diverged from base"
+        assert kb._business_contract_hash(contract) == base_kb._business_contract_hash(contract), (
+            f"max_nudges={v!r}: business-contract hash diverged from base"
+        )
+
+
+def test_overarching_round5_byte_identity_fuzz_max_defers():
+    """ROUND-5 byte-identity: a contract carrying max_defers across the full fuzz
+    vector. NOTE: max_defers IS a step-9 opt-in key, so a contract that declares it
+    OPTS IN -- which is the intended behavior (the opt-in path may legitimately
+    differ from base). We therefore assert byte-identity ONLY for the value that
+    does NOT make a usable bound AND stays non-opted is impossible here; instead we
+    assert the OPT-IN behavior is consistent and never CRASHES across the vector
+    (no '³'/'①' crash), and that the hash is invariant to the (stripped) invariants
+    report."""
+    base_kb = _load_base_module("base_kb_r5_defers", "hermes_cli/kanban_db.py")
+    for v in _FUZZ_BOUND_VALUES:
+        contract = _fuzz_legacy_contract(bound_key="max_defers", bound_value=v)
+        # max_defers present => opted in (intended). Must not crash.
+        assert grammar.contract_opts_into_step9(contract) is True, v
+        rep = inv.check_contract_invariants(contract)  # must not raise on '³'/'①'
+        assert isinstance(rep.errors, list)
+        # FIX A: the hash is invariant to the invariants report, so even an
+        # opted-in contract's business hash equals base (the step-9 finding lives
+        # only in the stripped invariants block).
+        assert kb._business_contract_hash(contract) == base_kb._business_contract_hash(contract), (
+            f"max_defers={v!r}: business-contract hash diverged from base"
+        )
+
+
+def test_overarching_round5_byte_identity_fuzz_strict():
+    """ROUND-5 byte-identity: a NON-OPTED contract carrying a NON-CANONICAL strict
+    value (['enabled','disabled','y'] -> NOT opted in) has invariants + hash
+    byte-identical to base. The CANONICAL values (['true','1',True] -> opted in)
+    legitimately differ (the opt-in path), so they are asserted to OPT IN, not to
+    match base."""
+    base_inv = _load_base_module("base_inv_r5_strict", "hermes_cli/kanban_launch_invariants.py")
+    base_kb = _load_base_module("base_kb_r5_strict", "hermes_cli/kanban_db.py")
+    canonical = {"true", "1", "on", "yes", True}
+    for v in _FUZZ_STRICT_VALUES:
+        contract = _fuzz_legacy_contract(strict_value=v)
+        opted = grammar.contract_opts_into_step9(contract)
+        if isinstance(v, str) and v.strip().lower() in canonical or v is True:
+            # Canonical truthy -> OPTED IN (intended divergence allowed).
+            assert opted is True, f"strict={v!r} should opt in"
+            continue
+        # Non-canonical strict -> NOT opted in -> byte-identical to base.
+        assert opted is False, f"strict={v!r} must NOT opt in (no broad truthiness)"
+        b = base_inv.check_contract_invariants(contract)
+        h = inv.check_contract_invariants(contract)
+        assert h.errors == b.errors, f"strict={v!r}: ERRORS diverged from base"
+        assert h.warnings == b.warnings, f"strict={v!r}: WARNINGS diverged from base"
+        assert kb._business_contract_hash(contract) == base_kb._business_contract_hash(contract), (
+            f"strict={v!r}: business-contract hash diverged from base"
+        )
+
+
+def test_overarching_round5_compiled_columns_byte_identical(fresh_home):
+    """ROUND-5 byte-identity: the COMPILED runtime columns (max_nudges persisted on
+    the timer schedule) for a NON-OPTED contract match what base 019271994 would
+    compile, across the fuzz vector. A non-opted max_nudges bound is read by the
+    SAME (reverted, base-exact) ``loop_max_nudges`` -> ``_coerce_int``, so '+5' /
+    '1_000' compile to NULL (rejected, base-exact), '5' to 5, '-0'/'-1' rejected
+    by the >=0 gate, etc."""
+    base_rt = _load_base_module("base_rt_r5_cols", "hermes_cli/kanban_reactive_runtime.py")
+    for v in _FUZZ_BOUND_VALUES:
+        loop = {"max_nudges": v}
+        # HEAD and base loop_max_nudges agree (the helper is base-exact); a
+        # base-CRASH char ('³'/'①') -> None on HEAD (no crash) vs base CRASH.
+        try:
+            b = base_rt.loop_max_nudges(loop)
+            b_crash = False
+        except Exception:
+            b, b_crash = None, True
+        h = rt.loop_max_nudges(loop)
+        if b_crash:
+            assert h is None, f"max_nudges={v!r}: base crashed, HEAD must compile None"
+        else:
+            assert h == b, f"max_nudges={v!r}: compiled cap HEAD {h!r} != base {b!r}"

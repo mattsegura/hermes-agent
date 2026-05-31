@@ -245,25 +245,33 @@ def _spec_numeric_range(spec: dict[str, Any]) -> Optional[tuple[Optional[float],
 
 
 def _coerce_nonneg_int(value: Any) -> Optional[int]:
+    # ROUND-5 FIX 1 (byte-identity by construction): the LEGACY (non-opted) intake
+    # path traverses this helper, so its acceptance set must be BYTE-FOR-BYTE base
+    # 019271994. The base implementation gated strings with ``.isdigit()``:
+    #
+    #     if isinstance(value, str) and value.strip().isdigit():
+    #         return int(value.strip())
+    #
+    # The round-4 rewrite swapped that for a bare ``int(value.strip())`` (then a
+    # >=0 reject), which WIDENED the acceptance set for the launch gate: a string
+    # base rejected via ``.isdigit()`` could now parse and flip a DEFAULT-OFF
+    # contract's invariants errors/warnings (and via the persisted invariants
+    # block, the contract hash). We restore the EXACT base ``.isdigit()`` gate so
+    # every input keeps its base decision. The ONLY change is wrapping the rare
+    # ``.isdigit()``-True/``int()``-raises char ('³','①') so it returns None
+    # instead of crashing the per-loop intake check -- proven byte-for-byte
+    # against base for the full fuzz vector (no acceptance-set change otherwise).
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
         return value if value >= 0 else None
     if isinstance(value, float) and value.is_integer():
         return int(value) if value >= 0 else None
-    if isinstance(value, str):
-        # FIX 6 (round-4): mirror kanban_reactive_runtime._coerce_int EXACTLY so
-        # intake and the runtime agree byte-for-byte on what is a usable bound. A
-        # prior ``.isascii()`` gate changed the result versus base for a non-ASCII
-        # but int()-parseable digit string ('٣' -> 3, '٦' -> 6), drifting the
-        # default-off invariant report from base. Drop the ascii narrowing: parse
-        # with ``int(value.strip())`` (wrapped so '³'/'①' -> None, no crash), then
-        # keep this a NON-NEGATIVE-int coercion by rejecting negatives.
+    if isinstance(value, str) and value.strip().isdigit():
         try:
-            parsed = int(value.strip())
+            return int(value.strip())
         except (ValueError, TypeError):
             return None
-        return parsed if parsed >= 0 else None
     return None
 
 
@@ -416,6 +424,18 @@ _RECOGNIZED_MAX_NUDGES_KEYS: frozenset[str] = frozenset(
     {"max_nudges", "max_follow_ups", "max_followups", "max_retries"}
 )
 
+#: ROUND-5 FIX 3: SQLite stores INTEGER columns as a signed 64-bit value. A bound
+#: that coerces to an int OUTSIDE this range (e.g. a 25-digit string ``'9'*25``)
+#: passes the coercion at intake but raises ``OverflowError: Python int too large
+#: to convert to SQLite INTEGER`` when the per-loop compile binds it, silently
+#: dropping the ENTIRE timer schedule (the loop disappears). For an OPTED-IN
+#: bound we reject an out-of-range value at intake (here) AND clamp fail-closed at
+#: persist (``_persist_reactive_timer_schedule``) so the loop is never silently
+#: dropped. A non-negative cap can never be negative, so only the max matters in
+#: practice, but we keep both edges for completeness.
+_SQLITE_INTEGER_MAX: int = (1 << 63) - 1
+_SQLITE_INTEGER_MIN: int = -(1 << 63)
+
 
 def _edit_distance(a: str, b: str, *, cap: int) -> int:
     """Levenshtein distance between ``a`` and ``b``, short-circuited at ``cap``+1.
@@ -535,6 +555,30 @@ def _near_miss(key: str, recognized: frozenset[str]) -> Optional[str]:
     return best[1] if best is not None else None
 
 
+def _loop_has_safety_key_near_miss(loop: dict[str, Any]) -> bool:
+    """ROUND-5 FIX 4: does ``loop`` carry a NEAR-MISS of a step-9 safety key?
+
+    True iff the loop declares a key that is a near-miss (typo/alias) of a
+    recognized anti-zombie / nudge-cap key but is NOT itself an exact recognized
+    key. Used to run :func:`_check_safety_optin_keys` INDEPENDENTLY of the opt-in
+    gate (see :func:`_check_event_loops`): a loop whose ONLY step-9 intent is a
+    TYPO'd safety key (``max_deferals``) never opts in via the grammar (the
+    grammar matches EXACT keys), so without this the typo-warning could never
+    fire. A loop with NO such near-miss returns False -> no new finding ->
+    byte-identical to base for every legacy loop.
+    """
+    for key in loop.keys():
+        if not isinstance(key, str):
+            continue
+        if key in _RECOGNIZED_MAX_DEFERS_KEYS or key in _RECOGNIZED_MAX_NUDGES_KEYS:
+            continue
+        if _near_miss(key, _RECOGNIZED_MAX_DEFERS_KEYS) or _near_miss(
+            key, _RECOGNIZED_MAX_NUDGES_KEYS
+        ):
+            return True
+    return False
+
+
 def _check_safety_optin_keys(
     name: str, loop: dict[str, Any], report: InvariantReport
 ) -> None:
@@ -544,6 +588,17 @@ def _check_safety_optin_keys(
     bound). A near-miss key (``max_deferals`` with one 'r') is ignored, leaving
     the board on the legacy fall-through with no error -- the operator believes
     a cap is set while it is fully inert. Surface the near-miss at intake.
+
+    ROUND-5 FIX 4 (self-defeating gate): this check used to run ONLY when the loop
+    had ALREADY opted into step-9 (via the grammar's EXACT-key match on a real
+    bound or a terminal-class declaration). A loop whose ONLY step-9 intent was a
+    TYPO'd safety key (``max_deferals``) therefore never opted in, so the typo
+    warning -- the one finding that exists precisely to catch that typo -- could
+    never fire: the gate defeated itself. It is now also invoked DIRECTLY from
+    :func:`_check_event_loops` whenever the loop carries a safety-key near-miss
+    (independent of the opt-in gate), so a typo'd safety opt-in is always
+    surfaced. It only EVER appends a WARNING for a genuine near-miss (no gate
+    change), so a legacy loop with no near-miss stays byte-identical to base.
     """
     for key in loop.keys():
         if not isinstance(key, str):
@@ -604,7 +659,20 @@ def _check_loop_bound_values(
             bad = False
             fractional = False
             negzero = False
-            if isinstance(val, bool):
+            overrange = False
+            # ROUND-5 FIX 3: a bound that COERCES to a valid non-negative int but
+            # is OUTSIDE the signed-64-bit range SQLite can store (e.g. ``'9'*25``)
+            # passes every check below yet raises OverflowError when the per-loop
+            # compile binds it to the INTEGER column -- silently dropping the whole
+            # schedule. Detect it here (opt-in only) using the RUNTIME coercion (the
+            # exact value that would be persisted) so the loop is flagged, not lost.
+            coerced = _runtime_coerce_int(val)
+            if coerced is not None and (
+                coerced > _SQLITE_INTEGER_MAX or coerced < _SQLITE_INTEGER_MIN
+            ):
+                overrange = True
+                bad = True
+            elif isinstance(val, bool):
                 bad = True
             elif isinstance(val, float) and not _math.isfinite(val):
                 bad = True
@@ -619,12 +687,14 @@ def _check_loop_bound_values(
             elif isinstance(val, (int, float)):
                 bad = val < 0
             elif isinstance(val, str):
-                # A string bound is usable only if it is the SAME thing the
-                # runtime accepts: an ASCII non-negative integer. _coerce_nonneg_int
-                # already encodes that (ASCII-narrowed, int()-guarded, >=0), so a
-                # str that does not coerce to a non-negative int is bad. This flags
-                # '³'/'①' (runtime crash class), '٣' (non-ASCII), and the negative
-                # '-1'/'-5' strings, agreeing with the integer-(-1) flag above.
+                # ROUND-5 FIX 1: a string bound is usable only if it coerces to a
+                # non-negative int via the BASE-EXACT ``_coerce_nonneg_int`` (the
+                # ``.isdigit()`` gate, int()-guarded, >=0). A str that does NOT so
+                # coerce is bad. This flags '³'/'①' (the .isdigit()-True/int()-raises
+                # crash class -- now caught to None, not a crash) and the negative
+                # '-1'/'-5' strings, agreeing with the integer-(-1) flag above. A
+                # non-ASCII but int()-PARSEABLE digit ('٣' Arabic-Indic 3) coerces to
+                # 3 exactly like base, so it is a USABLE bound and is NOT flagged.
                 bad = _coerce_nonneg_int(val) is None
                 # STEP-9 (LOW, round-3): the '-0' family. The runtime's _coerce_int
                 # ACCEPTS '-0' (it lstrips '-' before isdigit, then int('-0')==0),
@@ -639,7 +709,15 @@ def _check_loop_bound_values(
             else:
                 bad = val is not None
             if bad:
-                if fractional:
+                if overrange:
+                    report.errors.append(
+                        f"event loop '{name}' declares {label} {key}={val!r} which is "
+                        f"OUTSIDE the range a 64-bit integer column can store -- the "
+                        f"per-loop compile raises OverflowError binding it and silently "
+                        f"DROPS the entire timer schedule (the loop disappears). Declare a "
+                        f"bound between 0 and {_SQLITE_INTEGER_MAX}."
+                    )
+                elif fractional:
                     report.errors.append(
                         f"event loop '{name}' declares {label} {key}={val!r} which is a "
                         f"FRACTIONAL bound -- the runtime silently TRUNCATES it to "
@@ -741,7 +819,8 @@ def _check_event_loops(root: dict[str, Any], report: InvariantReport) -> None:
         # code paths here, so its errors/warnings are byte-identical to base
         # 019271994 BY CONSTRUCTION -- no new findings can perturb the report or
         # (via the persisted invariants block) the contract hash.
-        if _grammar_loop_opts_into_step9(loop):
+        opted_in = _grammar_loop_opts_into_step9(loop)
+        if opted_in:
             # 9(b) DECLARE-DON'T-INFER: when a loop OPTS IN to declared terminal
             # classes, every declared class MUST be a member of the closed
             # vocabulary. A fat-fingered class (e.g. "wonn" / "victory") would
@@ -753,6 +832,17 @@ def _check_event_loops(root: dict[str, Any], report: InvariantReport) -> None:
             # Gated by opt-in so a legacy loop carrying an UNRELATED ``max_*`` key
             # (e.g. ``max_followers`` / ``max_nudges``) produces no new finding.
             _check_loop_bound_values(name, loop, report)
+            _check_safety_optin_keys(name, loop, report)
+        elif _loop_has_safety_key_near_miss(loop):
+            # ROUND-5 FIX 4 (self-defeating gate): a loop whose ONLY step-9 intent
+            # is a TYPO'd safety key (``max_deferals``) does NOT opt in via the
+            # grammar (which matches EXACT keys), so the branch above never runs
+            # and the typo-warning -- the finding that exists precisely to catch
+            # that typo -- could never fire. Run the near-miss safety-key check
+            # whenever the loop CONTAINS a near-miss of a step-9 safety key,
+            # independent of the opt-in gate. This is WARNING-only (no gate
+            # change). A legacy loop with no such near-miss takes neither branch
+            # and is byte-identical to base.
             _check_safety_optin_keys(name, loop, report)
         if _grammar_has_inbound(triggers):
             if not _grammar_has_timer(triggers):
