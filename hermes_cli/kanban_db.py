@@ -155,6 +155,19 @@ LAUNCH_INTAKE_MAX_CLARIFICATION_ROUNDS = max(
 )
 BOARD_DISPATCH_PHASES = {"active"}
 MANAGED_BOARD_RUNTIME_MODES = {"company", "business", "managed"}
+
+# G2 per-task execution-contract fail-open conversions. Each is FLAG-GATED and
+# DEFAULT-OFF: with the flag unset the runtime behaves byte-identically to
+# today. The flags exist so each fail-closed conversion can be soaked against
+# live boards and flipped on ONE AT A TIME after a report-mode soak proves it
+# produces zero would-wedge findings.
+#   (a) absent require_* default fail-closed on managed boards.
+#   (b) inject the worker_envelope toolsets into the spawned worker's argv.
+#   (c) bridge the board contract's runtime.tool_policy.blocked_tools into the
+#       per-profile action gate.
+REQUIRE_CONTRACT_DEFAULTS_ENV: str = "HERMES_KANBAN_REQUIRE_CONTRACT_DEFAULTS"
+ENFORCE_WORKER_TOOLSETS_ENV: str = "HERMES_KANBAN_ENFORCE_WORKER_TOOLSETS"
+BRIDGE_TOOL_POLICY_ENV: str = "HERMES_KANBAN_BRIDGE_TOOL_POLICY"
 EXECUTABLE_WORK_STATUSES = {"ready", "review", "running"}
 LAUNCH_APPROVAL_TOKEN_TTL_SECONDS = 15 * 60
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -1260,6 +1273,71 @@ def _coerce_bool(value: Any) -> bool:
         if text in {"", "0", "false", "no", "n", "off", "none", "null"}:
             return False
     return bool(value)
+
+
+def _resolve_kanban_bool_flag(env_var: str, config_key: str) -> bool:
+    """Resolve a default-OFF kanban hardening flag.
+
+    Precedence (first that resolves wins), mirroring ``_auto_revert_enabled`` /
+    ``_launch_completeness_enforced_dimensions``:
+      1. Env ``env_var`` (truthy ``1``/``true``/``yes``/``on``,
+         falsy ``0``/``false``/``no``/``off`` -- an unrecognized token falls
+         through to config/default rather than guessing).
+      2. config.yaml ``kanban.<config_key>`` (bool/str via ``_coerce_bool``).
+      3. Default ``False`` -- unset means today's behavior, byte-identical.
+    """
+    raw = os.environ.get(env_var)
+    if raw is not None and str(raw).strip() != "":
+        token = str(raw).strip().lower()
+        if token in {"1", "true", "yes", "on"}:
+            return True
+        if token in {"0", "false", "no", "off"}:
+            return False
+        # Unrecognized token: fall through to config/default rather than guess.
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        kb_cfg = cfg.get("kanban") if isinstance(cfg, dict) else None
+        val = (kb_cfg or {}).get(config_key) if isinstance(kb_cfg, dict) else None
+    except Exception:  # pragma: no cover - config is optional
+        val = None
+    if val is not None:
+        return _coerce_bool(val)
+    return False
+
+
+def _require_contract_defaults_enabled() -> bool:
+    """G2(a): when ON, an ABSENT require_* on a MANAGED board fails CLOSED.
+
+    Flag: env ``HERMES_KANBAN_REQUIRE_CONTRACT_DEFAULTS`` / config.yaml
+    ``kanban.require_contract_defaults``. DEFAULT-OFF: absent stays absent.
+    """
+    return _resolve_kanban_bool_flag(
+        REQUIRE_CONTRACT_DEFAULTS_ENV, "require_contract_defaults"
+    )
+
+
+def _enforce_worker_toolsets_enabled() -> bool:
+    """G2(b): when ON, the spawned worker argv is constrained to the declared
+    worker_envelope toolsets via ``--toolsets``.
+
+    Flag: env ``HERMES_KANBAN_ENFORCE_WORKER_TOOLSETS`` / config.yaml
+    ``kanban.enforce_worker_toolsets``. DEFAULT-OFF: argv unchanged.
+    """
+    return _resolve_kanban_bool_flag(
+        ENFORCE_WORKER_TOOLSETS_ENV, "enforce_worker_toolsets"
+    )
+
+
+def _bridge_tool_policy_enabled() -> bool:
+    """G2(c): when ON, the board contract's runtime.tool_policy.blocked_tools is
+    merged (union) into the per-profile action gate's blocked set.
+
+    Flag: env ``HERMES_KANBAN_BRIDGE_TOOL_POLICY`` / config.yaml
+    ``kanban.bridge_tool_policy``. DEFAULT-OFF: only config.yaml rules apply.
+    """
+    return _resolve_kanban_bool_flag(BRIDGE_TOOL_POLICY_ENV, "bridge_tool_policy")
 
 
 def _json_object(value: Optional[Any], *, field: str) -> Optional[dict]:
@@ -11466,6 +11544,33 @@ def resolve_task_contract(task: Task, *, board: Optional[str] = None) -> dict[st
         or _coerce_bool(workflow.get("require_provider_policy"))
     )
     require_worker_envelopes = _coerce_bool(runtime.get("require_worker_envelopes"))
+    require_semantics = _coerce_bool(workflow.get("require_semantics"))
+    # G2(a) ABSENT-DEFAULT FAIL-CLOSED (managed boards only). DEFAULT-OFF: when
+    # the flag is unset this whole block is skipped and an absent require_*
+    # stays falsy, byte-identical to today. When ON and the board is managed,
+    # a require_* that is ABSENT everywhere it can be declared is treated as
+    # True -- so an empty/absent execution contract fails CLOSED at the
+    # dispatch gate instead of spawning an ungoverned worker. An explicit
+    # ``false`` is honored (only genuine absence is promoted).
+    board_mode = str(runtime.get("mode") or "").strip().lower()
+    contract_defaults_applied: list[str] = []
+    if (
+        board_mode in MANAGED_BOARD_RUNTIME_MODES
+        and _require_contract_defaults_enabled()
+    ):
+        if (
+            "require_provider_policy" not in explicit
+            and "require_provider_policy" not in runtime
+            and "require_provider_policy" not in workflow
+        ):
+            require_provider_policy = True
+            contract_defaults_applied.append("require_provider_policy")
+        if "require_worker_envelopes" not in runtime:
+            require_worker_envelopes = True
+            contract_defaults_applied.append("require_worker_envelopes")
+        if "require_semantics" not in workflow:
+            require_semantics = True
+            contract_defaults_applied.append("require_semantics")
     business_contract = _metadata_as_business_contract(board_meta)
     approval_gates = _contract_list(business_contract.get("approval_gates"))
     side_effect_policy = _contract_object(business_contract.get("side_effect_policy"))
@@ -11490,6 +11595,11 @@ def resolve_task_contract(task: Task, *, board: Optional[str] = None) -> dict[st
         "worker_envelope": envelope,
         "worker_envelopes_declared": bool(envelope_map),
         "require_worker_envelopes": require_worker_envelopes,
+        "require_semantics": require_semantics,
+        # G2(a): which require_* were promoted from ABSENT to True because this
+        # is a managed board and the fail-closed default flag is ON. Empty list
+        # (the default-off case) means no absent-default enforcement applies.
+        "contract_defaults_applied": contract_defaults_applied,
     }
 
 
@@ -11576,6 +11686,53 @@ def evaluate_dispatch_eligibility(
             board=board_slug,
         )
     )
+    # G2(a) ABSENT-DEFAULT FAIL-CLOSED enforcement (managed boards only).
+    # ``contract_defaults_applied`` is non-empty ONLY when the flag is ON, the
+    # board is managed, and the corresponding require_* was ABSENT (promoted to
+    # True in resolve_task_contract). With the flag OFF the list is empty and
+    # this whole block is a no-op -- byte-identical to today. The conditional
+    # blockers above only bite when the contract DECLARES something to enforce;
+    # these blockers are the teeth that make a truly EMPTY contract fail closed
+    # instead of spawning an ungoverned worker.
+    defaults_applied = set(contract.get("contract_defaults_applied") or [])
+    if defaults_applied:
+        if "require_worker_envelopes" in defaults_applied and not envelope:
+            if not any(b.get("code") == "missing_worker_envelope" for b in blockers):
+                blockers.append({
+                    "code": "missing_worker_envelope",
+                    "assignee": task.assignee,
+                    "reason": "managed_board_default",
+                })
+        if "require_provider_policy" in defaults_applied and not provider_policy:
+            blockers.append({
+                "code": "missing_provider_policy",
+                "capabilities": sorted(required_capabilities),
+                "reason": "managed_board_default",
+            })
+        if "require_semantics" in defaults_applied:
+            default_goal = _normalize_funnel_text(
+                contract.get("goal_id")
+            ) if contract.get("goal_id") else None
+            for field, value in (
+                ("goal_id", task.goal_id or default_goal),
+                ("workstream_id", task.workstream_id),
+                ("stage_key", task.stage_key),
+                ("action_key", task.action_key),
+            ):
+                if value:
+                    continue
+                code = (
+                    "missing_semantic_"
+                    + field.removesuffix("_id").removesuffix("_key")
+                )
+                if any(b.get("code") == code for b in blockers):
+                    continue
+                blockers.append({
+                    "code": code,
+                    "field": field,
+                    "reason": "managed_board_default",
+                    "message": f"managed board requires {field} on tasks",
+                })
     # Tier-1 sensor gating: a tripped circuit breaker auto-pauses dispatch on
     # the path it gates, and an over-budget/over-rate meter throttles new
     # spawns. Read off the persisted sensor state (refreshed by sensors_tick /
@@ -22396,6 +22553,29 @@ def _default_spawn(
         for sk in task.skills:
             if sk and sk != "kanban-worker":
                 cmd.extend(["--skills", sk])
+    # G2(b) WORKER-ENVELOPE TOOLSET INJECTION. DEFAULT-OFF: when the flag is
+    # unset this block is skipped entirely and argv is byte-identical to today.
+    # When ON, resolve the task's worker_envelope from the active contract and,
+    # ONLY when an envelope with declared toolsets exists for this worker
+    # profile, constrain the spawned subprocess to that (sub)set via the
+    # ``--toolsets`` flag (the `hermes` CLI's comma-separated enabled-toolsets
+    # arg -- see hermes_cli/_parser.py: ``-t/--toolsets``). Without a declared
+    # envelope NO flag is added, so a worker is never accidentally locked out;
+    # the profile's full toolset still applies. A best-effort contract read can
+    # never break a spawn.
+    if _enforce_worker_toolsets_enabled():
+        try:
+            _spawn_contract = resolve_task_contract(task, board=board)
+            _envelope = _contract_object(_spawn_contract.get("worker_envelope"))
+            _envelope_toolsets = _string_list(_envelope.get("toolsets"))
+            if _envelope_toolsets:
+                cmd.extend(["--toolsets", ",".join(_envelope_toolsets)])
+        except Exception:  # pragma: no cover - defensive: never break a spawn
+            _log.warning(
+                "kanban spawn: worker-envelope toolset injection skipped for task %r",
+                task.id,
+                exc_info=True,
+            )
     from hermes_cli.kanban_model_routing import resolve_worker_model
 
     resolved_model = resolve_worker_model(task, board=board)

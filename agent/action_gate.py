@@ -335,6 +335,50 @@ def _get_gate_config() -> dict:
     return {}
 
 
+def _contract_blocked_tools() -> list[str]:
+    """G2(c): the active board contract's ``runtime.tool_policy.blocked_tools``.
+
+    DEFAULT-OFF: when ``HERMES_KANBAN_BRIDGE_TOOL_POLICY`` (env) /
+    ``kanban.bridge_tool_policy`` (config.yaml) is unset this returns ``[]`` and
+    the action gate behaves byte-identically to today (only config.yaml
+    ``action_gate.rules.blocked_tools`` apply). When ON, the board contract's
+    declared blocked tools are returned so the caller can union them into the
+    per-profile blocked set.
+
+    Resolved defensively: the active board comes from ``HERMES_KANBAN_BOARD``
+    (set on every dispatched worker). Any failure -- import error, missing
+    metadata, malformed contract -- returns ``[]`` so a contract-read hiccup can
+    NEVER break the action gate (which would wedge every tool call).
+    """
+    try:
+        from hermes_cli.kanban_db import (
+            _bridge_tool_policy_enabled,
+            read_board_metadata,
+        )
+    except Exception:
+        return []
+    try:
+        if not _bridge_tool_policy_enabled():
+            return []
+    except Exception:
+        return []
+    try:
+        board = os.environ.get("HERMES_KANBAN_BOARD") or None
+        meta = read_board_metadata(board)
+        runtime = meta.get("runtime") if isinstance(meta.get("runtime"), dict) else {}
+        tool_policy = runtime.get("tool_policy") if isinstance(runtime, dict) else None
+        if not isinstance(tool_policy, dict):
+            return []
+        raw = tool_policy.get("blocked_tools")
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple, set)):
+            return []
+        return [str(t).strip() for t in raw if str(t).strip()]
+    except Exception:
+        return []
+
+
 def check_action_gate(
     tool_name: str,
     tool_args: dict,
@@ -350,6 +394,27 @@ def check_action_gate(
     (polls the queue) until the human responds or timeout expires.
     """
     config = _get_gate_config()
+
+    # G2(c) TOOL_POLICY BRIDGE. DEFAULT-OFF: ``_contract_blocked_tools()``
+    # returns ``[]`` unless the flag is ON, so this is byte-identical to today.
+    # When ON, the active board contract's runtime.tool_policy.blocked_tools are
+    # unioned into the per-profile ``rules.blocked_tools`` so the bridged tools
+    # are hard-blocked even when the profile config does not list them (and even
+    # when there is no action_gate config at all). Merging into a COPY leaves the
+    # loaded config untouched.
+    contract_blocked = _contract_blocked_tools()
+    if contract_blocked:
+        config = dict(config)
+        rules = dict(config.get("rules") or {})
+        existing = list(rules.get("blocked_tools") or [])
+        merged = list(existing)
+        seen = {str(t).casefold() for t in existing}
+        for t in contract_blocked:
+            if str(t).casefold() not in seen:
+                merged.append(t)
+                seen.add(str(t).casefold())
+        rules["blocked_tools"] = merged
+        config["rules"] = rules
 
     # If no action_gate config exists, gate is disabled — pass through
     if not config:
