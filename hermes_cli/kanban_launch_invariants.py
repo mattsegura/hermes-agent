@@ -252,17 +252,18 @@ def _coerce_nonneg_int(value: Any) -> Optional[int]:
     if isinstance(value, float) and value.is_integer():
         return int(value) if value >= 0 else None
     if isinstance(value, str):
-        # FIX 2 (round-2): mirror kanban_reactive_runtime._coerce_int -- str
-        # .isdigit() admits unicode chars int() rejects ('³','①') and accepts
-        # non-ASCII digit forms int() does parse ('٣' -> 3), so intake and the
-        # runtime disagreed on what counts as a usable bound. Narrow to ASCII
-        # digits and wrap int() so this stays a non-negative-int coercion only.
-        stripped = value.strip()
-        if stripped.isascii() and stripped.isdigit():
-            try:
-                return int(stripped)
-            except (ValueError, OverflowError):
-                return None
+        # FIX 6 (round-4): mirror kanban_reactive_runtime._coerce_int EXACTLY so
+        # intake and the runtime agree byte-for-byte on what is a usable bound. A
+        # prior ``.isascii()`` gate changed the result versus base for a non-ASCII
+        # but int()-parseable digit string ('٣' -> 3, '٦' -> 6), drifting the
+        # default-off invariant report from base. Drop the ascii narrowing: parse
+        # with ``int(value.strip())`` (wrapped so '³'/'①' -> None, no crash), then
+        # keep this a NON-NEGATIVE-int coercion by rejecting negatives.
+        try:
+            parsed = int(value.strip())
+        except (ValueError, TypeError):
+            return None
+        return parsed if parsed >= 0 else None
     return None
 
 
@@ -577,17 +578,17 @@ def _check_loop_bound_values(
     guards non-finite floats, so the loop still compiles -- but a malformed bound
     is still a bug, so flag it at intake instead of silently ignoring it.
 
-    FIX 2 (round-2): the string branch must agree with the runtime
-    (``kanban_reactive_runtime._coerce_int``). The old gate
-    ``not val.strip().lstrip('-').isdigit()`` (a) passed unicode-digit chars int()
+    FIX 2 / ROUND-4 FIX B: the string branch must agree with the runtime
+    (``kanban_reactive_runtime._coerce_int``). The original gate
+    ``not val.strip().lstrip('-').isdigit()`` passed unicode-digit chars int()
     rejects ('³','①') -- blind to the exact input that crashes/silently-drops the
-    watcher at compile -- and (b) passed a NEGATIVE string like '-1' (because
-    ``'-1'.lstrip('-')=='1'.isdigit()`` is True) even though the runtime coerces
-    '-1' to int -1 then requires n>=0, silently dropping the cap (unbounded). A
-    string bound is now BAD unless it round-trips through the same ASCII-narrowed,
-    non-negative coercion the runtime uses -- so '³'/'①' (crash class), '٣'
-    (non-ASCII coercion), and '-1'/'-5' (negative) are all flagged, matching the
-    integer -1 that was already flagged.
+    watcher at compile. Round-4 makes BOTH coercions a plain ``int(value.strip())``
+    (no ascii narrowing): '³'/'①' are caught (-> None, flagged here, no crash),
+    '٣' (Arabic-Indic 3, which int() PARSES) coerces to 3 in BOTH so it is a
+    USABLE bound exactly like base 019271994 (NOT flagged), and a genuine NEGATIVE
+    string '-1'/'-5' coerces to a negative int the runtime drops -- still flagged,
+    matching the integer -1. A '-0' string coerces to 0 in both layers (a valid
+    cap of 0), so it is NOT flagged: intake and runtime agree byte-for-byte.
     """
     import math as _math
     # STEP-9 (LOW, round-3): import the RUNTIME coercion so intake and runtime

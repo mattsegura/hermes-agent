@@ -325,25 +325,21 @@ def _coerce_int(value: Any) -> Optional[int]:
     if isinstance(value, int):
         return int(value)
     if isinstance(value, str):
-        # FIX 2 (round-2): str.isdigit() is True for unicode chars that int()
-        # REJECTS (superscript '³', circled '①'), so the old gate
-        # ``value.strip().lstrip('-').isdigit()`` admitted a string that then
-        # crashed the unguarded ``int(...)`` -- the per-loop compile swallowed
-        # that (``except Exception``), SILENTLY dropping the whole watcher (board
-        # activated with 0 schedules for that loop). It also ACCEPTED other
-        # unicode-digit forms int() does parse ('٣' Arabic-Indic 3 -> 3),
-        # silently coercing a non-ASCII bound. Narrow the gate to ASCII digits so
-        # only a plain ASCII integer string is a usable bound, AND wrap int() in
-        # try/except as belt-and-suspenders so no isdigit()-True/int()-False edge
-        # can ever crash this primitive again. The matching narrowing lives in
-        # invariants._coerce_nonneg_int / _check_loop_bound_values so intake and
-        # runtime agree on what is a usable bound.
-        stripped = value.strip()
-        if stripped.lstrip("-").isascii() and stripped.lstrip("-").isdigit():
-            try:
-                return int(stripped)
-            except (ValueError, OverflowError):
-                return None
+        # FIX 6 (round-4): the goal is "no isdigit()-True/int()-raises char can
+        # crash the per-loop compile" -- NOT to narrow what int() itself accepts.
+        # A prior round added an ``.isascii()`` gate on top of the try/except;
+        # that gate CHANGED the parse result versus base ``int(value.strip())``
+        # for a non-ASCII but int()-parseable digit string ('٣' Arabic-Indic 3,
+        # '٦' -> 6), so a legacy loop carrying such a bound stopped being a usable
+        # bound and the default-off invariant report drifted from base. Drop the
+        # ascii narrowing: just ``int(value.strip())`` exactly like base, wrapped
+        # so an isdigit()-True/int()-raises char ('³','①') is caught (-> None, no
+        # crash) instead of aborting the compile. The matching change lives in
+        # invariants._coerce_nonneg_int so intake and runtime agree byte-for-byte.
+        try:
+            return int(value.strip())
+        except (ValueError, TypeError):
+            return None
     return None
 
 

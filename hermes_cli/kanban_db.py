@@ -698,46 +698,192 @@ def _canonical_json_hash(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+#: Keys under ``launch_intake`` that are DERIVED telemetry, not authorial intent,
+#: and so must NOT bind the canonical business-contract hash. Both are reports
+#: recomputable from the contract itself:
+#:
+#:   * ``completeness`` -- an ``assess_launch_completeness`` report
+#:     (``enforced_dimensions`` / ``blocking`` / per-dimension findings) attached
+#:     by the degraded universal-drafter fallback (FIX 5).
+#:   * ``invariants``   -- a ``check_contract_invariants`` report
+#:     (errors/warnings/checked). It is fully recomputable from the contract via
+#:     ``check_contract_invariants`` and changes whenever ANY check finds (or
+#:     stops finding) something -- a step-9 opt-in, an overloaded key, a new
+#:     pre-existing finding, etc. Binding it to the hash made the canonical hash
+#:     a function of the CHECKER, not the contract: every new finding flipped the
+#:     default-off hash (the round-4 recurring leak). Stripping it makes the hash
+#:     invariant to ALL check findings by construction.
+_CONTRACT_HASH_TELEMETRY_INTAKE_KEYS: tuple[str, ...] = ("completeness", "invariants")
+
+
 def _strip_contract_hash_telemetry(normalized: Any) -> Any:
     """Return a copy of a normalized contract with non-semantic TELEMETRY
     stripped, so the contract hash is stable regardless of report-mode soak data.
 
-    FIX 5: the degraded universal-drafter fallback persists
-    ``launch_intake.completeness`` (an ``assess_launch_completeness`` report
-    carrying ``enforced_dimensions`` / ``blocking`` / new dimension findings).
-    That block is pure telemetry -- it does NOT change what the contract means --
-    but ``normalize_board_operating_contract`` preserves it verbatim, so a
-    degraded-path contract would hash DIFFERENTLY head-vs-base even with all
-    enforcement flags off, which can invalidate approval tokens or bump the
-    contract_version on a no-op upgrade. We drop it here so the hash ignores it.
+    STEP-9 ROUND-4 ROOT FIX: both ``launch_intake.completeness`` (FIX 5) AND
+    ``launch_intake.invariants`` are DERIVED reports -- recomputable from the
+    contract (the latter via ``check_contract_invariants``), NOT authorial
+    intent. ``normalize_board_operating_contract`` preserves them verbatim, so a
+    contract carrying either block would hash DIFFERENTLY whenever a check finding
+    appeared or disappeared -- the recurring default-off hash-flip. By stripping
+    BOTH here the canonical hash is invariant to ANY check finding (a step-9
+    opt-in, an overloaded key like ``class``/``kind``/``max_defers``/
+    ``terminal_classes``, OR a pre-existing finding): a new finding can never
+    change the hash, so the default-off hash-flip is structurally gone.
 
-    STEP-9 RE-ARCHITECTURE NOTE: a prior round-2 fix ALSO stripped
-    ``launch_intake.invariants`` from the hashed payload. That change is REVERTED
-    here. The reason it seemed necessary -- new HEAD-only invariant findings on a
-    legacy contract changing the hash -- DISAPPEARS once the step-9 intake checks
-    are gated behind opt-in: a non-opted contract produces NO new invariant
-    findings, so its ``launch_intake.invariants`` block is identical base-vs-HEAD
-    and the hash is unchanged WITHOUT touching the hashed payload. Stripping
-    invariants was itself harmful: it UN-APPROVED base boards whose approval hash
-    legitimately included the invariants block. The hashed payload is therefore
-    byte-identical to base 019271994 (only ``completeness`` is stripped, exactly
-    as base did).
+    An ``launch_intake`` that becomes EMPTY once its telemetry is removed is
+    dropped entirely (it carried nothing but telemetry), so a contract whose only
+    ``launch_intake`` content was an invariants/completeness report hashes
+    IDENTICALLY to one with no ``launch_intake`` at all.
+
+    RE-STAMP: because this changes the hash SCHEME for any contract that carried
+    an invariants block, ``_restamp_launch_approval_contract_hash`` re-binds any
+    pre-existing approval token / review / launch_approval to the new (stripped)
+    hash at load time, so an already-approved board STAYS approved (the contract
+    semantics are unchanged; only derived telemetry left the hash). On every live
+    board this is a no-op (no board carries an approval token / launch_approval /
+    launch_review_id; verified), so no live approval state is touched.
     """
     if not isinstance(normalized, dict):
         return normalized
     intake = normalized.get("launch_intake")
-    if not isinstance(intake, dict) or "completeness" not in intake:
+    if not isinstance(intake, dict):
+        return normalized
+    if not any(k in intake for k in _CONTRACT_HASH_TELEMETRY_INTAKE_KEYS):
         return normalized
     clone = dict(normalized)
     intake_clone = dict(intake)
-    intake_clone.pop("completeness", None)
-    clone["launch_intake"] = intake_clone
+    for key in _CONTRACT_HASH_TELEMETRY_INTAKE_KEYS:
+        intake_clone.pop(key, None)
+    if intake_clone:
+        clone["launch_intake"] = intake_clone
+    else:
+        # The intake block held nothing but derived telemetry -- drop it so the
+        # hash matches a contract that never carried a launch_intake at all.
+        clone.pop("launch_intake", None)
     return clone
 
 
 def _business_contract_hash(contract: Any) -> str:
     normalized = normalize_board_operating_contract(contract)
     return _canonical_json_hash(_strip_contract_hash_telemetry(normalized))
+
+
+def _legacy_completeness_only_contract_hash(contract: Any) -> str:
+    """The PRE-round-4 hash scheme: strip ONLY ``launch_intake.completeness``.
+
+    Used solely by the one-time re-stamp migration to RECOGNIZE an approval
+    binding that was created under the old scheme (where ``launch_intake.invariants``
+    still bound the hash). A binding whose stored hash equals THIS but not the new
+    ``_business_contract_hash`` is a re-stamp candidate. A contract that never
+    carried an invariants block hashes identically under both schemes, so it is
+    never a candidate (and the migration is a no-op for it).
+    """
+    normalized = normalize_board_operating_contract(contract)
+    if isinstance(normalized, dict):
+        intake = normalized.get("launch_intake")
+        if isinstance(intake, dict) and "completeness" in intake:
+            normalized = dict(normalized)
+            intake_clone = dict(intake)
+            intake_clone.pop("completeness", None)
+            normalized["launch_intake"] = intake_clone
+    return _canonical_json_hash(normalized)
+
+
+#: Per-thread re-entrancy guard for the FIX A re-stamp persist path. The persist
+#: (``write_board_metadata``) itself reads the board, which re-enters
+#: ``read_board_metadata``; this flag makes the nested read re-stamp in memory but
+#: NOT recurse into another persist (which would loop until the write lands).
+_RESTAMP_GUARD = threading.local()
+
+
+def _restamp_launch_approval_contract_hash(meta: dict) -> bool:
+    """One-time, idempotent re-stamp of an approval binding to the NEW hash scheme.
+
+    Round-4 FIX A changed the canonical business-contract hash scheme to ALSO
+    strip ``launch_intake.invariants`` (derived telemetry). A board approved under
+    the OLD scheme stores a ``launch_approval.contract_hash`` (and matching
+    ``board_launch_reviews`` / ``board_launch_approval_tokens`` rows) bound to the
+    old hash, so ``_board_has_approved_launch_review`` -- which recomputes the hash
+    under the NEW scheme -- would see a mismatch and silently UN-approve the board
+    even though the contract semantics are unchanged.
+
+    This re-binds such an approval to the new hash:
+
+      * recompute the current contract hash under the new scheme;
+      * if the stored binding already equals it -> no-op (idempotent, and the
+        common case once migrated);
+      * else, ONLY when the stored binding equals the OLD (completeness-only)
+        scheme hash for the SAME contract -> re-stamp board.json's
+        ``launch_approval.contract_hash`` + the DB review/token rows to the new
+        hash. (A binding that matches NEITHER is a genuinely-different contract --
+        left untouched so a real divergence still fails closed.)
+
+    Returns True iff the in-memory ``meta`` was mutated (so the caller can persist
+    board.json). LIVE NO-OP: a board with no ``launch_approval`` returns False
+    immediately -- verified that no live board carries one, so this never touches
+    live approval state.
+    """
+    approval = meta.get("launch_approval")
+    if not isinstance(approval, dict):
+        return False
+    stored_hash = str(approval.get("contract_hash") or "").strip()
+    if not stored_hash:
+        return False
+    slug = str(meta.get("slug") or "").strip()
+    if not slug:
+        return False
+    try:
+        contract = _metadata_as_business_contract(meta)
+        new_hash = _business_contract_hash(contract)
+    except (TypeError, ValueError):
+        return False
+    if stored_hash == new_hash:
+        return False  # already on the new scheme (idempotent) -- nothing to do.
+    try:
+        old_hash = _legacy_completeness_only_contract_hash(contract)
+    except (TypeError, ValueError):
+        return False
+    if stored_hash != old_hash:
+        # The binding matches neither scheme for this contract -> a genuinely
+        # different contract. Leave it so a real divergence still fails closed.
+        return False
+    # Re-stamp the persisted DB rows (review + token) bound to the old hash.
+    try:
+        conn = sqlite3.connect(
+            str(kanban_db_path(board=slug)),
+            isolation_level=None,
+            timeout=30,
+        )
+        conn.row_factory = sqlite3.Row
+        with contextlib.closing(conn):
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE board_launch_reviews SET contract_hash = ? "
+                    "WHERE board = ? AND contract_hash = ?",
+                    (new_hash, slug, old_hash),
+                )
+                conn.execute(
+                    "UPDATE board_launch_approval_tokens SET contract_hash = ? "
+                    "WHERE board = ? AND contract_hash = ?",
+                    (new_hash, slug, old_hash),
+                )
+    except Exception:  # pragma: no cover - DB best-effort; in-memory re-stamp still applies
+        pass
+    # Re-stamp the in-memory metadata bindings so the live read is consistent.
+    approval_clone = dict(approval)
+    approval_clone["contract_hash"] = new_hash
+    meta["launch_approval"] = approval_clone
+    tokens = meta.get("launch_approval_tokens")
+    if isinstance(tokens, list):
+        restamped_tokens = []
+        for tok in tokens:
+            if isinstance(tok, dict) and str(tok.get("contract_hash") or "").strip() == old_hash:
+                tok = dict(tok)
+                tok["contract_hash"] = new_hash
+            restamped_tokens.append(tok)
+        meta["launch_approval_tokens"] = restamped_tokens
+    return True
 
 
 def _approval_token_hash(token: str) -> str:
@@ -5049,6 +5195,34 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 if raw.get("context") is not None:
                     raw["context"] = _normalize_board_context(raw.get("context"))
                 meta.update(raw)
+                # ROUND-4 FIX A re-stamp: re-bind an approval created under the
+                # OLD (completeness-only) hash scheme to the NEW (also strips
+                # launch_intake.invariants) scheme, so the contract semantics are
+                # unchanged and the board STAYS approved. The in-memory re-stamp
+                # runs on EVERY read (cheap + idempotent) so the returned meta is
+                # always consistent. Persisting board.json is a one-shot
+                # optimization done OUTSIDE this read (the persist path calls
+                # read_board_metadata again, so a re-entrancy guard prevents the
+                # nested read from recursing into another persist). NO-OP on every
+                # board with no launch_approval (verified: no live board has one).
+                try:
+                    if (
+                        _restamp_launch_approval_contract_hash(meta)
+                        and not getattr(_RESTAMP_GUARD, "active", False)
+                    ):
+                        _RESTAMP_GUARD.active = True
+                        try:
+                            write_board_metadata(
+                                slug,
+                                launch_approval=meta.get("launch_approval"),
+                                launch_approval_tokens=meta.get("launch_approval_tokens"),
+                            )
+                        except Exception:  # pragma: no cover - persist best-effort
+                            pass
+                        finally:
+                            _RESTAMP_GUARD.active = False
+                except Exception:  # pragma: no cover - migration never blocks read
+                    pass
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         meta["metadata_error"] = f"invalid board metadata: {exc}"
     meta["db_path"] = str(kanban_db_path(slug))
@@ -17306,8 +17480,12 @@ def _upsert_timer_schedule(
     CLOSED instead of reverting to the substring path.
     """
     # STEP-9 OPT-IN GATE: case-preserving base persistence unless strict opt-in.
+    # ROUND-4 FIX C: under strict, route through the sentinel-aware persistence
+    # normalizer so an AUTHORED non-empty sentinel ('null'/'-'/''/whitespace)
+    # persists a distinct marker (read back as unrecognized -> DEFER) instead of
+    # collapsing to NULL and firing ungated. Non-strict stays base-verbatim.
     persisted_side_effect_class = (
-        _canonical_side_effect_class(side_effect_class)
+        _canonical_side_effect_class_for_persist(side_effect_class)
         if strict_side_effects
         else _normalize_funnel_text(side_effect_class)
     )
@@ -17491,11 +17669,23 @@ def _compile_one_reactive_loop(
         strict_side_effects = _side_effect_strict_enabled(
             _contract_object(contract.get("side_effect_policy"))
         )
-        side_effect_class = str(
-            loop.get("side_effect_class")
-            or spec.get("side_effect_class")
-            or "none"
-        )
+        # Base 019271994 coalesces any falsy authored class (incl. an authored
+        # empty string ``""``) to "none" here. Under NON-strict we keep that
+        # expression verbatim (byte-identical). Under STRICT (ROUND-4 FIX C) we
+        # must NOT let an AUTHORED-but-falsy sentinel ("") silently become "none"
+        # and fire ungated: when the loop ITSELF declares a side_effect_class key
+        # (present, even if falsy), pass that authored value (incl. "") through to
+        # the sentinel-aware persistence normalizer, which routes a non-"none"
+        # sentinel to the dropped marker (-> the strict gate defers). A genuinely
+        # absent class falls back to the stage spec then None -> NULL -> fires.
+        if strict_side_effects and "side_effect_class" in loop:
+            side_effect_class = loop.get("side_effect_class")  # may be "" / sentinel
+        else:
+            side_effect_class = str(
+                loop.get("side_effect_class")
+                or spec.get("side_effect_class")
+                or "none"
+            )
         now = int(time.time())
         # B1 fix: the optimizer-managed cadence knob is the SOURCE OF TRUTH for
         # timer cadence. Resolve it as managed_knob_default OR the trigger's own
@@ -17621,6 +17811,57 @@ def _canonical_side_effect_class(value: Optional[Any]) -> Optional[str]:
     """
     text = _normalize_funnel_text(value)
     return text.lower() if text is not None else None
+
+
+#: ROUND-4 FIX C: the DB value persisted (under STRICT only) for a loop whose
+#: AUTHORED ``side_effect_class`` was a NON-EMPTY sentinel ('null' / '-' / '' /
+#: whitespace) that ``_normalize_funnel_text`` would collapse to NULL. Without a
+#: distinct marker such a value normalizes to NULL at persistence, the gate then
+#: coalesces NULL -> the benign 'none', and the loop FIRES ungated -- the opt-in
+#: strict gap. Persisting this distinct non-vocabulary marker makes the strict
+#: gate read it back as UNRECOGNIZED -> DEFER (fail-CLOSED). Mirrors the
+#: terminal_classes dropped-sentinel design (:data:`_TERMINAL_CLASSES_DROPPED_DB_MARKER`).
+#: It is NOT a member of the side-effect vocabulary, so a genuinely-absent class
+#: (true NULL) is unaffected and still fires.
+_SIDE_EFFECT_CLASS_DROPPED_DB_MARKER: str = "__side_effect_class_dropped__"
+
+
+def _canonical_side_effect_class_for_persist(value: Optional[Any]) -> Optional[str]:
+    """Strict-mode persistence normalizer for ``side_effect_class`` (FIX C).
+
+    Like :func:`_canonical_side_effect_class` (strip + lower-case + collapse the
+    ``none``/``null``/``-`` sentinels and empty strings to NULL) EXCEPT it
+    distinguishes a genuinely-absent class from an AUTHORED non-empty sentinel
+    that would normalize away:
+
+      * input ``None`` (truly absent) -> NULL (fires; unchanged);
+      * an authored value whose canonical form is ``none`` -> NULL (fires;
+        ``none`` is the explicit benign class, unchanged);
+      * an authored NON-EMPTY value that normalizes to NULL but is NOT ``none``
+        ('null' / '-' / '' / '   ') -> the dropped-sentinel MARKER, so the strict
+        gate reads it back as unrecognized and DEFERS (fail-CLOSED);
+      * any surviving real class -> its lower-cased canonical form (unchanged).
+
+    Only used under STRICT. The non-strict path stays ``_normalize_funnel_text``
+    verbatim (case-preserving, marker-free), so a non-opted board is byte-identical
+    to base 019271994.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        # Non-string authored value: defer to the base canonicalizer (which
+        # str()-coerces); no sentinel semantics apply.
+        return _canonical_side_effect_class(value)
+    normalized = _canonical_side_effect_class(value)
+    if normalized is not None:
+        return normalized
+    # The authored string normalized to NULL. If the author literally wrote the
+    # benign ``none``, that is the explicit no-side-effect class -> NULL (fires).
+    if value.strip().lower() == "none":
+        return None
+    # Otherwise it was a NON-EMPTY broken sentinel ('null' / '-' / '' / '  ') the
+    # author DID write but which would silently vanish -> fail CLOSED via marker.
+    return _SIDE_EFFECT_CLASS_DROPPED_DB_MARKER
 
 
 def _side_effect_strict_enabled(policy: dict) -> bool:
