@@ -164,6 +164,62 @@ def test_disabled_via_mode_off_also_short_circuits(fresh_home):
         assert _knob_audit_rows(conn, slug) == []
 
 
+def test_disabled_board_audit_ledger_is_frozen_not_pruned(fresh_home):
+    """FIX 8: a DISABLED board's audit ledger + signal history are FROZEN -- the
+    opportunistic retention prune now runs AFTER the kill-switch short-circuit,
+    so a disabled board with prior history keeps every row for inspection.
+    FAILS before FIX 8 (the prune ran BEFORE the short-circuit and aged-out a
+    disabled board's old audit rows)."""
+    slug = "ks-frozen-ledger"
+    _make_board(
+        slug,
+        {"default": 72, "allowed": [48, 72]},
+        optimizer_policy={"disabled": True, "approved_by": "owner", "reason": "paused"},
+    )
+    base = 6_500_000
+    with kb.connect(board=slug) as conn:
+        # Seed prior history: an applied knob-audit row + outcome signals, all OLD
+        # (well before `now`) so they WOULD be pruned under a short horizon.
+        kb.apply_knob_update(
+            conn, board=slug, knob=KNOB, new_value=48, old_value=72,
+            reason="optimizer:prior", actor="optimizer", now=base,
+        )
+        for i in range(4):
+            _emit_outcome(conn, board=slug, knob=KNOB, value=48, reward_value=1.0, ts=base + i)
+        audit_before = len(_knob_audit_rows(conn, slug))
+        signals_before = conn.execute(
+            "SELECT COUNT(*) FROM board_signals WHERE board = ?", (slug,)
+        ).fetchone()[0]
+        assert audit_before > 0 and signals_before > 0
+
+        # Tick the disabled board FAR in the future with a tiny retention horizon
+        # that WOULD prune all the old rows -- if the prune ran on a disabled board.
+        much_later = base + 10_000_000
+        res = kb.optimizer_tick(
+            conn, board=slug, now=much_later, rng=random.Random(0),
+        )
+        assert res["skipped"] == [{"knob": None, "reason": "optimizer_disabled"}]
+        # The prune did NOT run on the disabled board: result has no 'retention' key.
+        assert "retention" not in res, res
+        # Prior history is fully PRESERVED (frozen).
+        assert len(_knob_audit_rows(conn, slug)) == audit_before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM board_signals WHERE board = ?", (slug,)
+        ).fetchone()[0] == signals_before
+
+
+def test_enabled_board_still_runs_retention_prune(fresh_home):
+    """Control for FIX 8: an ENABLED board's tick STILL runs the retention prune
+    (the move only gates it behind the kill-switch, it does not remove it)."""
+    slug = "ks-prune-runs"
+    _make_board(slug, {"default": 72, "allowed": [48, 72]})  # no policy -> enabled
+    base = 6_800_000
+    with kb.connect(board=slug) as conn:
+        res = kb.optimizer_tick(conn, board=slug, now=base + 100, rng=random.Random(0))
+        # An enabled board reports a retention result (the prune executed).
+        assert "retention" in res, res
+
+
 def test_disabled_killswitch_also_blocks_canary_revert(fresh_home):
     """A disabled board must not even auto-revert -- the kill-switch is total."""
     slug = "ks-disabled-canary"

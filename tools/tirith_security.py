@@ -120,22 +120,53 @@ def _default_fail_open(autonomous: "bool | None" = None) -> bool:
     return not autonomous
 
 
+def _schema_default_fail_open() -> bool:
+    """The schema (DEFAULT_CONFIG) value for ``security.tirith_fail_open``.
+
+    Read defensively from ``DEFAULT_CONFIG`` so a raw on-disk value that merely
+    MIRRORS the schema default is recognised as a non-choice. Falls back to the
+    known literal (``True``) if the import fails.
+    """
+    try:
+        from hermes_cli.config import DEFAULT_CONFIG
+        sec = DEFAULT_CONFIG.get("security", {}) if isinstance(DEFAULT_CONFIG, dict) else {}
+        if isinstance(sec, dict) and "tirith_fail_open" in sec:
+            return bool(sec["tirith_fail_open"])
+    except Exception:  # pragma: no cover - defensive: never fail the loader
+        pass
+    return True
+
+
 def _user_set_fail_open() -> "bool | None":
     """Whether the user EXPLICITLY set ``security.tirith_fail_open`` on disk.
 
-    Returns the explicit value, or ``None`` when the user did NOT set it (so the
-    session-kind default applies). We read the RAW on-disk config -- not the
-    merged ``load_config()`` -- because ``load_config()`` injects the schema
-    default ``tirith_fail_open: True`` for every install, which would otherwise
-    shadow the autonomous fail-closed default. An explicit user setting must
-    still win; a baked-in schema default must not.
+    Returns the explicit value, or ``None`` when the user did NOT make an
+    explicit choice (so the session-kind default applies). We read the RAW
+    on-disk config -- not the merged ``load_config()`` -- because
+    ``load_config()`` injects the schema default ``tirith_fail_open: True`` for
+    every install, which would otherwise shadow the autonomous fail-closed
+    default.
+
+    H3 hardening: ``config.yaml`` ALSO persists a verbatim dump of
+    ``DEFAULT_CONFIG`` (including ``tirith_fail_open: true``) on first save, so a
+    raw value can be present on disk without ever being an operator CHOICE. We
+    therefore treat a raw value that EQUALS the schema default as "not
+    explicitly set" (return ``None``) -- letting the autonomous session-kind
+    default (fail-CLOSED) apply. A raw value that DIFFERS from the schema default
+    is a genuine operator override and still wins.
     """
     try:
         from hermes_cli.config import read_raw_config
         raw = read_raw_config()
         sec = raw.get("security", {}) if isinstance(raw, dict) else {}
         if isinstance(sec, dict) and "tirith_fail_open" in sec:
-            return bool(sec["tirith_fail_open"])
+            value = bool(sec["tirith_fail_open"])
+            # A raw value that merely mirrors the persisted schema default is
+            # NOT an explicit operator choice -- defer to the session-kind
+            # default so an autonomous run resolves fail-CLOSED.
+            if value == _schema_default_fail_open():
+                return None
+            return value
     except Exception:  # pragma: no cover - defensive: never fail the loader
         pass
     return None

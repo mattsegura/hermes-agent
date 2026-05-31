@@ -180,19 +180,76 @@ def test_a_explicit_false_is_honored_when_flag_on(fresh_home, monkeypatch):
 
 
 def test_a_config_yaml_flag_resolution(fresh_home, monkeypatch):
-    """The flag also resolves from config.yaml ``kanban.require_contract_defaults``
-    when the env var is unset (env > config.yaml kanban.* > default)."""
+    """FIX 7: the flag resolves from a REAL config.yaml
+    ``kanban.require_contract_defaults`` when the env var is unset, exercising
+    the actual config-layer branch of ``_resolve_kanban_bool_flag`` (no
+    monkeypatch of the resolver). env > config.yaml kanban.* > default."""
+    import yaml as _yaml
+
     monkeypatch.delenv("HERMES_KANBAN_REQUIRE_CONTRACT_DEFAULTS", raising=False)
-    monkeypatch.setattr(
-        kb,
-        "_resolve_kanban_bool_flag",
-        lambda env_var, config_key: config_key == "require_contract_defaults",
+    # Write a genuine config.yaml under the fresh HERMES_HOME so load_config()
+    # reads it through the normal pipeline.
+    config_path = fresh_home / "config.yaml"
+    config_path.write_text(
+        _yaml.safe_dump({"kanban": {"require_contract_defaults": True}}),
+        encoding="utf-8",
     )
+    # Defensively clear the config caches so the just-written file is read
+    # (the caches are keyed on mtime/size, but be explicit for test isolation).
+    try:
+        import hermes_cli.config as _cfgmod
+        _cfgmod._LOAD_CONFIG_CACHE.clear()
+        _cfgmod._RAW_CONFIG_CACHE.clear()
+    except Exception:
+        pass
+
+    # Sanity: the REAL resolver (not monkeypatched) now reports True from config.
+    assert kb._resolve_kanban_bool_flag(
+        "HERMES_KANBAN_REQUIRE_CONTRACT_DEFAULTS", "require_contract_defaults"
+    ) is True
+    assert kb._require_contract_defaults_enabled() is True
+
     _managed_board_empty_contract()
     with kb.connect(board="managed") as conn:
         tid = kb.create_task(conn, title="cfg", assignee="worker", board="managed", initial_status="blocked")
         contract = kb.resolve_task_contract(kb.get_task(conn, tid), board="managed")
+        # The config-layer flag promoted the absent require_* defaults.
         assert contract["require_worker_envelopes"] is True
+        assert contract["require_provider_policy"] is True
+        assert contract["require_semantics"] is True
+        assert set(contract["contract_defaults_applied"]) == {
+            "require_worker_envelopes",
+            "require_provider_policy",
+            "require_semantics",
+        }
+
+
+def test_a_config_yaml_flag_false_keeps_default_off(fresh_home, monkeypatch):
+    """FIX 7 companion: a real config.yaml with the flag set FALSE (or absent)
+    keeps the default-off behavior -- the config-layer branch is exercised in
+    BOTH directions, not just the promote path."""
+    import yaml as _yaml
+
+    monkeypatch.delenv("HERMES_KANBAN_REQUIRE_CONTRACT_DEFAULTS", raising=False)
+    config_path = fresh_home / "config.yaml"
+    config_path.write_text(
+        _yaml.safe_dump({"kanban": {"require_contract_defaults": False}}),
+        encoding="utf-8",
+    )
+    try:
+        import hermes_cli.config as _cfgmod
+        _cfgmod._LOAD_CONFIG_CACHE.clear()
+        _cfgmod._RAW_CONFIG_CACHE.clear()
+    except Exception:
+        pass
+
+    assert kb._require_contract_defaults_enabled() is False
+    _managed_board_empty_contract()
+    with kb.connect(board="managed") as conn:
+        tid = kb.create_task(conn, title="cfg-off", assignee="worker", board="managed", initial_status="blocked")
+        contract = kb.resolve_task_contract(kb.get_task(conn, tid), board="managed")
+        assert contract["require_worker_envelopes"] is False
+        assert contract["contract_defaults_applied"] == []
 
 
 # ===========================================================================
@@ -231,9 +288,61 @@ def _capture_spawn_argv(monkeypatch, task, workspace, board):
     return captured["cmd"]
 
 
+def _parse_spawn_toolsets(cmd):
+    """Parse the spawned worker argv with the REAL ``hermes`` parser and return
+    the resolved ``args.toolsets``.
+
+    This is the crux of FIX 2: the worker keeps whatever toolset the parser
+    actually resolves -- a string-match on argv is NOT sufficient because the
+    ``chat`` subparser redefines ``-t/--toolsets`` (default=None) and will
+    silently null any ``--toolsets`` placed BEFORE ``chat``. We therefore drive
+    the same parse path ``hermes`` itself uses:
+
+      1. strip the leading ``hermes`` invocation prefix (everything up to and
+         including the ``chat`` subcommand's owning argv -- here we just locate
+         the ``-p``/``--profile`` pair and drop it, mirroring
+         ``main._apply_profile_override`` which removes it before argparse),
+      2. drop the bare ``hermes`` exe / ``-m module`` prefix tokens that precede
+         the first recognised top-level flag,
+      3. parse the remainder with ``build_top_level_parser()`` (chat registered,
+         exactly as ``main.main`` wires it).
+    """
+    import argparse
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, _subparsers, chat_parser = build_top_level_parser()
+    # main.main() sets this so the chat subparser is dispatchable.
+    chat_parser.set_defaults(func=lambda *a, **k: None)
+
+    argv = list(cmd)
+    # (1) Strip the ``-p``/``--profile`` pair the real launcher consumes BEFORE
+    # argparse ever sees it (main._apply_profile_override).
+    stripped = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-p", "--profile") and i + 1 < len(argv):
+            i += 2
+            continue
+        if a.startswith("--profile="):
+            i += 1
+            continue
+        stripped.append(a)
+        i += 1
+    # (2) Drop the bare exe / module-launch prefix: everything before the first
+    # token the top-level parser owns. ``--accept-hooks`` is always present in a
+    # worker spawn and is a recognised top-level flag, so cut there.
+    if "--accept-hooks" in stripped:
+        start = stripped.index("--accept-hooks")
+        stripped = stripped[start:]
+    # (3) parse_known_args so any leftover engine-only flags don't abort.
+    ns, _unknown = parser.parse_known_args(stripped)
+    return getattr(ns, "toolsets", None)
+
+
 def test_b_no_toolsets_flag_by_default(fresh_home, monkeypatch):
-    """DEFAULT-OFF: even with an envelope present, the spawn argv carries NO
-    ``--toolsets`` -- byte-identical to today."""
+    """DEFAULT-OFF: even with an envelope present, the worker resolves to the
+    UNRESTRICTED (None) toolset -- the parser sees no constraint."""
     _spawn_board_with_envelope("spawnboard", toolsets=["web", "kanban"])
     with kb.connect(board="spawnboard") as conn:
         tid = kb.create_task(conn, title="w", assignee="worker", board="spawnboard", initial_status="blocked")
@@ -241,11 +350,17 @@ def test_b_no_toolsets_flag_by_default(fresh_home, monkeypatch):
         workspace = kb.resolve_workspace(task, board="spawnboard")
         cmd = _capture_spawn_argv(monkeypatch, task, workspace, "spawnboard")
     assert "--toolsets" not in cmd, f"unexpected --toolsets in default-off argv: {cmd}"
+    # And the real parser confirms: no constraint resolved.
+    assert _parse_spawn_toolsets(cmd) is None
 
 
 def test_b_toolsets_injected_when_flag_on_and_envelope_present(fresh_home, monkeypatch):
-    """FLAG-ON + declared envelope: the argv carries ``--toolsets web,kanban``
-    (the envelope's declared subset of the profile's full toolset)."""
+    """FLAG-ON + declared envelope: the REAL parser resolves
+    ``args.toolsets == 'web,kanban'`` (the envelope's declared subset).
+
+    This is the FIX 2 regression: it FAILS before the fix because the flag was
+    appended BEFORE ``chat`` and the chat subparser nulls it -> args.toolsets is
+    None and the worker keeps its full profile toolset (silently inert)."""
     monkeypatch.setenv("HERMES_KANBAN_ENFORCE_WORKER_TOOLSETS", "1")
     _spawn_board_with_envelope("spawnboard", toolsets=["web", "kanban"])
     with kb.connect(board="spawnboard") as conn:
@@ -254,17 +369,20 @@ def test_b_toolsets_injected_when_flag_on_and_envelope_present(fresh_home, monke
         workspace = kb.resolve_workspace(task, board="spawnboard")
         cmd = _capture_spawn_argv(monkeypatch, task, workspace, "spawnboard")
     assert "--toolsets" in cmd, f"spawn argv missing --toolsets: {cmd}"
-    idx = cmd.index("--toolsets")
-    assert cmd[idx + 1] == "web,kanban", f"wrong toolset list: {cmd[idx + 1]!r}"
-    # Must precede the 'chat' subcommand (top-level inherited flag placement).
-    assert cmd.index("--toolsets") < cmd.index("chat"), (
-        f"--toolsets must come before 'chat': {cmd}"
+    # Placement contract: the flag MUST come AFTER 'chat' so the chat subparser
+    # receives it (the whole point of the fix).
+    assert cmd.index("--toolsets") > cmd.index("chat"), (
+        f"--toolsets must come AFTER 'chat' so the subparser receives it: {cmd}"
+    )
+    # The authoritative assertion: PARSE the argv and confirm the resolved value.
+    assert _parse_spawn_toolsets(cmd) == "web,kanban", (
+        f"parser must resolve the envelope toolset, got {_parse_spawn_toolsets(cmd)!r}"
     )
 
 
 def test_b_no_flag_when_envelope_absent_even_if_enabled(fresh_home, monkeypatch):
-    """FLAG-ON but NO envelope declared for this worker: NO ``--toolsets`` flag
-    (no accidental lockout -- the profile's full toolset still applies)."""
+    """FLAG-ON but NO envelope declared for this worker: the parser resolves to
+    the UNRESTRICTED (None) toolset (no accidental lockout)."""
     monkeypatch.setenv("HERMES_KANBAN_ENFORCE_WORKER_TOOLSETS", "1")
     _spawn_board_with_envelope("spawnboard", toolsets=None)
     with kb.connect(board="spawnboard") as conn:
@@ -275,6 +393,7 @@ def test_b_no_flag_when_envelope_absent_even_if_enabled(fresh_home, monkeypatch)
     assert "--toolsets" not in cmd, (
         f"no envelope declared -> must NOT inject --toolsets: {cmd}"
     )
+    assert _parse_spawn_toolsets(cmd) is None
 
 
 def test_b_empty_toolsets_envelope_does_not_inject(fresh_home, monkeypatch):
@@ -288,6 +407,7 @@ def test_b_empty_toolsets_envelope_does_not_inject(fresh_home, monkeypatch):
         workspace = kb.resolve_workspace(task, board="spawnboard")
         cmd = _capture_spawn_argv(monkeypatch, task, workspace, "spawnboard")
     assert "--toolsets" not in cmd, f"empty toolsets must not inject flag: {cmd}"
+    assert _parse_spawn_toolsets(cmd) is None
 
 
 # ===========================================================================

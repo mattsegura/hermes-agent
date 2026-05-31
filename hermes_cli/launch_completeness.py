@@ -90,15 +90,39 @@ _SCOREABLE_SUCCESS_RE = re.compile(
 # stdlib-only / engine-import-optional).
 _TYPED_SUCCESS_REQUIRED_KEYS: tuple[str, ...] = ("metric", "comparator", "target", "data_source")
 
+# The closed set of comparators the scoreboard can actually evaluate. Mirrors
+# kanban_db._TYPED_SUCCESS_COMPARATORS + the prose aliases it folds to symbols.
+# A comparator OUTSIDE this set means the typed entry is not machine-gradeable
+# (the scoreboard has no operator to apply) -> the entry is NOT scoreable.
+_TYPED_SUCCESS_COMPARATORS: frozenset[str] = frozenset({">=", "<=", ">", "<", "==", "!="})
+_TYPED_SUCCESS_COMPARATOR_ALIASES: tuple[str, ...] = ("at_least", "at_most")
+
 
 def _is_typed_success(entry: Any) -> bool:
     """A success entry is *typed* when it is a dict that declares a ``metric``."""
     return isinstance(entry, dict) and bool(str(entry.get("metric") or "").strip())
 
 
+def _comparator_is_valid(value: Any) -> bool:
+    """True when ``value`` is a comparator the scoreboard can evaluate (a symbolic
+    operator or a known prose alias). Normalization folds aliases to symbols, so
+    we accept either form here."""
+    if not isinstance(value, str):
+        return False
+    token = value.strip().lower()
+    text = value.strip()
+    return text in _TYPED_SUCCESS_COMPARATORS or token in _TYPED_SUCCESS_COMPARATOR_ALIASES
+
+
 def _typed_success_missing_keys(entry: dict) -> list[str]:
     """Required keys a typed success entry is missing (empty/absent values count
-    as missing). A non-empty result means the entry is NOT scoreable."""
+    as missing). A non-empty result means the entry is NOT scoreable.
+
+    FIX 6: a ``comparator`` that is present but OUTSIDE the known comparator set
+    is treated as missing (the scoreboard cannot grade an unknown operator), and
+    a non-scalar ``target`` (dict/list/...) is rejected by the isinstance guard
+    -- closing the laundering path where a repr-stringified non-scalar looked
+    scoreable."""
     missing: list[str] = []
     for key in _TYPED_SUCCESS_REQUIRED_KEYS:
         val = entry.get(key)
@@ -109,6 +133,10 @@ def _typed_success_missing_keys(entry: dict) -> list[str]:
         elif isinstance(val, str) and not val.strip():
             missing.append(key)
         elif not isinstance(val, (int, float, str, bool)):
+            # non-scalar target/value (dict/list/...) is not gradeable.
+            missing.append(key)
+        elif key == "comparator" and not _comparator_is_valid(val):
+            # present but unrecognized operator -> not scoreable.
             missing.append(key)
     return missing
 
@@ -204,6 +232,21 @@ _WIN_TERMINAL_TOKENS: tuple[str, ...] = (
     "completed", "complete", "fulfilled", "succeeded", "success", "approved",
 )
 
+# Explicit LOSS-class indicators. These are checked BEFORE the win-substring
+# logic so a failure terminal whose label happens to embed a win substring
+# (e.g. 'closed_lost' contains 'closed', 'disapproved' contains 'approved',
+# 'unsigned' contains 'sign', 'incomplete'/'not_completed' contain 'complete')
+# is correctly classified as NOT a win. Tokens are deliberately PRECISE so they
+# never collide with a legitimate win label: there is no bare 'un'/'no' prefix,
+# and bare 'lose' is intentionally OMITTED because it is a substring of
+# 'closed_won'/'closed'/'close' (only 'lost'/'loss' are used).
+_LOSS_TERMINAL_TOKENS: tuple[str, ...] = (
+    "lost", "loss", "closed_lost", "unsigned", "incomplete",
+    "not_completed", "not_complete", "disapprov", "disqualif", "reject",
+    "declin", "cancel", "abandon", "churn", "expired", "dead",
+    "failed", "fail", "withdrawn", "bounced",
+)
+
 
 def _terminal_state_tokens(loop: Any) -> list[str]:
     """Lowercased terminal-state labels for a loop/entity (str or dict shapes)."""
@@ -224,6 +267,12 @@ def _terminal_state_tokens(loop: Any) -> list[str]:
 
 def _looks_like_win(token: str) -> bool:
     t = (token or "").lower()
+    # A token that reads as a LOSS is never a win, even when it also embeds a
+    # win substring (closed_lost / disapproved / unsigned / incomplete / ...).
+    # This loss check runs FIRST so the optimizer is never rewarded for a
+    # loss-producing terminal outcome.
+    if any(tok in t for tok in _LOSS_TERMINAL_TOKENS):
+        return False
     return any(tok in t for tok in _WIN_TERMINAL_TOKENS)
 
 

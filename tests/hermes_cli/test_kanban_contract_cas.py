@@ -134,3 +134,83 @@ def test_no_expected_version_keeps_legacy_behavior(fresh_home):
     kb.create_board("cas3", name="CAS3")
     kb.write_board_metadata("cas3", description="free write")  # no expected_version
     assert kb.read_board_metadata("cas3")["description"] == "free write"
+
+
+# ---------------------------------------------------------------------------
+# FIX 5: launch_intake.completeness is TELEMETRY, not contract semantics -- it
+# must not perturb the business-contract hash (which approval tokens and the
+# contract_version bind to). The degraded universal-drafter fallback attaches
+# this block with all enforcement flags OFF; if it changed the hash, a no-op
+# upgrade would invalidate approval tokens / bump contract_version.
+# ---------------------------------------------------------------------------
+
+
+def _intake_contract(*, with_completeness):
+    contract = {
+        "objective": {
+            "statement": "Run a mock board",
+            "success": ["proof is structured"],
+            "failure": ["worker escapes"],
+            "constraints": ["mock only"],
+        },
+        "launch_intake": {
+            "answers": {"goal": "do the thing"},
+            "owner_review_required": True,
+        },
+    }
+    if with_completeness:
+        contract["launch_intake"]["completeness"] = {
+            "ok": True,
+            "errors": [],
+            "warnings": ["[success_scoreability] success criteria are not scoreable"],
+            "dimensions": {"invariants": {"findings": ["warning: soft"], "enforced": True}},
+            "enforced_dimensions": ["success_scoreability"],
+            "blocking": [],
+        }
+    return contract
+
+
+def test_completeness_telemetry_does_not_change_contract_hash(fresh_home):
+    # A contract WITH vs WITHOUT the launch_intake.completeness block hashes
+    # IDENTICALLY. FAILS before FIX 5 (normalize preserved the block verbatim,
+    # so the degraded-path contract drifted the hash head-vs-base).
+    h_plain = kb._business_contract_hash(_intake_contract(with_completeness=False))
+    h_telemetry = kb._business_contract_hash(_intake_contract(with_completeness=True))
+    assert h_plain == h_telemetry, (
+        "launch_intake.completeness telemetry must not change the contract hash"
+    )
+
+
+def test_approval_token_binding_unaffected_by_completeness_telemetry(fresh_home):
+    # The approval-token contract binding compares the bound contract_hash to the
+    # hash of the contract presented at verify time (_validate_approval_token_record).
+    # A token issued against the plain contract therefore still matches the SAME
+    # contract after the degraded fallback attaches completeness telemetry,
+    # because the hash is identical. We assert that binding hash equivalence
+    # directly (the level the token validator actually compares).
+    plain = _intake_contract(with_completeness=False)
+    with_tel = _intake_contract(with_completeness=True)
+
+    bound_hash = kb._business_contract_hash(plain)
+    presented_hash = kb._business_contract_hash(with_tel)
+    assert bound_hash == presented_hash
+
+    # The token validator rejects only when the hashes differ; identical hashes
+    # pass the contract-binding check. Build a minimal pending record bound to
+    # the plain hash and verify it validates against the telemetry-carrying hash.
+    record = {
+        "status": "pending",
+        "board": "casintake",
+        "kind": "launch",
+        "contract_version": 1,
+        "contract_hash": bound_hash,
+        "amendment_id": None,
+    }
+    # Must NOT raise: the telemetry-carrying contract presents the same hash.
+    kb._validate_approval_token_record(
+        record,
+        board="casintake",
+        kind="launch",
+        contract_hash=presented_hash,
+        contract_version=1,
+    )

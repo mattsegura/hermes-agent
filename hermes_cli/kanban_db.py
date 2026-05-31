@@ -77,6 +77,7 @@ except ImportError:  # pragma: no cover - Windows has no fcntl module.
     fcntl = None  # type: ignore[assignment]
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -651,8 +652,34 @@ def _canonical_json_hash(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _strip_contract_hash_telemetry(normalized: Any) -> Any:
+    """Return a copy of a normalized contract with non-semantic TELEMETRY
+    stripped, so the contract hash is stable regardless of report-mode soak data.
+
+    FIX 5: the degraded universal-drafter fallback persists
+    ``launch_intake.completeness`` (an ``assess_launch_completeness`` report
+    carrying ``enforced_dimensions`` / ``blocking`` / new dimension findings).
+    That block is pure telemetry -- it does NOT change what the contract means --
+    but ``normalize_board_operating_contract`` preserves it verbatim, so a
+    degraded-path contract would hash DIFFERENTLY head-vs-base even with all
+    enforcement flags off, which can invalidate approval tokens or bump the
+    contract_version on a no-op upgrade. We drop it here so the hash ignores it.
+    """
+    if not isinstance(normalized, dict):
+        return normalized
+    intake = normalized.get("launch_intake")
+    if not isinstance(intake, dict) or "completeness" not in intake:
+        return normalized
+    clone = dict(normalized)
+    intake_clone = dict(intake)
+    intake_clone.pop("completeness", None)
+    clone["launch_intake"] = intake_clone
+    return clone
+
+
 def _business_contract_hash(contract: Any) -> str:
-    return _canonical_json_hash(normalize_board_operating_contract(contract))
+    normalized = normalize_board_operating_contract(contract)
+    return _canonical_json_hash(_strip_contract_hash_telemetry(normalized))
 
 
 def _approval_token_hash(token: str) -> str:
@@ -2119,14 +2146,24 @@ def _completeness_blocking_findings(report: Optional[dict], enforced_dims) -> li
     """The launch-completeness findings that should BLOCK the gate, given the
     configured enforced dimension set. Shared by ``validate_business_runtime_contract``
     (readiness errors) and the degraded-fallback telemetry so both agree on what
-    "would block". Invariant findings are stored ``error:``/``warning:``-prefixed;
-    only the structural errors block (invariant warnings stay advisory)."""
+    "would block".
+
+    Invariant findings are stored with a leading classifier:
+    ``error: ...`` (a hard structural rail), ``warning: ...`` (advisory),
+    ``raised: <exc>`` (the checker itself CRASHED), or the bare
+    ``check_contract_invariants unavailable ...`` marker (the engine checker
+    could not be imported). FIX 4(a): for the ``invariants`` dimension we use a
+    DENYLIST -- block EVERYTHING except ``warning:`` so a crashed/unavailable
+    checker FAILS CLOSED under enforcement instead of being silently dropped.
+    Only genuine advisory ``warning:`` findings stay non-blocking."""
     blocking: list[str] = []
     dims = (report or {}).get("dimensions") or {}
     for dim in enforced_dims:
         info = dims.get(dim) or {}
         for finding in info.get("findings", []) or []:
-            if dim == "invariants" and not str(finding).startswith("error:"):
+            # invariants: advisory ONLY for explicit warnings; an error,
+            # a 'raised:' crash, or the 'unavailable' marker all BLOCK.
+            if dim == "invariants" and str(finding).startswith("warning:"):
                 continue
             blocking.append(f"[{dim}] {finding}")
     return blocking
@@ -2297,6 +2334,14 @@ def validate_business_runtime_contract(
     # consults this function) finally SEES what only the invariants enforced.
     # Surfaced as warnings + a structured `completeness` block; non-blocking until
     # per-dimension enforce after a soak. Defensive: never breaks validate.
+    #
+    # FIX 4(b): resolve the ENFORCED dimension set OUTSIDE the try so that if the
+    # assessment itself crashes we still know whether enforcement was requested.
+    # When enforcement IS requested and the assessor raises, we FAIL CLOSED
+    # (record a blocking error so readiness.ok=False and the gate blocks) instead
+    # of silently dropping all enforcement. When enforcement is OFF (the default
+    # empty set), a crash stays a no-op so default-off behavior is unchanged.
+    _enforced_dims = _launch_completeness_enforced_dimensions()
     try:
         from hermes_cli.launch_completeness import assess_launch_completeness
 
@@ -2310,7 +2355,6 @@ def validate_business_runtime_contract(
         # (a distinct launch_completeness_failed blocker). The default-EMPTY
         # enforced set leaves `errors` byte-identical to before -> zero runtime
         # behavior change until a dimension is flipped on after a report soak.
-        _enforced_dims = _launch_completeness_enforced_dimensions()
         _completeness_blocking = _completeness_blocking_findings(_completeness, _enforced_dims)
         for _msg in _completeness_blocking:
             if _msg not in errors:
@@ -2321,7 +2365,26 @@ def validate_business_runtime_contract(
         if _completeness_blocking and status != "invalid":
             status = "invalid"
     except Exception as _exc:  # pragma: no cover - defensive
-        _completeness = {"ok": True, "errors": [], "warnings": [], "dimensions": {}, "unavailable": repr(_exc)}
+        if _enforced_dims:
+            # Enforcement requested but the assessment crashed -> FAIL CLOSED:
+            # an unverifiable contract must not dispatch under enforcement.
+            _enforce_unavailable = f"[enforcement_unavailable] completeness assessment raised: {_exc!r}"
+            _completeness = {
+                "ok": False,
+                "errors": [_enforce_unavailable],
+                "warnings": [],
+                "dimensions": {},
+                "enforced_dimensions": sorted(_enforced_dims),
+                "blocking": [_enforce_unavailable],
+                "unavailable": repr(_exc),
+            }
+            if _enforce_unavailable not in errors:
+                errors.append(_enforce_unavailable)
+            if status != "invalid":
+                status = "invalid"
+        else:
+            # Default-off: a crash stays a no-op (byte-identical to before).
+            _completeness = {"ok": True, "errors": [], "warnings": [], "dimensions": {}, "unavailable": repr(_exc)}
 
     credentials: dict[str, Any] = {"ok": True, "missing_keys": [], "inputs": []}
     try:
@@ -4235,8 +4298,27 @@ def _normalize_typed_success_entry(entry: dict) -> dict:
         if key not in out:
             continue
         val = out.get(key)
-        # keep numbers numeric; coerce everything else to a stripped string
-        if isinstance(val, bool) or not isinstance(val, (int, float)):
+        # FIX 6: a typed target/baseline must be a SCALAR (number or string). A
+        # non-scalar (dict/list/tuple) must NOT be repr-stringified into a
+        # non-empty string -- that would launder it past the spec's isinstance
+        # guard and make a junk entry look scoreable. Keep the non-scalar value
+        # in its ORIGINAL type so launch_completeness._typed_success_missing_keys
+        # rejects it. Also reject non-finite floats (nan/inf): drop the key so
+        # the entry reads as missing (un-scoreable) rather than carrying a value
+        # the scoreboard can never compare against.
+        if isinstance(val, bool):
+            # bool is a scalar but not a meaningful numeric target -> stringify.
+            out[key] = str(val).strip()
+        elif isinstance(val, (int, float)):
+            if isinstance(val, float) and not math.isfinite(val):
+                # non-finite numeric target is not gradeable -> drop the key.
+                out.pop(key, None)
+            # else: keep finite numbers numeric (unchanged).
+        elif isinstance(val, (dict, list, tuple, set)):
+            # NON-SCALAR: preserve the original type so the spec guard rejects it.
+            out[key] = val
+        else:
+            # other scalars (str / None / etc.) -> legacy stripped-string coercion.
             out[key] = str(val).strip() if val is not None else ""
     data_source = str(out.get("data_source") or "").strip()
     if "data_source" in out:
@@ -17314,8 +17396,21 @@ def _looks_like_win_token(token: Optional[str]) -> bool:
         return False
     try:
         from hermes_cli.launch_completeness import _looks_like_win as _llw
+        # _llw already applies the loss-token denylist BEFORE the win check, so
+        # a loss terminal that embeds a win substring (closed_lost / disapproved
+        # / unsigned / incomplete / not_completed / ...) is correctly rejected.
         return bool(_llw(t))
     except Exception:  # pragma: no cover - defensive: degrade to legacy behavior
+        # Legacy fallback kept consistent with the spec helper: an explicit loss
+        # marker is never a win, even when it embeds the 'won' substring.
+        _LEGACY_LOSS = (
+            "lost", "loss", "closed_lost", "unsigned", "incomplete",
+            "not_completed", "not_complete", "disapprov", "disqualif",
+            "reject", "declin", "cancel", "abandon", "churn", "expired",
+            "dead", "failed", "fail", "withdrawn", "bounced",
+        )
+        if any(tok in t for tok in _LEGACY_LOSS):
+            return False
         return "won" in t
 
 
@@ -18483,10 +18578,14 @@ OPTIMIZER_CANARY_HOLD_SECONDS: int = 24 * 3600
 #: will judge -- too few and the comparison is noise, so we keep holding.
 OPTIMIZER_CANARY_MIN_OUTCOMES: int = 4
 
-#: Improvement epsilon (in utility units). The post-change mean utility must
-#: beat the pre-change baseline by MORE than this to be considered an
-#: improvement; otherwise the change is "did not improve" and is reverted.
-OPTIMIZER_CANARY_IMPROVE_EPSILON: float = 0.0
+#: Regression epsilon (in utility units). The auto-revert canary fires ONLY when
+#: the post-change mean utility drops BELOW the pre-change baseline by MORE than
+#: this margin. A small positive value means a NEUTRAL (no-harm) change -- whose
+#: post-change mean is at or near the baseline -- is KEPT rather than churned
+#: back, while a clear regression beyond the margin still reverts. The margin is
+#: deliberately small so it does not mask real collapses (the regression test's
+#: pre=1.0/post=0.0 drop of 1.0 dwarfs it).
+OPTIMIZER_CANARY_IMPROVE_EPSILON: float = 0.05
 
 #: Env flag overriding a board's optimizer auto-revert. Truthy enables, falsy
 #: (``0``/``false``/``no``/``off``) disables. Unset falls through to config.yaml
@@ -19409,8 +19508,13 @@ def _optimizer_canary_revert(
     # No baseline to compare against -> cannot call it a regression; hold.
     if pre_mean is None or post_mean is None:
         return None
-    improved = post_mean > (pre_mean + OPTIMIZER_CANARY_IMPROVE_EPSILON)
-    if improved:
+    # FIX 8: only a genuine REGRESSION is reverted. A NEUTRAL (no-harm) change --
+    # one whose post-change mean is within OPTIMIZER_CANARY_IMPROVE_EPSILON of the
+    # baseline -- is KEPT, not auto-reverted: there is no evidence it hurt, and
+    # reverting it just churns the knob. The auto-revert fires only when the
+    # post-change mean drops BELOW the baseline by more than the epsilon margin.
+    regressed = post_mean < (pre_mean - OPTIMIZER_CANARY_IMPROVE_EPSILON)
+    if not regressed:
         return None
 
     # Regression: revert to the last-known-good old_value. Guard the value is
@@ -19513,14 +19617,6 @@ def optimizer_tick(
         "gated": [],
         "reverted": [],
     }
-    # Opportunistic retention prune (operational hygiene). Best-effort: a prune
-    # failure must never break the learning tick. The rollup keeps the learner's
-    # posterior intact, so this is safe to run before evaluating the knob.
-    try:
-        result["retention"] = prune_board_retention(conn, board=board_slug, now=when)
-    except Exception:  # pragma: no cover - retention is best-effort hygiene
-        _log.warning("kanban retention prune failed for board %s", board_slug, exc_info=True)
-
     try:
         contract = _metadata_as_business_contract(read_board_metadata(board_slug))
     except Exception as exc:
@@ -19545,6 +19641,16 @@ def optimizer_tick(
     if _optimizer_policy_disabled_state(runtime)["disabled"]:
         result["skipped"].append({"knob": knob, "reason": "optimizer_disabled"})
         return result
+    # FIX 8: opportunistic retention prune (operational hygiene) runs AFTER the
+    # kill-switch short-circuit, so a DISABLED board's audit ledgers + signal
+    # history are FROZEN (never pruned) once the optimizer is turned off -- the
+    # audit trail of a disabled board must stay intact for inspection. Best-effort:
+    # a prune failure must never break the learning tick; the rollup keeps the
+    # learner's posterior intact, so it is safe to run before evaluating the knob.
+    try:
+        result["retention"] = prune_board_retention(conn, board=board_slug, now=when)
+    except Exception:  # pragma: no cover - retention is best-effort hygiene
+        _log.warning("kanban retention prune failed for board %s", board_slug, exc_info=True)
     # E3 multi-knob tick: tune EVERY present managed knob, not just the first
     # ``select_managed_knob`` result. Mirrors the read-model loop in
     # ``build_learned_state_read_model`` (filter ``OPTIMIZER_MANAGED_KNOBS`` by
@@ -22646,19 +22752,23 @@ def _default_spawn(
     # When ON, resolve the task's worker_envelope from the active contract and,
     # ONLY when an envelope with declared toolsets exists for this worker
     # profile, constrain the spawned subprocess to that (sub)set via the
-    # ``--toolsets`` flag (the `hermes` CLI's comma-separated enabled-toolsets
-    # arg -- see hermes_cli/_parser.py: ``-t/--toolsets``). Without a declared
-    # envelope NO flag is added, so a worker is never accidentally locked out;
-    # the profile's full toolset still applies. A best-effort contract read can
-    # never break a spawn.
+    # ``--toolsets`` flag. The flag MUST be passed to the ``chat`` SUBCOMMAND
+    # (not the top-level parser): the chat subparser redefines ``-t/--toolsets``
+    # with default=None, so a ``--toolsets`` placed before ``chat`` is captured
+    # by the top-level parser and then SILENTLY OVERWRITTEN to None by the
+    # subparser namespace -- the worker keeps its full profile toolset. We
+    # therefore resolve the list here but inject it AFTER the ``chat`` token
+    # below. Without a declared envelope NO flag is added, so a worker is never
+    # accidentally locked out; the profile's full toolset still applies. A
+    # best-effort contract read can never break a spawn.
+    _envelope_toolsets: list[str] = []
     if _enforce_worker_toolsets_enabled():
         try:
             _spawn_contract = resolve_task_contract(task, board=board)
             _envelope = _contract_object(_spawn_contract.get("worker_envelope"))
             _envelope_toolsets = _string_list(_envelope.get("toolsets"))
-            if _envelope_toolsets:
-                cmd.extend(["--toolsets", ",".join(_envelope_toolsets)])
         except Exception:  # pragma: no cover - defensive: never break a spawn
+            _envelope_toolsets = []
             _log.warning(
                 "kanban spawn: worker-envelope toolset injection skipped for task %r",
                 task.id,
@@ -22673,6 +22783,11 @@ def _default_spawn(
         "chat",
         "-q", prompt,
     ])
+    # Inject the envelope toolset constraint AFTER ``chat`` so the chat
+    # subparser (which owns ``-t/--toolsets`` with default=None) actually
+    # receives it; placed before ``chat`` it would be parsed and then nulled.
+    if _envelope_toolsets:
+        cmd.extend(["--toolsets", ",".join(_envelope_toolsets)])
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

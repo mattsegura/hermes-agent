@@ -1132,3 +1132,133 @@ def test_terminal_outcome_is_conversion_detector_unit():
     assert f("churned", ["onboarded", "churned"]) is False
     assert f("", ["won"]) is False
     assert f(None, ["won"]) is False
+
+
+# ---------------------------------------------------------------------------
+# FIX 1 (G6 false-positive). A LOSS terminal whose label embeds a win substring
+# ('closed_lost' contains 'closed', 'disapproved' contains 'approved',
+# 'unsigned' contains 'sign', 'incomplete'/'not_completed' contain 'complete')
+# previously slipped past the loose win-substring classifier and earned the FULL
+# 1.0 conversion reward -- poisoning the optimizer toward loss-producing knobs.
+# The explicit loss-token denylist (checked BEFORE the win check) fixes this
+# WITHOUT regressing any legitimate win.
+# ---------------------------------------------------------------------------
+
+# Loss labels that embed a win substring (the historical false-positives) plus
+# plain loss labels. NONE of these may earn a conversion reward.
+_LOSS_TERMINALS = [
+    "closed_lost", "disapproved", "unsigned", "incomplete",
+    "not_completed", "churned", "rejected", "cancelled", "expired",
+    "failed", "withdrawn", "bounced", "abandoned", "declined",
+    "disqualified", "lost",
+]
+
+# Genuine win labels that MUST keep earning the conversion reward.
+_WIN_TERMINALS = [
+    "closed_won", "won", "under_contract", "onboarded", "paid",
+    "published", "signed", "converted", "completed", "delivered",
+    "sold", "accepted", "fulfilled", "succeeded",
+]
+
+
+def test_win_classifier_loss_tokens_are_not_wins():
+    # Direct unit coverage of the win classifier over the FULL loss list. Each
+    # loss label -- including the ones that embed a win substring -- must be
+    # rejected. FAILS before FIX 1 (closed_lost/disapproved/unsigned/incomplete/
+    # not_completed wrongly returned True).
+    import hermes_cli.launch_completeness as lc
+    for token in _LOSS_TERMINALS:
+        assert lc._looks_like_win(token) is False, (
+            f"loss terminal {token!r} must NOT classify as a win"
+        )
+        assert kb._looks_like_win_token(token) is False, (
+            f"loss terminal {token!r} must NOT classify as a win (kanban_db mirror)"
+        )
+
+
+def test_win_classifier_win_tokens_still_win():
+    # The fix must not regress legitimate wins: every genuine win label still
+    # classifies as a win in BOTH the spec helper and the kanban_db mirror.
+    import hermes_cli.launch_completeness as lc
+    for token in _WIN_TERMINALS:
+        assert lc._looks_like_win(token) is True, (
+            f"win terminal {token!r} must still classify as a win"
+        )
+        assert kb._looks_like_win_token(token) is True, (
+            f"win terminal {token!r} must still classify as a win (kanban_db mirror)"
+        )
+
+
+def test_declared_loss_terminal_embedding_win_substring_earns_no_conversion():
+    # Detector-level proof of the core defect: a loop declaring
+    # ['closed_won', 'closed_lost'] that resolves to 'closed_lost' must NOT be
+    # credited a conversion even though 'closed_lost' embeds the 'closed' win
+    # substring. FAILS before FIX 1 (_terminal_outcome_is_conversion returned
+    # True via the loose _looks_like_win classifier).
+    f = kb._terminal_outcome_is_conversion
+    assert f("closed_lost", ["closed_won", "closed_lost"]) is False
+    assert f("disapproved", ["approved", "disapproved"]) is False
+    assert f("unsigned", ["signed", "unsigned"]) is False
+    assert f("incomplete", ["completed", "incomplete"]) is False
+    assert f("not_completed", ["completed", "not_completed"]) is False
+    assert f("churned", ["onboarded", "churned"]) is False
+    # The declared WIN counterparts still earn the conversion.
+    assert f("closed_won", ["closed_won", "closed_lost"]) is True
+    assert f("approved", ["approved", "disapproved"]) is True
+    assert f("under_contract", ["under_contract", "lost"]) is True
+    assert f("onboarded", ["onboarded", "churned"]) is True
+    assert f("paid", ["paid", "expired"]) is True
+    assert f("published", ["published", "rejected"]) is True
+
+
+def test_runtime_declared_loss_terminal_records_zero_reward(fresh_home):
+    # End-to-end through the reactive runtime: a loop declaring
+    # terminal_states=['closed_won','closed_lost'] that actually terminates as
+    # 'closed_lost' records reward_kind='loop_closed' / reward_value=0.0, never a
+    # conversion. Before FIX 1 this poisoned the optimizer with a full 1.0
+    # conversion reward for a LOSS.
+    _approve("serious", _win_contract(terminal_states=["closed_won", "closed_lost"]))
+    with kb.connect(board="serious") as conn:
+        row = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        entity_id = row["entity_id"]
+        base = int(row["next_fire_at"])
+
+        kb.resolve_reactive_entity(
+            conn, entity_id, terminal_outcome="closed_lost",
+            state="closed_lost", actor="fixture",
+        )
+        kb.reactive_tick(conn, now=base, board="serious")
+        outcomes = _loop_terminal_outcomes(conn, "serious")
+        assert outcomes, "a terminal outcome should still be recorded"
+        assert all(o["reward_kind"] != "conversion" for o in outcomes), (
+            "a 'closed_lost' loss terminal must NOT earn a conversion reward"
+        )
+        assert any(
+            o["reward_kind"] == "loop_closed" and o["reward_value"] == 0.0
+            for o in outcomes
+        )
+
+
+def test_runtime_declared_win_terminal_in_won_lost_pair_still_converts(fresh_home):
+    # The mirror of the above: the WIN side of a closed_won/closed_lost pair must
+    # still earn the conversion (proves the fix did not over-correct).
+    _approve("serious", _win_contract(terminal_states=["closed_won", "closed_lost"]))
+    with kb.connect(board="serious") as conn:
+        row = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchone()
+        entity_id = row["entity_id"]
+        base = int(row["next_fire_at"])
+
+        kb.resolve_reactive_entity(
+            conn, entity_id, terminal_outcome="closed_won",
+            state="closed_won", actor="fixture",
+        )
+        kb.reactive_tick(conn, now=base, board="serious")
+        outcomes = _loop_terminal_outcomes(conn, "serious")
+        assert any(
+            o["reward_kind"] == "conversion" and o["reward_value"] == 1.0
+            for o in outcomes
+        ), "the win side of a won/lost pair must still earn the conversion reward"

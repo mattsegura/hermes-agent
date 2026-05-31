@@ -392,6 +392,85 @@ def test_typed_success_malformed_dict_does_not_raise_and_is_kept():
 
 
 # --------------------------------------------------------------------------- #
+# FIX 6: typed-success non-scalar target laundering + comparator validation.
+# A dict/list target must NOT be repr-stringified into a scoreable-looking
+# string; nan/inf targets are dropped; an out-of-set comparator is not scoreable.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "bad_target",
+    [{"nested": 1}, [1, 2, 3], (1, 2)],
+)
+def test_typed_success_nonscalar_target_is_not_scoreable(bad_target):
+    """A non-scalar target survives normalization WITH its non-scalar type (no
+    repr-laundering) so the spec rejects it. FAILS before FIX 6 (str()-coercion
+    turned it into a non-empty string that looked scoreable)."""
+    from hermes_cli.kanban_db import normalize_objective_metadata
+    from hermes_cli.launch_completeness import _is_scoreable
+
+    out = normalize_objective_metadata(
+        {"statement": "x", "success": [_typed_success_entry(target=bad_target)]}
+    )
+    entry = out["success"][0]
+    # Normalizer must NOT have laundered it into a string.
+    assert not isinstance(entry.get("target"), str), entry
+    assert _is_scoreable(entry) is False
+
+    c = _base()
+    c["objective"]["success"] = [_typed_success_entry(target=bad_target)]
+    assert _has(assess(c)["warnings"], "success_scoreability"), assess(c)["warnings"]
+    assert not assess(copy.deepcopy(c), enforce=True)["ok"]
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_typed_success_nonfinite_target_is_not_scoreable(bad):
+    """A non-finite numeric target (nan/inf) is dropped by the normalizer so the
+    entry reads as missing its target -> not scoreable."""
+    from hermes_cli.kanban_db import normalize_objective_metadata
+    from hermes_cli.launch_completeness import _is_scoreable
+
+    out = normalize_objective_metadata(
+        {"statement": "x", "success": [_typed_success_entry(target=bad)]}
+    )
+    entry = out["success"][0]
+    assert "target" not in entry, entry  # dropped
+    assert _is_scoreable(entry) is False
+
+
+@pytest.mark.parametrize("bad_comparator", ["roughly", "approx", "~=", "", "is"])
+def test_typed_success_out_of_set_comparator_is_not_scoreable(bad_comparator):
+    """A comparator the scoreboard cannot evaluate makes the typed entry NOT
+    scoreable (the comparator key is treated as missing/invalid)."""
+    from hermes_cli.launch_completeness import _is_scoreable
+
+    entry = _typed_success_entry(comparator=bad_comparator)
+    assert _is_scoreable(entry) is False
+
+    c = _base()
+    c["objective"]["success"] = [entry]
+    assert _has(assess(c)["warnings"], "success_scoreability"), assess(c)["warnings"]
+
+
+def test_typed_success_valid_comparators_stay_scoreable():
+    """Every symbolic comparator and the prose aliases keep a typed entry scoreable
+    (the fix must not over-reject)."""
+    from hermes_cli.launch_completeness import _is_scoreable
+
+    for cmp in (">=", "<=", ">", "<", "==", "!=", "at_least", "at_most"):
+        assert _is_scoreable(_typed_success_entry(comparator=cmp)) is True, cmp
+
+
+def test_typed_success_comparator_set_is_validated_against_kanban_db():
+    """The spec's comparator set mirrors kanban_db._TYPED_SUCCESS_COMPARATORS
+    (FIX 6 also addresses the 'defined but never validated' gap)."""
+    import hermes_cli.kanban_db as kb
+    import hermes_cli.launch_completeness as lc
+
+    assert lc._TYPED_SUCCESS_COMPARATORS == kb._TYPED_SUCCESS_COMPARATORS
+
+
+# --------------------------------------------------------------------------- #
 # G4 PART 2: side_effect_class default-DENY (missing blocks; 'none' is valid)
 # --------------------------------------------------------------------------- #
 

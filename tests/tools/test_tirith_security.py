@@ -1506,11 +1506,89 @@ class TestAutonomousFailClosedPosture:
         cfg = _tirith_mod._load_security_config()
         assert cfg["tirith_fail_open"] is True
 
-    def test_config_layer_wins_over_autonomous_default(self, monkeypatch):
-        # An EXPLICIT on-disk security.tirith_fail_open: true (read from the RAW
-        # config) beats the autonomous default. This is the operator-override
-        # path: the user genuinely chose fail-open in config.yaml.
+    def test_config_layer_override_that_differs_from_default_wins(self, monkeypatch):
+        # An EXPLICIT on-disk security.tirith_fail_open that DIFFERS from the
+        # schema default is a genuine operator choice and beats the session-kind
+        # default. Here an INTERACTIVE operator persisted fail-CLOSED (False,
+        # != default True): it must override the interactive fail-open default.
+        try:
+            import hermes_cli.config as _cfgmod
+            monkeypatch.setattr(_cfgmod, "load_config", lambda *a, **k: {})
+            monkeypatch.setattr(
+                _cfgmod, "read_raw_config",
+                lambda *a, **k: {"security": {"tirith_fail_open": False}},
+            )
+        except Exception:
+            pytest.skip("hermes_cli.config not importable")
+        cfg = _tirith_mod._load_security_config()
+        # Differs from the default -> honoured as an operator override.
+        assert cfg["tirith_fail_open"] is False
+
+    # --- FIX 3 (H3): a persisted SCHEMA-DEFAULT value is NOT an operator choice ---
+
+    def test_persisted_schema_default_does_not_shadow_autonomous_failclosed(self, monkeypatch):
+        # The keystone H3 regression: config.yaml persists a verbatim dump of
+        # DEFAULT_CONFIG, so security.tirith_fail_open: true is on disk on every
+        # install WITHOUT being an operator choice. With HERMES_CRON_SESSION set
+        # and no TIRITH_FAIL_OPEN env, the resolved posture MUST be fail-CLOSED.
+        # FAILS before the fix (the raw 'true' shadowed the autonomous default).
+        assert _tirith_mod._schema_default_fail_open() is True  # precondition
+        try:
+            import hermes_cli.config as _cfgmod
+            monkeypatch.setattr(_cfgmod, "load_config", lambda *a, **k: {})
+            # Persisted value MIRRORS the schema default (True) -> not a choice.
+            monkeypatch.setattr(
+                _cfgmod, "read_raw_config",
+                lambda *a, **k: {"security": {"tirith_fail_open": True}},
+            )
+        except Exception:
+            pytest.skip("hermes_cli.config not importable")
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        cfg = _tirith_mod._load_security_config()
+        assert cfg["tirith_fail_open"] is False, (
+            "a persisted schema-default true must NOT shadow the autonomous "
+            "fail-closed posture"
+        )
+
+    def test_user_set_fail_open_treats_schema_default_as_unset(self, monkeypatch):
+        # Direct unit coverage of the resolver: a raw value equal to the schema
+        # default returns None (not a choice); a differing value returns it.
+        try:
+            import hermes_cli.config as _cfgmod
+        except Exception:
+            pytest.skip("hermes_cli.config not importable")
+        monkeypatch.setattr(
+            _cfgmod, "read_raw_config",
+            lambda *a, **k: {"security": {"tirith_fail_open": True}},
+        )
+        assert _tirith_mod._user_set_fail_open() is None
+        monkeypatch.setattr(
+            _cfgmod, "read_raw_config",
+            lambda *a, **k: {"security": {"tirith_fail_open": False}},
+        )
+        assert _tirith_mod._user_set_fail_open() is False
+
+    def test_env_override_beats_persisted_schema_default_in_autonomous(self, monkeypatch):
+        # Even with the persisted schema-default on disk, an EXPLICIT env still
+        # wins (the operator opts the autonomous run back into fail-open).
+        try:
+            import hermes_cli.config as _cfgmod
+            monkeypatch.setattr(_cfgmod, "load_config", lambda *a, **k: {})
+            monkeypatch.setattr(
+                _cfgmod, "read_raw_config",
+                lambda *a, **k: {"security": {"tirith_fail_open": True}},
+            )
+        except Exception:
+            pytest.skip("hermes_cli.config not importable")
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setenv("TIRITH_FAIL_OPEN", "true")
+        cfg = _tirith_mod._load_security_config()
+        assert cfg["tirith_fail_open"] is True
+
+    def test_persisted_schema_default_interactive_stays_fail_open(self, monkeypatch):
+        # Interactive (no cron marker): the persisted schema-default true defers
+        # to the interactive session-kind default, which is ALSO fail-open --
+        # so interactive behaviour is unchanged.
         try:
             import hermes_cli.config as _cfgmod
             monkeypatch.setattr(_cfgmod, "load_config", lambda *a, **k: {})
