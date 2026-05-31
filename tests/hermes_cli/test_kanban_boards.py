@@ -580,7 +580,7 @@ class TestBoardCRUD:
             intake_answers="I want 10 qualified recruiting conversations per month.",
         )
 
-        with pytest.raises(ValueError, match="intake_answers already submitted"):
+        with pytest.raises(ValueError, match="intake_answers duplicate a prior submission"):
             kb.review_business_launch_contract(
                 "duplicate-answer-intake",
                 intake_answers="I want 10 qualified recruiting conversations per month.",
@@ -611,7 +611,7 @@ class TestBoardCRUD:
             "raw": "I just want more partners, do whatever."
         }
 
-        with pytest.raises(ValueError, match="intake_answers already submitted"):
+        with pytest.raises(ValueError, match="intake_answers duplicate a prior submission"):
             kb.review_business_launch_contract(
                 "duplicate-generic-answer-intake",
                 intake_answers={"answers": "I just want more partners, do whatever."},
@@ -2188,7 +2188,7 @@ class TestCLI:
             env_extra=env,
         )
         assert duplicate.returncode == 2
-        assert "intake_answers already submitted" in duplicate.stderr
+        assert "intake_answers duplicate a prior submission" in duplicate.stderr
 
         clear_answers = {
             "success_criteria": "Create 20 qualified referral partner opportunities and book 5 qualified conversations per month.",

@@ -97,10 +97,10 @@ def _ready_contract():
                             "required_capabilities": ["skip_trace"],
                             "required_toolsets": ["kanban"],
                             "required_proof": ["skip_trace_record"],
-                            "side_effect_class": "read_only",
+                            "side_effect_class": "none",
                         }
                     ],
-                    "triggers": [{"type": "timer", "key": "tick"}],
+                    "triggers": [{"type": "timer", "key": "tick", "cadence_hours": 24}],
                     "exit_criteria": [{"transition": "done", "evidence_required": ["skip_trace_record"]}],
                 },
                 {"key": "done", "actions": [{"key": "archive"}], "exit_criteria": []},

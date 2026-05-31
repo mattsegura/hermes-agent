@@ -454,7 +454,7 @@ def test_malformed_board_metadata_fails_closed(fresh_home):
 def test_explicit_board_cannot_spoof_connected_serious_board(fresh_home):
     tid = _create_contract_board(_contract(worker_capabilities=[]))
     with kb.connect(board="serious") as conn:
-        with pytest.raises(ValueError, match="does not match connected board"):
+        with pytest.raises(ValueError, match=r"does not match (pinned )?connected board"):
             kb.claim_task(conn, tid, board="default")
         task = kb.get_task(conn, tid)
         assert task is not None
@@ -464,7 +464,7 @@ def test_explicit_board_cannot_spoof_connected_serious_board(fresh_home):
     tid = _create_contract_board(_contract())
     with kb.connect(board="serious") as conn:
         assert kb.claim_task(conn, tid) is not None
-        with pytest.raises(ValueError, match="does not match connected board"):
+        with pytest.raises(ValueError, match=r"does not match (pinned )?connected board"):
             kb.complete_task(conn, tid, summary="spoofed board", metadata={}, board="default")
         task = kb.get_task(conn, tid)
         assert task is not None
