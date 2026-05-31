@@ -698,192 +698,43 @@ def _canonical_json_hash(value: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-#: Keys under ``launch_intake`` that are DERIVED telemetry, not authorial intent,
-#: and so must NOT bind the canonical business-contract hash. Both are reports
-#: recomputable from the contract itself:
-#:
-#:   * ``completeness`` -- an ``assess_launch_completeness`` report
-#:     (``enforced_dimensions`` / ``blocking`` / per-dimension findings) attached
-#:     by the degraded universal-drafter fallback (FIX 5).
-#:   * ``invariants``   -- a ``check_contract_invariants`` report
-#:     (errors/warnings/checked). It is fully recomputable from the contract via
-#:     ``check_contract_invariants`` and changes whenever ANY check finds (or
-#:     stops finding) something -- a step-9 opt-in, an overloaded key, a new
-#:     pre-existing finding, etc. Binding it to the hash made the canonical hash
-#:     a function of the CHECKER, not the contract: every new finding flipped the
-#:     default-off hash (the round-4 recurring leak). Stripping it makes the hash
-#:     invariant to ALL check findings by construction.
-_CONTRACT_HASH_TELEMETRY_INTAKE_KEYS: tuple[str, ...] = ("completeness", "invariants")
-
-
 def _strip_contract_hash_telemetry(normalized: Any) -> Any:
     """Return a copy of a normalized contract with non-semantic TELEMETRY
     stripped, so the contract hash is stable regardless of report-mode soak data.
 
-    STEP-9 ROUND-4 ROOT FIX: both ``launch_intake.completeness`` (FIX 5) AND
-    ``launch_intake.invariants`` are DERIVED reports -- recomputable from the
-    contract (the latter via ``check_contract_invariants``), NOT authorial
-    intent. ``normalize_board_operating_contract`` preserves them verbatim, so a
-    contract carrying either block would hash DIFFERENTLY whenever a check finding
-    appeared or disappeared -- the recurring default-off hash-flip. By stripping
-    BOTH here the canonical hash is invariant to ANY check finding (a step-9
-    opt-in, an overloaded key like ``class``/``kind``/``max_defers``/
-    ``terminal_classes``, OR a pre-existing finding): a new finding can never
-    change the hash, so the default-off hash-flip is structurally gone.
+    FIX 5: the degraded universal-drafter fallback persists
+    ``launch_intake.completeness`` (an ``assess_launch_completeness`` report
+    carrying ``enforced_dimensions`` / ``blocking`` / new dimension findings).
+    That block is pure telemetry -- it does NOT change what the contract means --
+    but ``normalize_board_operating_contract`` preserves it verbatim, so a
+    degraded-path contract would hash DIFFERENTLY head-vs-base even with all
+    enforcement flags off, which can invalidate approval tokens or bump the
+    contract_version on a no-op upgrade. We drop it here so the hash ignores it.
 
-    An ``launch_intake`` that becomes EMPTY once its telemetry is removed is
-    dropped entirely (it carried nothing but telemetry), so a contract whose only
-    ``launch_intake`` content was an invariants/completeness report hashes
-    IDENTICALLY to one with no ``launch_intake`` at all.
-
-    RE-STAMP: because this changes the hash SCHEME for any contract that carried
-    an invariants block, ``_restamp_launch_approval_contract_hash`` re-binds any
-    pre-existing approval token / review / launch_approval to the new (stripped)
-    hash at load time, so an already-approved board STAYS approved (the contract
-    semantics are unchanged; only derived telemetry left the hash). On every live
-    board this is a no-op (no board carries an approval token / launch_approval /
-    launch_review_id; verified), so no live approval state is touched.
+    STEP-9 NOTE: ``launch_intake.invariants`` is DELIBERATELY left in the hash
+    (base-verbatim). The step-9 invariant checks are opt-in-gated, so a NON-OPTED
+    contract produces NO new invariant findings -- its ``launch_intake.invariants``
+    block is byte-identical to base, hence its hash is byte-identical to base
+    WITHOUT any extra stripping. Stripping invariants would have been a no-op for
+    the non-opted path but caused the un-approval/hash-flip regression for any
+    invariants-carrying contract; opt-in-gating already prevents new findings from
+    leaking into the default-off hash, so the strip is unnecessary and removed.
     """
     if not isinstance(normalized, dict):
         return normalized
     intake = normalized.get("launch_intake")
-    if not isinstance(intake, dict):
-        return normalized
-    if not any(k in intake for k in _CONTRACT_HASH_TELEMETRY_INTAKE_KEYS):
+    if not isinstance(intake, dict) or "completeness" not in intake:
         return normalized
     clone = dict(normalized)
     intake_clone = dict(intake)
-    for key in _CONTRACT_HASH_TELEMETRY_INTAKE_KEYS:
-        intake_clone.pop(key, None)
-    if intake_clone:
-        clone["launch_intake"] = intake_clone
-    else:
-        # The intake block held nothing but derived telemetry -- drop it so the
-        # hash matches a contract that never carried a launch_intake at all.
-        clone.pop("launch_intake", None)
+    intake_clone.pop("completeness", None)
+    clone["launch_intake"] = intake_clone
     return clone
 
 
 def _business_contract_hash(contract: Any) -> str:
     normalized = normalize_board_operating_contract(contract)
     return _canonical_json_hash(_strip_contract_hash_telemetry(normalized))
-
-
-def _legacy_completeness_only_contract_hash(contract: Any) -> str:
-    """The PRE-round-4 hash scheme: strip ONLY ``launch_intake.completeness``.
-
-    Used solely by the one-time re-stamp migration to RECOGNIZE an approval
-    binding that was created under the old scheme (where ``launch_intake.invariants``
-    still bound the hash). A binding whose stored hash equals THIS but not the new
-    ``_business_contract_hash`` is a re-stamp candidate. A contract that never
-    carried an invariants block hashes identically under both schemes, so it is
-    never a candidate (and the migration is a no-op for it).
-    """
-    normalized = normalize_board_operating_contract(contract)
-    if isinstance(normalized, dict):
-        intake = normalized.get("launch_intake")
-        if isinstance(intake, dict) and "completeness" in intake:
-            normalized = dict(normalized)
-            intake_clone = dict(intake)
-            intake_clone.pop("completeness", None)
-            normalized["launch_intake"] = intake_clone
-    return _canonical_json_hash(normalized)
-
-
-#: Per-thread re-entrancy guard for the FIX A re-stamp persist path. The persist
-#: (``write_board_metadata``) itself reads the board, which re-enters
-#: ``read_board_metadata``; this flag makes the nested read re-stamp in memory but
-#: NOT recurse into another persist (which would loop until the write lands).
-_RESTAMP_GUARD = threading.local()
-
-
-def _restamp_launch_approval_contract_hash(meta: dict) -> bool:
-    """One-time, idempotent re-stamp of an approval binding to the NEW hash scheme.
-
-    Round-4 FIX A changed the canonical business-contract hash scheme to ALSO
-    strip ``launch_intake.invariants`` (derived telemetry). A board approved under
-    the OLD scheme stores a ``launch_approval.contract_hash`` (and matching
-    ``board_launch_reviews`` / ``board_launch_approval_tokens`` rows) bound to the
-    old hash, so ``_board_has_approved_launch_review`` -- which recomputes the hash
-    under the NEW scheme -- would see a mismatch and silently UN-approve the board
-    even though the contract semantics are unchanged.
-
-    This re-binds such an approval to the new hash:
-
-      * recompute the current contract hash under the new scheme;
-      * if the stored binding already equals it -> no-op (idempotent, and the
-        common case once migrated);
-      * else, ONLY when the stored binding equals the OLD (completeness-only)
-        scheme hash for the SAME contract -> re-stamp board.json's
-        ``launch_approval.contract_hash`` + the DB review/token rows to the new
-        hash. (A binding that matches NEITHER is a genuinely-different contract --
-        left untouched so a real divergence still fails closed.)
-
-    Returns True iff the in-memory ``meta`` was mutated (so the caller can persist
-    board.json). LIVE NO-OP: a board with no ``launch_approval`` returns False
-    immediately -- verified that no live board carries one, so this never touches
-    live approval state.
-    """
-    approval = meta.get("launch_approval")
-    if not isinstance(approval, dict):
-        return False
-    stored_hash = str(approval.get("contract_hash") or "").strip()
-    if not stored_hash:
-        return False
-    slug = str(meta.get("slug") or "").strip()
-    if not slug:
-        return False
-    try:
-        contract = _metadata_as_business_contract(meta)
-        new_hash = _business_contract_hash(contract)
-    except (TypeError, ValueError):
-        return False
-    if stored_hash == new_hash:
-        return False  # already on the new scheme (idempotent) -- nothing to do.
-    try:
-        old_hash = _legacy_completeness_only_contract_hash(contract)
-    except (TypeError, ValueError):
-        return False
-    if stored_hash != old_hash:
-        # The binding matches neither scheme for this contract -> a genuinely
-        # different contract. Leave it so a real divergence still fails closed.
-        return False
-    # Re-stamp the persisted DB rows (review + token) bound to the old hash.
-    try:
-        conn = sqlite3.connect(
-            str(kanban_db_path(board=slug)),
-            isolation_level=None,
-            timeout=30,
-        )
-        conn.row_factory = sqlite3.Row
-        with contextlib.closing(conn):
-            with write_txn(conn):
-                conn.execute(
-                    "UPDATE board_launch_reviews SET contract_hash = ? "
-                    "WHERE board = ? AND contract_hash = ?",
-                    (new_hash, slug, old_hash),
-                )
-                conn.execute(
-                    "UPDATE board_launch_approval_tokens SET contract_hash = ? "
-                    "WHERE board = ? AND contract_hash = ?",
-                    (new_hash, slug, old_hash),
-                )
-    except Exception:  # pragma: no cover - DB best-effort; in-memory re-stamp still applies
-        pass
-    # Re-stamp the in-memory metadata bindings so the live read is consistent.
-    approval_clone = dict(approval)
-    approval_clone["contract_hash"] = new_hash
-    meta["launch_approval"] = approval_clone
-    tokens = meta.get("launch_approval_tokens")
-    if isinstance(tokens, list):
-        restamped_tokens = []
-        for tok in tokens:
-            if isinstance(tok, dict) and str(tok.get("contract_hash") or "").strip() == old_hash:
-                tok = dict(tok)
-                tok["contract_hash"] = new_hash
-            restamped_tokens.append(tok)
-        meta["launch_approval_tokens"] = restamped_tokens
-    return True
 
 
 def _approval_token_hash(token: str) -> str:
@@ -5195,34 +5046,6 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
                 if raw.get("context") is not None:
                     raw["context"] = _normalize_board_context(raw.get("context"))
                 meta.update(raw)
-                # ROUND-4 FIX A re-stamp: re-bind an approval created under the
-                # OLD (completeness-only) hash scheme to the NEW (also strips
-                # launch_intake.invariants) scheme, so the contract semantics are
-                # unchanged and the board STAYS approved. The in-memory re-stamp
-                # runs on EVERY read (cheap + idempotent) so the returned meta is
-                # always consistent. Persisting board.json is a one-shot
-                # optimization done OUTSIDE this read (the persist path calls
-                # read_board_metadata again, so a re-entrancy guard prevents the
-                # nested read from recursing into another persist). NO-OP on every
-                # board with no launch_approval (verified: no live board has one).
-                try:
-                    if (
-                        _restamp_launch_approval_contract_hash(meta)
-                        and not getattr(_RESTAMP_GUARD, "active", False)
-                    ):
-                        _RESTAMP_GUARD.active = True
-                        try:
-                            write_board_metadata(
-                                slug,
-                                launch_approval=meta.get("launch_approval"),
-                                launch_approval_tokens=meta.get("launch_approval_tokens"),
-                            )
-                        except Exception:  # pragma: no cover - persist best-effort
-                            pass
-                        finally:
-                            _RESTAMP_GUARD.active = False
-                except Exception:  # pragma: no cover - migration never blocks read
-                    pass
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         meta["metadata_error"] = f"invalid board metadata: {exc}"
     meta["db_path"] = str(kanban_db_path(slug))
@@ -12238,15 +12061,35 @@ def _side_effect_and_approval_blockers(
     to base for every board that did not opt in.
     """
     blockers: list[dict[str, Any]] = []
+    policy = _contract_object(contract.get("side_effect_policy"))
+    strict_side_effects = _side_effect_strict_enabled(policy)
     sec = str(side_effect_class).strip() if side_effect_class else ""
+    # ROUND-6 FIX 3 (dispatch-gate '' sentinel asymmetry): mirror the reactive
+    # gate's sentinel logic so BOTH strict gates agree. The reactive path persists
+    # a DECLARED side_effect_class that normalizes away to empty (but is NOT the
+    # explicit benign 'none') as the dropped MARKER, so the strict gate reads it
+    # back as UNRECOGNIZED -> defers (fail-CLOSED). The dispatch gate's early
+    # ``if not sec: return blockers`` fired BEFORE consulting strict, so a worker
+    # carrying an AUTHORED-but-falsy sentinel ('' / 'null' / '-' / whitespace)
+    # dispatched UNGATED under strict -- the exact asymmetry the reactive gate
+    # already closes. Under strict, route the resolved class through the SAME
+    # sentinel-aware normalizer (``_canonical_side_effect_class_for_persist``):
+    #   * a genuinely-absent class (None) -> None -> empty sec -> base early return;
+    #   * an explicit benign 'none' -> None -> empty sec -> base early return;
+    #   * a DECLARED non-empty sentinel that normalizes away -> the dropped MARKER,
+    #     which is outside the closed vocabulary -> strict_unrecognized -> defer.
+    # NON-STRICT: ``side_effect_class`` is untouched and the early return is the
+    # BASE expression verbatim, so a non-opted board is byte-identical to base.
+    if strict_side_effects and side_effect_class is not None and not sec:
+        sentinel = _canonical_side_effect_class_for_persist(side_effect_class)
+        if sentinel == _SIDE_EFFECT_CLASS_DROPPED_DB_MARKER:
+            sec = sentinel
     if not sec:
         return blockers
-    policy = _contract_object(contract.get("side_effect_policy"))
     # ROUND-5 FIX 6: strict opt-in is DEFAULT-OFF. Non-strict boards keep the BASE
     # case-sensitive sets verbatim (byte-identical). Under strict, mirror
     # reactive_tick: fold the policy sets AND the resolved class to one canonical
     # (lower-case) vocabulary so a mixed-case row/declaration matches.
-    strict_side_effects = _side_effect_strict_enabled(policy)
     if strict_side_effects:
         sec = sec.strip().lower()
         forbidden = {s.strip().lower() for s in _string_list(policy.get("forbidden"))}

@@ -308,30 +308,42 @@ def cadence_seconds(trigger: dict) -> Optional[int]:
 
 
 def _coerce_int(value: Any) -> Optional[int]:
-    # ROUND-5 FIX 1 (byte-identity by construction): this helper is on the
-    # LEGACY (non-opted) code path, so its acceptance set must be BYTE-FOR-BYTE
-    # base 019271994. The base implementation was:
+    # ROUND-5/6 FIX 2 (byte-identity by construction): this helper is on the
+    # SHARED, NON-OPTED code path -- ``loop_max_nudges`` uses it, and max_nudges
+    # is NOT opt-in-gated. Its behavior must therefore be BYTE-FOR-BYTE base
+    # 019271994, including the base CRASH characteristic:
     #
-    #     if isinstance(value, bool): return None
-    #     if isinstance(value, (int, float)): return int(value)
-    #     if isinstance(value, str) and value.strip().lstrip("-").isdigit():
-    #         return int(value.strip())
-    #     return None
+    #   * a ``.isdigit()``-True char that ``int()`` rejects ('³' SUPERSCRIPT
+    #     THREE, '①' CIRCLED ONE) RAISES ValueError;
+    #   * a non-finite float (float('inf')/float('nan')) RAISES on ``int()``.
     #
-    # The round-4 rewrite swapped the ``.isdigit()`` gate for a bare
-    # ``int(value.strip())``, which silently WIDENED the acceptance set ('+5',
-    # '1_000', '-0' that base REJECTED now parse), flipping the launch-gate
-    # report.ok / compiled max_nudges for DEFAULT-OFF contracts. We restore the
-    # EXACT base ``.isdigit()`` gate so every input keeps its base decision
-    # ('+5'/'1_000' -> None, '-0' -> 0, '٣' -> 3, '-1' -> -1, 2.7 -> 2).
-    #
-    # The ONLY legitimate concern the prior rounds addressed was a CRASH, not an
-    # acceptance question: a ``.isdigit()``-True char that ``int()`` rejects
-    # ('³' SUPERSCRIPT THREE, '①' CIRCLED ONE) raised ValueError and aborted the
-    # per-loop compile; a non-finite float ('.inf'/'.nan') raised on ``int()``
-    # too. We wrap ONLY the parse calls so those rare crashes become None (no
-    # acceptance-set change for any finite/parseable input -- proven byte-for-byte
-    # against base for the full fuzz vector).
+    # That raise is the BASE default-off behavior: the per-loop compile
+    # try/except (_compile_one_reactive_loop) catches it and DROPS the loop while
+    # recording an error -> schedule row count 0. Swallowing the crash here would
+    # CHANGE that default-off decision (the round-4/5 regression). The crash-safe
+    # parser lives in ``_coerce_int_safe`` and is used EXCLUSIVELY by the opt-in
+    # ``loop_max_defers`` bound, never on this shared path.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return None
+
+
+def _coerce_int_safe(value: Any) -> Optional[int]:
+    """Crash-safe integer coercion for the OPT-IN ``max_defers`` bound ONLY.
+
+    Identical acceptance set to :func:`_coerce_int`, but wraps the ``int()``
+    parse so the rare ``.isdigit()``-True-but-unparseable inputs ('³', '①') and
+    non-finite floats (inf/nan) become ``None`` instead of raising. This is used
+    EXCLUSIVELY by :func:`loop_max_defers`, which the contract opts into
+    explicitly (``loop_opts_into_defer_bound``); the shared, non-opted
+    ``loop_max_nudges`` path keeps the base-verbatim crashing ``_coerce_int`` so
+    a NON-OPTED loop's compile decision is byte-identical to base by
+    construction.
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -461,7 +473,11 @@ def loop_max_defers(loop: dict) -> Optional[int]:
     """
     if isinstance(loop, dict):
         for key in ("max_defers", "max_deferrals", "max_defer"):
-            n = _coerce_int(loop.get(key))
+            # OPT-IN path: use the crash-safe parser so a malformed declared
+            # bound ('³'/'①'/inf/nan) clamps to None (unbounded -> graceful)
+            # instead of crashing the compile. The shared non-opted max_nudges
+            # path keeps the base-verbatim crashing ``_coerce_int``.
+            n = _coerce_int_safe(loop.get(key))
             if n is not None and n >= 0:
                 return n
     return None

@@ -245,22 +245,39 @@ def _spec_numeric_range(spec: dict[str, Any]) -> Optional[tuple[Optional[float],
 
 
 def _coerce_nonneg_int(value: Any) -> Optional[int]:
-    # ROUND-5 FIX 1 (byte-identity by construction): the LEGACY (non-opted) intake
-    # path traverses this helper, so its acceptance set must be BYTE-FOR-BYTE base
-    # 019271994. The base implementation gated strings with ``.isdigit()``:
-    #
-    #     if isinstance(value, str) and value.strip().isdigit():
-    #         return int(value.strip())
-    #
-    # The round-4 rewrite swapped that for a bare ``int(value.strip())`` (then a
-    # >=0 reject), which WIDENED the acceptance set for the launch gate: a string
-    # base rejected via ``.isdigit()`` could now parse and flip a DEFAULT-OFF
-    # contract's invariants errors/warnings (and via the persisted invariants
-    # block, the contract hash). We restore the EXACT base ``.isdigit()`` gate so
-    # every input keeps its base decision. The ONLY change is wrapping the rare
-    # ``.isdigit()``-True/``int()``-raises char ('³','①') so it returns None
-    # instead of crashing the per-loop intake check -- proven byte-for-byte
-    # against base for the full fuzz vector (no acceptance-set change otherwise).
+    # ROUND-6 FIX 2 (byte-identity by construction): this helper is on the SHARED,
+    # NON-OPTED intake path -- ``_loop_has_finite_max_nudges`` (the F10 "machine-
+    # checkable stop" rail in ``_check_event_loops``) calls it for EVERY loop, and
+    # the max_nudges checks are NOT opt-in-gated. Its behavior must therefore be
+    # BYTE-FOR-BYTE base 019271994, including the base CRASH characteristic: a
+    # ``.isdigit()``-True char that ``int()`` rejects ('³','①') RAISES. Swallowing
+    # the crash here would change a DEFAULT-OFF contract's invariants decision (the
+    # round-4/5 regression). The crash-safe variant lives in
+    # ``_coerce_nonneg_int_safe`` and is used EXCLUSIVELY by the opt-in
+    # ``_check_loop_bound_values`` bound, never on this shared path.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and value.is_integer():
+        return int(value) if value >= 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _coerce_nonneg_int_safe(value: Any) -> Optional[int]:
+    """Crash-safe non-negative coercion for the OPT-IN bound-value check ONLY.
+
+    Identical acceptance set to :func:`_coerce_nonneg_int`, but wraps the ``int()``
+    parse so the rare ``.isdigit()``-True-but-unparseable chars ('³','①') become
+    ``None`` instead of raising. Used EXCLUSIVELY by
+    :func:`_check_loop_bound_values`, which runs ONLY for a loop that opted into
+    step-9 (``loop_opts_into_step9``); the shared, non-opted
+    ``_loop_has_finite_max_nudges`` path keeps the base-verbatim crashing
+    ``_coerce_nonneg_int`` so a NON-OPTED contract's invariants report is
+    byte-identical to base by construction.
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -649,7 +666,13 @@ def _check_loop_bound_values(
     # STEP-9 (LOW, round-3): import the RUNTIME coercion so intake and runtime
     # agree on the '-0' edge (the runtime accepts it as 0). Runtime is a leaf that
     # imports only the grammar, so this cannot create a circular import.
-    from hermes_cli.kanban_reactive_runtime import _coerce_int as _runtime_coerce_int
+    #
+    # ROUND-6 FIX 2: this check is OPT-IN-only (gated by loop_opts_into_step9 in
+    # _check_event_loops), so it must use the CRASH-SAFE runtime parser
+    # ``_coerce_int_safe`` -- the shared base-verbatim ``_coerce_int`` RAISES on
+    # '³'/'①'/inf and would abort this opt-in check. The safe variant has an
+    # IDENTICAL acceptance set, so the '-0' agreement is preserved.
+    from hermes_cli.kanban_reactive_runtime import _coerce_int_safe as _runtime_coerce_int
 
     def _flag_if_bad(keys: frozenset[str], label: str) -> None:
         for key in keys:
@@ -687,15 +710,17 @@ def _check_loop_bound_values(
             elif isinstance(val, (int, float)):
                 bad = val < 0
             elif isinstance(val, str):
-                # ROUND-5 FIX 1: a string bound is usable only if it coerces to a
-                # non-negative int via the BASE-EXACT ``_coerce_nonneg_int`` (the
-                # ``.isdigit()`` gate, int()-guarded, >=0). A str that does NOT so
-                # coerce is bad. This flags '³'/'①' (the .isdigit()-True/int()-raises
-                # crash class -- now caught to None, not a crash) and the negative
+                # ROUND-6 FIX 2: a string bound is usable only if it coerces to a
+                # non-negative int via the CRASH-SAFE ``_coerce_nonneg_int_safe``
+                # (the ``.isdigit()`` gate, int()-guarded, >=0). This is the OPT-IN
+                # path, so the safe variant is required: the shared base-verbatim
+                # ``_coerce_nonneg_int`` RAISES on '³'/'①'. A str that does NOT
+                # coerce is bad -- this flags '³'/'①' (the .isdigit()-True/int()-
+                # raises crash class -> None here, not a crash) and the negative
                 # '-1'/'-5' strings, agreeing with the integer-(-1) flag above. A
                 # non-ASCII but int()-PARSEABLE digit ('٣' Arabic-Indic 3) coerces to
                 # 3 exactly like base, so it is a USABLE bound and is NOT flagged.
-                bad = _coerce_nonneg_int(val) is None
+                bad = _coerce_nonneg_int_safe(val) is None
                 # STEP-9 (LOW, round-3): the '-0' family. The runtime's _coerce_int
                 # ACCEPTS '-0' (it lstrips '-' before isdigit, then int('-0')==0),
                 # so the runtime treats it as a VALID cap of 0 -- it is NOT "silently

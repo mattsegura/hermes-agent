@@ -683,6 +683,13 @@ def test_live_ninaxfinds_contract_has_no_optin_declarations():
     assert head_report.warnings == base_report.warnings, "live invariant WARNINGS diverged"
     # Hash is stable (re-synthesizing the same contract yields the same hash).
     assert kb._business_contract_hash(bc) == kb._business_contract_hash(json.loads(json.dumps(bc)))
+    # ROUND-6: the live contract hash is byte-identical base-vs-HEAD (the strip is
+    # base-verbatim and the contract carries no telemetry that the schemes treat
+    # differently).
+    base_kb = _load_base_module("base_kb_live", "hermes_cli/kanban_db.py")
+    assert kb._business_contract_hash(bc) == base_kb._business_contract_hash(bc), (
+        "live ninaxfinds contract hash diverged from base 019271994"
+    )
 
 
 # ===========================================================================
@@ -885,25 +892,68 @@ def test_fix5_null_terminal_classes_is_still_legacy(fresh_home):
 
 
 @pytest.mark.parametrize("bad", [float("inf"), float("nan")])
-def test_fix6_coerce_int_guards_non_finite(bad):
-    """``_coerce_int`` returns None for a non-finite float instead of raising
-    (which crashed the per-loop compile and silently dropped the schedule)."""
-    assert rt._coerce_int(bad) is None
+def test_round6_shared_coerce_int_raises_on_non_finite_base_verbatim(bad):
+    """ROUND-6 FIX 2: the SHARED ``_coerce_int`` (used by the NON-OPTED
+    ``loop_max_nudges`` path) RAISES on a non-finite float, byte-identical to base
+    019271994. The base per-loop compile try/except catches the raise and DROPS the
+    loop -- that IS the base default-off behavior. The crash-safe variant lives in
+    ``_coerce_int_safe`` and is used EXCLUSIVELY by the opt-in ``loop_max_defers``.
+
+    Mutation check: if the shared helper swallowed the crash (the round-4/5
+    regression) it would CHANGE the non-opted compile decision -> this raise check
+    fails."""
+    import pytest as _pt
+    with _pt.raises((ValueError, OverflowError)):
+        rt._coerce_int(bad)
+    # loop_max_nudges is on the shared non-opted path -> the raise propagates.
+    with _pt.raises((ValueError, OverflowError)):
+        rt.loop_max_nudges({"max_nudges": bad})
+    # The OPT-IN max_defers path uses the crash-safe parser -> clamps to None.
     assert rt.loop_max_defers({"max_defers": bad}) is None
-    assert rt.loop_max_nudges({"max_nudges": bad}) is None
-    # A finite value still coerces.
+    assert rt._coerce_int_safe(bad) is None
+    # A finite value still coerces on both paths.
     assert rt._coerce_int(3.0) == 3
+    assert rt._coerce_int_safe(3.0) == 3
     assert rt.loop_max_defers({"max_defers": 2}) == 2
 
 
-def test_fix6_inf_max_defers_does_not_silently_drop_loop(fresh_home):
-    """A loop with ``max_defers: .inf`` must NOT silently vanish: the board
-    compiles a real timer schedule (the loop is not dropped), and intake flags
-    the malformed bound.
+def test_round6_non_opted_inf_max_nudges_drops_loop_base_verbatim(fresh_home):
+    """ROUND-6 FIX 2 (direct probe vs base): a NON-OPTED loop with
+    ``max_nudges: .inf`` is DROPPED by the per-loop compile (the shared
+    base-verbatim ``_coerce_int`` raises, the compile try/except records an error
+    and drops the loop) -> schedule row count 0, EXACTLY like base 019271994.
 
-    Mutation check: revert the isfinite guard and the per-loop compile raises,
-    the schedule is swallowed, and 0 rows exist -- failing the row-count here.
-    """
+    Mutation check: if the shared helper swallowed inf (round-4/5) the loop would
+    compile a row -> the row-count-0 assertion fails."""
+    loop = {
+        "key": "seller_follow_up",
+        "type": "seller_follow_up",
+        "entity": "conversation_thread",
+        "triggers": [{"kind": "timer", "detail": "x", "cadence_hours": 72}],
+        "terminal_states": ["won", "lost"],
+        "max_nudges": float("inf"),
+    }
+    contract = _contract(event_loops=[loop])
+    # NON-OPTED: max_nudges is not a step-9 opt-in key.
+    assert grammar.contract_opts_into_step9(contract) is False
+    _approve("serious", contract)
+    with kb.connect(board="serious") as conn:
+        rows = conn.execute(
+            "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
+        ).fetchall()
+        assert len(rows) == 0, (
+            "a non-opted inf max_nudges must DROP the loop (base 019271994 behavior)"
+        )
+
+
+def test_round6_optin_inf_max_defers_does_not_crash_compile(fresh_home):
+    """ROUND-6 FIX 2 (opt-in graceful): a loop with ``max_defers: .inf`` OPTS IN.
+    The crash-safe ``_coerce_int_safe`` clamps the bound to None (unbounded) so the
+    loop still compiles a real timer schedule (the opt-in path is crash-SAFE), and
+    intake flags the malformed bound.
+
+    This proves the desired crash-safety is confined to the OPT-IN max_defers path
+    while the shared max_nudges path stays base-verbatim (raises -> drops)."""
     loop = {
         "key": "seller_follow_up",
         "type": "seller_follow_up",
@@ -914,19 +964,20 @@ def test_fix6_inf_max_defers_does_not_silently_drop_loop(fresh_home):
         "max_defers": float("inf"),
     }
     contract = _contract(event_loops=[loop])
+    # OPTED IN: max_defers is a step-9 opt-in key.
+    assert grammar.contract_opts_into_step9(contract) is True
     _approve("serious", contract)
     with kb.connect(board="serious") as conn:
         rows = conn.execute(
             "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious",)
         ).fetchall()
-        assert len(rows) == 1, "the loop must still compile (not silently dropped)"
-        # Inf is not a usable bound -> unbounded at runtime (None), byte-identical
-        # to a legacy unbounded loop.
+        assert len(rows) == 1, "the opt-in loop must still compile (crash-safe)"
+        # Inf is not a usable bound -> unbounded at runtime (None).
         assert rows[0]["max_defers"] is None
-    # Intake flags the malformed bound (FIX 6 surfacing).
+    # Intake (opt-in) flags the malformed bound.
     report = inv.check_contract_invariants(contract)
     assert any("max_defers" in e and "non-negative integer bound" in e
-               for e in report.errors), "intake must flag max_defers=.inf"
+               for e in report.errors), "intake must flag max_defers=.inf (opt-in)"
 
 
 # ===========================================================================
@@ -1415,19 +1466,22 @@ def test_rearch_mixed_case_row_not_in_policy_non_strict_fires(fresh_home):
 
 
 @pytest.mark.parametrize("bad", ["³", "①", "²"])  # superscript-3, circled-1, superscript-2
-def test_r2_fix2_isdigit_true_int_false_does_not_crash(bad):
-    """ROUND-2 FIX 2: a string where ``str.isdigit()`` is True but ``int()``
-    raises (superscript/circled digits) must NOT crash ``_coerce_int`` (which the
-    per-loop compile would swallow, silently dropping the watcher). It returns
-    None (treated as no usable bound).
+def test_r2_fix2_isdigit_true_int_false_raises_on_shared_path(bad):
+    """ROUND-6 FIX 2: a string where ``str.isdigit()`` is True but ``int()`` raises
+    (superscript/circled digits) RAISES on the SHARED ``_coerce_int`` (and the
+    non-opted ``loop_max_nudges``) -- byte-identical to base 019271994. The
+    per-loop compile try/except then DROPS the loop. The OPT-IN ``loop_max_defers``
+    uses the crash-safe parser -> None.
 
-    Mutation check (revert FIX 2): the old ``...isdigit()`` gate admits these and
-    the unguarded ``int()`` raises ValueError -- this assertion would surface the
-    crash instead of None.
-    """
-    assert rt._coerce_int(bad) is None
+    Mutation check (the round-4/5 regression): if the shared helper swallowed the
+    crash this raise check fails."""
+    import pytest as _pt
+    with _pt.raises((ValueError, TypeError)):
+        rt._coerce_int(bad)
+    with _pt.raises((ValueError, TypeError)):
+        rt.loop_max_nudges({"max_nudges": bad})
+    # OPT-IN max_defers path is crash-safe.
     assert rt.loop_max_defers({"max_defers": bad}) is None
-    assert rt.loop_max_nudges({"max_nudges": bad}) is None
 
 
 def test_r2_fix2_arabic_indic_digit_not_silently_coerced():
@@ -1491,17 +1545,24 @@ def test_r2_fix2_negative_string_bound_flagged_at_intake(neg):
 
 
 def test_r2_fix2_intake_and_runtime_agree_on_unicode_digit():
-    """ROUND-4 FIX B: intake and runtime agree byte-for-byte on what is a usable
-    bound. '³' (superscript, int() RAISES) is flagged at intake AND coerces to
-    None at runtime (caught, no crash -- the FIX-6 goal). '٣' (Arabic-Indic 3,
-    int() PARSES) coerces to 3 in BOTH (byte-identical to base int('٣')==3); the
-    round-2 ascii gate that forced it to None is gone."""
+    """ROUND-6 FIX 2: intake and runtime agree on what is a usable bound on the
+    OPT-IN ``max_defers`` path. '³' (superscript, int() RAISES) is flagged at intake
+    (via the crash-safe ``_coerce_nonneg_int_safe``) AND coerces to None at runtime
+    (via the crash-safe ``loop_max_defers``). '٣' (Arabic-Indic 3, int() PARSES)
+    coerces to 3 in BOTH (byte-identical to base int('٣')==3).
+
+    NOTE: the SHARED ``_coerce_nonneg_int`` RAISES on '³' (base-verbatim); only the
+    OPT-IN safe variant catches it -> None."""
+    import pytest as _pt
     report = inv.check_contract_invariants(
         _invariant_contract(_invariant_loop(max_defers="³"))
     )
     assert any("max_defers" in e for e in report.errors)
     assert rt.loop_max_defers({"max_defers": "³"}) is None
-    assert inv._coerce_nonneg_int("³") is None
+    # Shared helper RAISES (base-verbatim); the OPT-IN safe variant catches it.
+    with _pt.raises((ValueError, TypeError)):
+        inv._coerce_nonneg_int("³")
+    assert inv._coerce_nonneg_int_safe("³") is None
     # Arabic-Indic 3 parses identically in intake and runtime (== base).
     assert inv._coerce_nonneg_int("٣") == 3
     assert rt._coerce_int("٣") == 3
@@ -1654,18 +1715,16 @@ def test_r2_fix4_max_defers_reader_returns_sentinel_for_inf():
 # --- RE-ARCHITECTURE: hash REVERT + byte-identity via opt-in gating ------------
 
 
-def test_rearch_hash_strips_invariants_block():
-    """ROUND-4 FIX A (supersedes the round-2/round-3 REVERT): the canonical hash
-    NOW ALSO strips ``launch_intake.invariants`` -- it is a DERIVED report
-    (recomputable via check_contract_invariants), not authorial intent, so it must
-    NOT bind the hash. This is what structurally removes the recurring default-off
-    hash-flip: two contracts that differ ONLY in their invariants report hash
-    IDENTICALLY, so no check finding can ever change the hash.
+def test_rearch_hash_retains_invariants_block_base_verbatim():
+    """ROUND-6 FIX 1 (SUBTRACTIVE REVERT of round-4 FIX A): the canonical hash
+    RETAINS ``launch_intake.invariants`` -- EXACTLY as base 019271994. Two contracts
+    that differ ONLY in their invariants report hash DIFFERENTLY, exactly like base.
+    Byte-identity for the DEFAULT-OFF path comes from opt-in-gating (a non-opted
+    contract produces NO new findings -> its invariants block is identical to base),
+    NOT from stripping the block.
 
-    The round-2/round-3 worry (stripping un-approved base boards) is resolved by
-    the re-stamp migration (``_restamp_launch_approval_contract_hash``), which
-    re-binds any OLD-scheme approval to the new hash so the board stays approved
-    (see test_fixA_restamp_keeps_old_scheme_approval_valid)."""
+    Mutation check: re-add the invariants strip and these two hashes become EQUAL,
+    diverging from base -> this fails."""
     base = _contract()
     with_clean = dict(base)
     with_clean["launch_intake"] = {"invariants": {"ok": True, "errors": [], "warnings": []}}
@@ -1673,35 +1732,17 @@ def test_rearch_hash_strips_invariants_block():
     with_findings["launch_intake"] = {
         "invariants": {"ok": False, "errors": ["something"], "warnings": ["a typo"]}
     }
-    assert kb._business_contract_hash(with_clean) == kb._business_contract_hash(with_findings), (
-        "invariants is DERIVED telemetry and must be stripped from the hash"
+    assert kb._business_contract_hash(with_clean) != kb._business_contract_hash(with_findings), (
+        "invariants is RETAINED in the hash (base 019271994 behavior); two differing "
+        "invariants reports must hash differently"
     )
 
 
-def test_rearch_invariants_strip_drops_both_telemetry_keys():
-    """ROUND-4 FIX A: ``_strip_contract_hash_telemetry`` drops BOTH
-    ``completeness`` AND ``invariants``, and drops a launch_intake left holding
-    nothing but telemetry entirely (so it hashes like a contract with no
-    launch_intake)."""
-    def new_strip(normalized):
-        # The expected post-FIX-A behavior, reconstructed independently.
-        if not isinstance(normalized, dict):
-            return normalized
-        intake = normalized.get("launch_intake")
-        if not isinstance(intake, dict):
-            return normalized
-        if not any(k in intake for k in ("completeness", "invariants")):
-            return normalized
-        clone = dict(normalized)
-        ic = dict(intake)
-        ic.pop("completeness", None)
-        ic.pop("invariants", None)
-        if ic:
-            clone["launch_intake"] = ic
-        else:
-            clone.pop("launch_intake", None)
-        return clone
-
+def test_rearch_strip_drops_only_completeness_base_verbatim():
+    """ROUND-6 FIX 1: ``_strip_contract_hash_telemetry`` drops ONLY
+    ``completeness`` (base 019271994 behavior) -- it RETAINS ``invariants``.
+    Asserted against the base module loaded via git show."""
+    base_kb = _load_base_module("base_kb_strip_probes", "hermes_cli/kanban_db.py")
     probes = [
         {"objective": {"statement": "x"}},
         {"launch_intake": {"completeness": {"blocking": []}}},
@@ -1711,7 +1752,15 @@ def test_rearch_invariants_strip_drops_both_telemetry_keys():
         {"launch_intake": {"invariants": {"ok": True}, "answers": {"g": "x"}}},
     ]
     for p in probes:
-        assert kb._strip_contract_hash_telemetry(dict(p)) == new_strip(dict(p)), p
+        head = kb._strip_contract_hash_telemetry(json.loads(json.dumps(p)))
+        base = base_kb._strip_contract_hash_telemetry(json.loads(json.dumps(p)))
+        assert head == base, f"HEAD strip diverged from base for {p}"
+        # Direct: completeness gone, invariants retained.
+        intake = head.get("launch_intake")
+        if isinstance(intake, dict):
+            assert "completeness" not in intake, f"completeness must be stripped: {p}"
+            if isinstance(p.get("launch_intake"), dict) and "invariants" in p["launch_intake"]:
+                assert "invariants" in intake, f"invariants must be RETAINED: {p}"
 
 
 def test_rearch_legacy_contract_hash_byte_identical_via_optin_gating():
@@ -2289,13 +2338,18 @@ def test_overarching_intake_optin_enforces(fresh_home):
 
 
 # ===========================================================================
-# ROUND-4 FIX A: the contract hash must be invariant to ANY check finding --
-# launch_intake.invariants is a DERIVED report (recomputable via
-# check_contract_invariants), not authorial intent, so it must not bind the
-# canonical hash. This structurally removes the recurring default-off hash-flip:
-# a new finding (a step-9 opt-in OR an overloaded key like class/kind/
-# max_defers/terminal_classes OR a pre-existing finding) can never change the
-# hash. Plus the one-time re-stamp migration keeps an OLD-scheme approval valid.
+# ROUND-6 FIX 1 (SUBTRACTIVE REVERT of round-4 FIX A): the canonical hash strips
+# ONLY launch_intake.completeness, EXACTLY as base 019271994 does -- it does NOT
+# strip launch_intake.invariants, and there is NO re-stamp migration. The
+# rationale: the step-9 invariant checks are opt-in-gated, so a NON-OPTED contract
+# produces NO new invariant findings -> its launch_intake.invariants block is
+# byte-identical to base -> its _business_contract_hash is byte-identical to base
+# WITHOUT stripping. Stripping invariants was unnecessary AND caused the
+# un-approval/hash-flip regression for any invariants-carrying contract. These
+# tests pin: (a) the strip is base-identical (only completeness), (b) an
+# invariants-carrying contract hashes IDENTICAL base-vs-HEAD, (c) a non-opted
+# contract's invariants block + hash are byte-identical to base, (d) an OPTED-IN
+# contract's findings appear in ITS OWN invariants/hash (fine -- it opted in).
 # ===========================================================================
 
 
@@ -2331,167 +2385,154 @@ def _overloaded_key_contract(*, max_nudges=5):
     }
 
 
-def test_fixA_overloaded_key_contract_hash_identical_base_vs_head():
-    """FIX A byte-identity proof: a contract with overloaded keys (a
-    terminal_states entry carrying class/kind, a terminal_classes map, a
-    fractional max_defers) hashes IDENTICALLY base-vs-HEAD.
+def test_fix1_strip_is_base_identical_only_completeness():
+    """ROUND-6 FIX 1: ``_strip_contract_hash_telemetry`` strips ONLY
+    ``launch_intake.completeness`` -- EXACTLY as base 019271994. It does NOT strip
+    ``launch_intake.invariants``. Proven by loading the base module and asserting
+    HEAD's strip produces the IDENTICAL result as base for a contract carrying
+    BOTH telemetry blocks.
 
-    A contract that carries NO launch_intake telemetry hashes identically under
-    both the base (completeness-only) and HEAD (also strips invariants) schemes,
-    so the head hash equals base 019271994's hash byte-for-byte.
+    Mutation check: re-add ``invariants`` to the strip and the invariants block
+    drops out at HEAD but not base -> the strip results diverge and this fails."""
+    base_kb = _load_base_module("base_kb_strip", "hermes_cli/kanban_db.py")
+    normalized = {
+        "objective": {"statement": "x"},
+        "launch_intake": {
+            "answers": {"a": 1},
+            "completeness": {"ok": True, "errors": [], "warnings": []},
+            "invariants": {"ok": False, "errors": ["e1"], "warnings": ["w1"]},
+        },
+    }
+    head_stripped = kb._strip_contract_hash_telemetry(json.loads(json.dumps(normalized)))
+    base_stripped = base_kb._strip_contract_hash_telemetry(json.loads(json.dumps(normalized)))
+    assert head_stripped == base_stripped, "HEAD strip diverged from base 019271994"
+    # Direct shape assertion: completeness gone, invariants RETAINED.
+    assert "completeness" not in head_stripped["launch_intake"]
+    assert head_stripped["launch_intake"]["invariants"] == {
+        "ok": False, "errors": ["e1"], "warnings": ["w1"]
+    }, "invariants must be RETAINED (base does NOT strip it)"
 
-    Mutation check: if FIX A ever bound a check finding to the hash (e.g. by
-    persisting launch_intake.invariants into the hashed payload), the head hash
-    would drift from base for any contract whose invariants report differs, and
-    this equality fails."""
-    base_kb = _load_base_module("base_kb_fixA", "hermes_cli/kanban_db.py")
+
+def test_fix1_invariants_carrying_contract_hash_identical_base_vs_head():
+    """ROUND-6 FIX 1 (a): an invariants-carrying contract hashes IDENTICAL
+    base-vs-HEAD. Because the strip is now base-verbatim (only completeness), the
+    HEAD hash equals base for ANY contract -- including one carrying a
+    launch_intake.invariants block.
+
+    Mutation check: re-add the invariants strip and HEAD drops the invariants block
+    from the hashed payload while base keeps it -> the hashes diverge and this
+    fails."""
+    base_kb = _load_base_module("base_kb_fix1_inv", "hermes_cli/kanban_db.py")
+    contract = _overloaded_key_contract()
+    contract["launch_intake"] = {
+        "answers": {"a": 1},
+        "invariants": {"ok": False, "errors": ["e1"], "warnings": ["w1"], "checked": {"event_loops": 1}},
+    }
+    assert kb._business_contract_hash(contract) == base_kb._business_contract_hash(contract), (
+        "invariants-carrying contract hash diverged from base 019271994"
+    )
+
+
+def test_fix1_overloaded_key_contract_hash_identical_base_vs_head():
+    """ROUND-6 FIX 1: a plain contract with overloaded keys (a terminal_states
+    entry carrying class/kind, a terminal_classes map, a fractional max_defers)
+    hashes IDENTICALLY base-vs-HEAD (no launch_intake telemetry at all)."""
+    base_kb = _load_base_module("base_kb_fix1_plain", "hermes_cli/kanban_db.py")
     contract = _overloaded_key_contract()
     assert kb._business_contract_hash(contract) == base_kb._business_contract_hash(contract), (
         "overloaded-key contract hash diverged from base 019271994"
     )
 
 
-def test_fixA_hash_invariant_to_invariants_report_content():
-    """FIX A root: the canonical hash is INVARIANT to launch_intake.invariants
-    content -- two contracts identical except for a differing invariants report
-    (one ok, one with errors/warnings) hash IDENTICALLY. This is what makes a new
-    finding (step-9 opt-in OR an overloaded key OR a pre-existing finding) unable
-    to flip the default-off hash.
+def test_fix1_non_opted_invariants_block_byte_identical_to_base():
+    """ROUND-6 FIX 1 (b): a NON-OPTED contract's launch_intake.invariants block is
+    byte-identical to base -> its hash is byte-identical to base. We compute the
+    invariants report via the SAME checker base would use (it is opt-in-gated, so a
+    non-opted contract produces NO new findings), attach it, and assert the hash
+    matches base.
 
-    Mutation check: revert FIX A (keep invariants in the hashed payload) and the
-    two hashes differ -> this fails."""
-    base = _overloaded_key_contract()
-    c_ok = json.loads(json.dumps(base))
-    c_ok["launch_intake"] = {"answers": {"a": 1}, "invariants": {"ok": True, "errors": [], "warnings": ["w1"]}}
-    c_bad = json.loads(json.dumps(base))
-    c_bad["launch_intake"] = {"answers": {"a": 1}, "invariants": {"ok": False, "errors": ["e2"], "warnings": []}}
-    assert kb._business_contract_hash(c_ok) == kb._business_contract_hash(c_bad), (
-        "the hash must not depend on the launch_intake.invariants report"
+    Mutation check: if the step-9 checks were NOT opt-in-gated, a non-opted
+    contract's invariants report would carry new findings -> the attached block
+    would differ from base -> the hash diverges and this fails. (Pinned elsewhere
+    by the opt-in-gate effect tests.)"""
+    base_inv = _load_base_module("base_inv_fix1_block", "hermes_cli/kanban_launch_invariants.py")
+    base_kb = _load_base_module("base_kb_fix1_block", "hermes_cli/kanban_db.py")
+    contract = _overloaded_key_contract()
+    # Strip the step-9 opt-ins so the loop is genuinely LEGACY.
+    loop = contract["event_loops"][0]
+    loop["terminal_states"] = ["closed_won", "closed_lost"]
+    loop.pop("terminal_classes", None)
+    loop.pop("max_defers", None)
+    assert grammar.contract_opts_into_step9(contract) is False
+    # The invariants report is byte-identical base-vs-HEAD (opt-in-gated).
+    base_report = base_inv.check_contract_invariants(contract)
+    head_report = inv.check_contract_invariants(contract)
+    assert head_report.errors == base_report.errors
+    assert head_report.warnings == base_report.warnings
+    # Attach the (identical) report and assert the hash matches base too.
+    c_head = json.loads(json.dumps(contract))
+    c_head["launch_intake"] = {"answers": {"a": 1}, "invariants": head_report.as_dict()}
+    c_base = json.loads(json.dumps(contract))
+    c_base["launch_intake"] = {"answers": {"a": 1}, "invariants": base_report.as_dict()}
+    assert kb._business_contract_hash(c_head) == base_kb._business_contract_hash(c_base), (
+        "a non-opted contract's invariants-carrying hash diverged from base"
     )
-    # And a launch_intake holding ONLY derived telemetry hashes identically to a
-    # contract with no launch_intake at all (the emptied-intake drop).
-    c_only_tel = json.loads(json.dumps(base))
-    c_only_tel["launch_intake"] = {"invariants": {"ok": True}, "completeness": {"ok": True}}
-    assert kb._business_contract_hash(c_only_tel) == kb._business_contract_hash(base), (
-        "a launch_intake holding only telemetry must drop out of the hash entirely"
-    )
 
 
-def test_fixA_invariants_telemetry_does_not_change_contract_hash():
-    """FIX A: a contract WITH vs WITHOUT a launch_intake.invariants block hashes
-    IDENTICALLY (mirrors the completeness test for the now-also-stripped key).
-
-    Mutation check: remove "invariants" from _CONTRACT_HASH_TELEMETRY_INTAKE_KEYS
-    and the WITH-block hash drifts -> this fails."""
+def test_fix1_completeness_telemetry_still_stripped_from_hash():
+    """ROUND-6 FIX 1: ``launch_intake.completeness`` IS still stripped (base FIX 5
+    behavior, preserved): a contract WITH vs WITHOUT a completeness block hashes
+    IDENTICALLY -- the degraded-fallback soak telemetry must not bind the hash."""
     plain = {"objective": {"statement": "x"}, "launch_intake": {"answers": {"g": "do"}}}
-    with_inv = {
+    with_comp = {
         "objective": {"statement": "x"},
         "launch_intake": {
             "answers": {"g": "do"},
-            "invariants": {"ok": True, "errors": [], "warnings": ["soft"], "checked": {"event_loops": 0}},
+            "completeness": {"ok": True, "errors": [], "warnings": [], "enforced_dimensions": []},
         },
     }
-    assert kb._business_contract_hash(plain) == kb._business_contract_hash(with_inv)
+    assert kb._business_contract_hash(plain) == kb._business_contract_hash(with_comp)
 
 
-def test_fixA_restamp_keeps_old_scheme_approval_valid(fresh_home):
-    """FIX A re-stamp migration: a synthetic board APPROVED under the OLD
-    (completeness-only) hash scheme STAYS approved after the migration -- the
-    bound contract_hash is re-stamped to the new scheme on read, so the consumed
-    approval token still validates and _board_has_approved_launch_review is True.
-
-    Mutation check: drop the re-stamp call from read_board_metadata and the board
-    reads back UN-approved (the stored old hash != the recomputed new hash), so
-    _board_has_approved_launch_review returns False here."""
-    import time
-
-    contract = {
-        "objective": {"statement": "x", "success": ["s"], "failure": ["f"], "constraints": ["c"]},
-        "launch_intake": {"answers": {"a": 1}, "invariants": {"ok": True, "errors": [], "warnings": ["w1"]}},
-    }
-    kb.create_board("restamp", name="Restamp")
-    old_hash = kb._legacy_completeness_only_contract_hash(contract)
-    new_hash = kb._business_contract_hash(contract)
-    # Precondition: the schemes genuinely differ for this invariants-carrying contract.
-    assert old_hash != new_hash, "test contract must differ under the two schemes"
-
-    now = int(time.time())
-    with kb.connect(board="restamp") as conn:
-        with kb.write_txn(conn):
-            conn.execute(
-                "INSERT INTO board_launch_approval_tokens "
-                "(id,status,kind,board,contract_version,from_version,contract_hash,amendment_id,"
-                " approved_by,evidence,reason,created_at,expires_at,token_hash,consumed_at,expired_at,revoked_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                ("tok1", "consumed", "launch_review", "restamp", 1, None, old_hash, None,
-                 "owner", "{}", None, now, now + 999999, "th1", now, None, None),
-            )
-            conn.execute(
-                "INSERT INTO board_launch_reviews "
-                "(id,status,kind,board,approval_token_id,contract_version,contract_hash,amendment_id,"
-                " approved_by,evidence,reason,readiness,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                ("rev1", "approved", "launch_review", "restamp", "tok1", 1, old_hash, None,
-                 "owner", '{"type":"owner_approval"}', None, "{}", now),
-            )
-    kb.write_board_metadata(
-        "restamp",
-        business_contract=contract,
-        contract_version=1,
-        launch_review_id="rev1",
-        launch_approval={
-            "id": "rev1", "status": "approved", "approved_by": "owner",
-            "evidence": {"type": "owner_approval"}, "approval_token_id": "tok1",
-            "contract_hash": old_hash, "contract_version": 1,
-        },
-        launch_approval_tokens=[{"id": "tok1", "contract_hash": old_hash}],
+def test_fix1_opted_in_contract_findings_appear_in_its_own_invariants():
+    """ROUND-6 FIX 1 (c): an OPTED-IN contract's step-9 findings DO appear in its
+    own invariants report (and thus its hash if persisted) -- which is fine, it
+    opted in. This pins that the revert did NOT suppress opt-in enforcement: an
+    opted-in loop with an unknown declared class surfaces an error a non-opted loop
+    would not."""
+    opted = _invariant_contract(
+        _invariant_loop(terminal_classes={"closed_won": "victory", "closed_lost": "loss"}),
     )
-
-    meta = kb.read_board_metadata("restamp")
-    # In-memory binding re-stamped to the new scheme and the board stays approved.
-    assert meta["launch_approval"]["contract_hash"] == new_hash
-    assert kb._board_has_approved_launch_review(meta) is True, (
-        "an OLD-scheme approval must remain valid after the re-stamp migration"
+    assert grammar.contract_opts_into_step9(opted) is True
+    rep = inv.check_contract_invariants(opted)
+    assert any("unknown" in e and "victory" in e for e in rep.errors), (
+        "an opted-in loop's unknown declared class must surface in its invariants"
     )
-    # DB review + token rows re-stamped to the new hash.
-    with kb.connect(board="restamp") as conn:
-        t = conn.execute("SELECT contract_hash FROM board_launch_approval_tokens WHERE id=?", ("tok1",)).fetchone()
-        r = conn.execute("SELECT contract_hash FROM board_launch_reviews WHERE id=?", ("rev1",)).fetchone()
-    assert t["contract_hash"] == new_hash and r["contract_hash"] == new_hash
-    # Persisted board.json re-stamped (idempotent on the second read).
-    assert kb.read_board_metadata("restamp")["launch_approval"]["contract_hash"] == new_hash
+    # The same shape NOT opted in -> no such finding (terminal_classes is the
+    # opt-in; without it there is no declared class to validate).
+    not_opted = _invariant_contract(_invariant_loop())
+    assert grammar.contract_opts_into_step9(not_opted) is False
+    rep2 = inv.check_contract_invariants(not_opted)
+    assert not any("victory" in e for e in rep2.errors)
 
 
-def test_fixA_restamp_is_noop_without_approval(fresh_home):
-    """FIX A re-stamp is a NO-OP for a board with no launch_approval (the LIVE
-    case: no live board carries one). The migration returns False and mutates
-    nothing."""
-    kb.create_board("plain", name="Plain")
-    meta = kb.read_board_metadata("plain")
-    assert meta.get("launch_approval") is None
-    assert kb._restamp_launch_approval_contract_hash(dict(meta)) is False
-
-
-def test_fixA_restamp_leaves_genuinely_different_contract_untouched(fresh_home):
-    """FIX A re-stamp must NOT re-bind an approval whose stored hash matches
-    NEITHER scheme for the current contract -- that is a genuine divergence which
-    must still fail closed (no silent re-approval)."""
-    meta = {
-        "slug": "x",
-        "objective": {"statement": "x"},
-        "launch_approval": {"id": "r", "contract_hash": "deadbeef" * 8, "status": "approved"},
-        "launch_approval_tokens": [],
-    }
-    assert kb._restamp_launch_approval_contract_hash(meta) is False
-    assert meta["launch_approval"]["contract_hash"] == "deadbeef" * 8
+def test_fix1_no_restamp_machinery_remains():
+    """ROUND-6 FIX 1: the round-4 re-stamp migration is REMOVED (with the
+    invariants strip gone there is nothing to re-stamp). The helpers and the
+    telemetry-key tuple it introduced must no longer exist -- they were net-new
+    over base 019271994."""
+    assert not hasattr(kb, "_restamp_launch_approval_contract_hash")
+    assert not hasattr(kb, "_legacy_completeness_only_contract_hash")
+    assert not hasattr(kb, "_CONTRACT_HASH_TELEMETRY_INTAKE_KEYS")
+    assert not hasattr(kb, "_RESTAMP_GUARD")
 
 
 # ===========================================================================
-# ROUND-4 FIX B: legacy coercion is byte-identical to base -- a non-ASCII but
-# int()-parseable digit string ('٣'==3) parses EXACTLY as base, while an
-# isdigit()-True/int()-raises char ('³','①') is caught -> None (no crash, the
-# FIX-6 goal). The default-off invariant report for a legacy loop with
-# max_nudges='٣' is byte-identical to base 019271994.
+# ROUND-6 FIX 2: shared coercion is BYTE-VERBATIM base 019271994 -- a non-ASCII
+# but int()-parseable digit string ('٣'==3) parses EXACTLY as base, AND an
+# isdigit()-True/int()-raises char ('³','①') RAISES exactly as base (the
+# per-loop compile try/except then DROPS the loop). The crash-safety lives ONLY
+# in the opt-in ``_coerce_int_safe`` / max_defers path.
 # ===========================================================================
 
 
@@ -2502,21 +2543,32 @@ def test_fixA_restamp_leaves_genuinely_different_contract_untouched(fresh_home):
         ("٦", 6),       # Arabic-Indic 6
         ("5", 5),       # plain ASCII still works
         ("-3", -3),     # negative ASCII (runtime _coerce_int allows; caller bounds it)
-        ("³", None),    # superscript: int() raises -> None (no crash; FIX-6 goal)
-        ("①", None),    # circled: int() raises -> None
         ("abc", None),
     ],
 )
-def test_fixB_coerce_int_matches_base_no_ascii_narrowing(raw, expected):
+def test_round6_shared_coerce_int_matches_base_parseable(raw, expected):
     """``_coerce_int`` parses a non-ASCII int()-parseable digit EXACTLY as base
-    (int(value.strip())) and catches the isdigit()-True/int()-raises chars.
+    (int(value.strip())) for every PARSEABLE input.
 
     Mutation check: re-introduce the ``.isascii()`` gate and '٣' coerces to None
     (not 3), diverging from base int('٣')==3 -> this fails."""
     assert rt._coerce_int(raw) == expected
-    # Base int() agreement for the parseable cases.
     if expected is not None:
         assert int(raw.strip()) == expected
+
+
+@pytest.mark.parametrize("raw", ["³", "①"])
+def test_round6_shared_coerce_int_raises_base_verbatim(raw):
+    """``_coerce_int`` RAISES on an isdigit()-True/int()-raises char, byte-identical
+    to base 019271994 (the per-loop compile try/except then DROPS the loop). The
+    OPT-IN ``_coerce_int_safe`` catches the same input -> None.
+
+    Mutation check: if the shared helper swallowed the crash, this raise check
+    fails (the round-4/5 regression)."""
+    import pytest as _pt
+    with _pt.raises((ValueError, TypeError)):
+        rt._coerce_int(raw)
+    assert rt._coerce_int_safe(raw) is None
 
 
 @pytest.mark.parametrize(
@@ -2526,44 +2578,48 @@ def test_fixB_coerce_int_matches_base_no_ascii_narrowing(raw, expected):
         ("٦", 6),
         ("5", 5),
         ("-1", None),   # negative -> not a non-negative bound
-        ("³", None),    # no crash
-        ("①", None),
     ],
 )
-def test_fixB_coerce_nonneg_int_matches_base(raw, expected):
-    """``_coerce_nonneg_int`` mirrors ``_coerce_int`` (no ascii narrowing) and
-    stays a NON-NEGATIVE coercion."""
+def test_round6_coerce_nonneg_int_matches_base_parseable(raw, expected):
+    """``_coerce_nonneg_int`` mirrors ``_coerce_int`` (no ascii narrowing) for every
+    PARSEABLE input and stays a NON-NEGATIVE coercion."""
     assert inv._coerce_nonneg_int(raw) == expected
 
 
-def test_fixB_legacy_max_nudges_arabic_digit_byte_identical_invariants():
-    """FIX B byte-identity: a LEGACY loop with ``max_nudges='٣'`` produces an
-    invariant report (errors+warnings) byte-identical to base 019271994 -- base
-    int('٣')==3 is finite, so neither base nor HEAD raises a 'can never stop'
-    error.
+@pytest.mark.parametrize("raw", ["³", "①"])
+def test_round6_coerce_nonneg_int_raises_base_verbatim(raw):
+    """``_coerce_nonneg_int`` (shared, non-opted F10 path) RAISES on '³'/'①' exactly
+    like base; the OPT-IN ``_coerce_nonneg_int_safe`` catches it -> None."""
+    import pytest as _pt
+    with _pt.raises((ValueError, TypeError)):
+        inv._coerce_nonneg_int(raw)
+    assert inv._coerce_nonneg_int_safe(raw) is None
 
-    Mutation check: re-add the ascii narrowing and '٣' becomes an unusable bound
-    at HEAD, so HEAD would flag the loop as unbounded ('can never stop') while
-    base does not -> the error lists diverge and this fails."""
+
+def test_round6_legacy_max_nudges_arabic_digit_byte_identical_invariants():
+    """ROUND-6 FIX 2 byte-identity: a LEGACY loop with ``max_nudges='٣'`` produces
+    an invariant report (errors+warnings) byte-identical to base 019271994 -- base
+    int('٣')==3 is finite, so neither base nor HEAD raises a 'can never stop'
+    error."""
     contract = _overloaded_key_contract(max_nudges="٣")
-    # Strip the step-9 opt-ins so this is a genuinely LEGACY loop (no opt-in).
     loop = contract["event_loops"][0]
     loop["terminal_states"] = ["closed_won", "closed_lost"]
     loop.pop("terminal_classes", None)
     loop.pop("max_defers", None)
     assert grammar.contract_opts_into_step9(contract) is False
 
-    base_inv = _load_base_module("base_inv_fixB", "hermes_cli/kanban_launch_invariants.py")
+    base_inv = _load_base_module("base_inv_r6", "hermes_cli/kanban_launch_invariants.py")
     base_report = base_inv.check_contract_invariants(contract)
     head_report = inv.check_contract_invariants(contract)
     assert head_report.errors == base_report.errors, "invariant ERRORS diverged from base"
     assert head_report.warnings == base_report.warnings, "invariant WARNINGS diverged from base"
 
 
-def test_fixB_compiled_max_nudges_column_matches_base(fresh_home):
-    """FIX B: a loop with ``max_nudges='٣'`` compiles a schedule whose persisted
-    ``max_nudges`` column == 3 (base int('٣')), AND a '³' bound does NOT crash the
-    per-loop compile (the loop still compiles)."""
+def test_round6_compiled_max_nudges_column_matches_base(fresh_home):
+    """ROUND-6 FIX 2 direct probe: a loop with ``max_nudges='٣'`` compiles a
+    schedule whose persisted ``max_nudges`` column == 3 (base int('٣')), AND a '³'
+    bound RAISES -> the per-loop compile DROPS the loop (schedule row count 0),
+    EXACTLY like base 019271994 (NOT the round-4/5 'compiles with NULL' behavior)."""
     loop = {
         "key": "seller_follow_up", "type": "seller_follow_up", "entity": "conversation_thread",
         "triggers": [{"kind": "timer", "detail": "x", "cadence_hours": 72}],
@@ -2574,16 +2630,17 @@ def test_fixB_compiled_max_nudges_column_matches_base(fresh_home):
         row = _schedule_row(conn)
         assert int(row["max_nudges"]) == 3 == int("٣")
 
-    # A '³' bound must NOT crash the compile -> the loop still compiles (with no
-    # usable nudge cap, byte-identical to a legacy loop whose cap was dropped).
+    # A '³' bound RAISES in _coerce_int -> the per-loop compile DROPS the loop
+    # (base 019271994 behavior). Schedule row count 0.
     loop2 = dict(loop, max_nudges="³")
     _approve("serious2", _contract(event_loops=[loop2]))
     with kb.connect(board="serious2") as conn:
         rows = conn.execute(
             "SELECT * FROM reactive_timer_schedules WHERE board = ?", ("serious2",)
         ).fetchall()
-        assert len(rows) == 1, "a '³' bound must not silently drop the schedule"
-        assert rows[0]["max_nudges"] is None
+        assert len(rows) == 0, (
+            "a '³' max_nudges must DROP the loop (base 019271994 raises -> drops)"
+        )
 
 
 # ===========================================================================
@@ -2684,15 +2741,14 @@ _BASE_COERCE_NONNEG_VECTOR = {
 }
 
 
-def test_fix1_coerce_int_acceptance_set_is_base_exact():
-    """ROUND-5 FIX 1: the shared ``_coerce_int`` acceptance set is BYTE-FOR-BYTE
-    base 019271994. The round-4 rewrite to a bare ``int(value.strip())`` WIDENED
-    it ('+5'/'1_000'/'-0' that base's ``.isdigit()`` gate REJECTED now parsed),
-    flipping default-off launch-gate decisions. This pins the base acceptance set.
+def test_round6_coerce_int_acceptance_set_is_base_exact():
+    """ROUND-6 FIX 2: the shared ``_coerce_int`` acceptance set is BYTE-FOR-BYTE
+    base 019271994 -- the ``.isdigit()`` gate, the int()/float() branches, AND the
+    base CRASH on '³'/'①'. This pins the base acceptance set including the raise.
 
-    Mutation check (the round-4 regression): drop the ``.isdigit()`` gate and use
-    ``int(value.strip())`` -> '+5' becomes 5 and '1_000' becomes 1000, so these
-    assertions fail."""
+    Mutation check (round-4/5 regression): drop the ``.isdigit()`` gate or swallow
+    the crash and these assertions fail."""
+    import pytest as _pt
     for raw, expected in _BASE_COERCE_INT_VECTOR.items():
         assert rt._coerce_int(raw) == expected or (
             rt._coerce_int(raw) is None and expected is None
@@ -2701,17 +2757,22 @@ def test_fix1_coerce_int_acceptance_set_is_base_exact():
     assert rt._coerce_int(2.7) == 2
     assert rt._coerce_int(5) == 5
     assert rt._coerce_int(True) is None
-    # The ONLY sanctioned divergence: a base-CRASH char becomes None (no crash).
-    assert rt._coerce_int("³") is None
-    assert rt._coerce_int("①") is None
+    # The shared helper RAISES on '³'/'①' (base-verbatim). The OPT-IN safe variant
+    # catches it -> None.
+    for crash in ("³", "①"):
+        with _pt.raises((ValueError, TypeError)):
+            rt._coerce_int(crash)
+        assert rt._coerce_int_safe(crash) is None
 
 
-def test_fix1_coerce_nonneg_int_acceptance_set_is_base_exact():
-    """ROUND-5 FIX 1: the shared ``_coerce_nonneg_int`` acceptance set is
-    BYTE-FOR-BYTE base 019271994 (``.isdigit()`` gate, which rejects '-0'/'+5').
+def test_round6_coerce_nonneg_int_acceptance_set_is_base_exact():
+    """ROUND-6 FIX 2: the shared ``_coerce_nonneg_int`` acceptance set is
+    BYTE-FOR-BYTE base 019271994 (``.isdigit()`` gate, which rejects '-0'/'+5')
+    INCLUDING the base raise on '³'/'①'.
 
-    Mutation check: drop the ``.isdigit()`` gate for a bare ``int()`` -> '-0'
-    coerces to 0 and '+5' to 5, so these assertions fail."""
+    Mutation check: drop the ``.isdigit()`` gate or swallow the crash and these
+    fail."""
+    import pytest as _pt
     for raw, expected in _BASE_COERCE_NONNEG_VECTOR.items():
         got = inv._coerce_nonneg_int(raw)
         assert got == expected or (got is None and expected is None), (
@@ -2721,20 +2782,24 @@ def test_fix1_coerce_nonneg_int_acceptance_set_is_base_exact():
     assert inv._coerce_nonneg_int(-1) is None
     assert inv._coerce_nonneg_int(5.0) == 5
     assert inv._coerce_nonneg_int(2.7) is None
-    # Sanctioned divergence: base-CRASH char -> None (no crash).
-    assert inv._coerce_nonneg_int("³") is None
+    # Shared helper RAISES on '³'; the OPT-IN safe variant catches it -> None.
+    with _pt.raises((ValueError, TypeError)):
+        inv._coerce_nonneg_int("³")
+    assert inv._coerce_nonneg_int_safe("³") is None
 
 
-def test_fix1_shared_helpers_byte_identical_to_base_source():
-    """ROUND-5 FIX 1 (provable byte-identity): load the BASE 019271994 helpers and
-    assert HEAD's shared coercion helpers produce the IDENTICAL result for every
-    input in the fuzz vector -- except a base CRASH, where HEAD returns None (the
-    minimal, proven-safe try/except). This is the machine-checkable form of the
-    `git diff ... shows ZERO behavioral diff on the helpers` requirement."""
-    base_rt = _load_base_module("base_rt_fix1", "hermes_cli/kanban_reactive_runtime.py")
-    base_inv = _load_base_module("base_inv_fix1", "hermes_cli/kanban_launch_invariants.py")
+def test_round6_shared_helpers_byte_identical_to_base_source():
+    """OVERARCHING DIRECT PROOF (a): load the BASE 019271994 helpers and assert
+    HEAD's shared coercion helpers produce the IDENTICAL result for every input in
+    the fuzz vector -- INCLUDING raising EXACTLY where base raises. This is the
+    machine-checkable proof that the shared coercion path is base-verbatim. The
+    OPT-IN safe variants are asserted to match base where base does NOT crash, and
+    to return None (not raise) where base crashes."""
+    base_rt = _load_base_module("base_rt_r6", "hermes_cli/kanban_reactive_runtime.py")
+    base_inv = _load_base_module("base_inv_r6_src", "hermes_cli/kanban_launch_invariants.py")
     vector = ["+5", "1_000", "-0", "٣", "³", "①", "5", "-1", 2.7, "garbage",
-              "0", "", "  7 ", "-5", 5, True, False, None, "٣٣"]
+              "0", "", "  7 ", "-5", 5, True, False, None, "٣٣",
+              float("inf"), float("nan")]
     for v in vector:
         # Base value or CRASH.
         try:
@@ -2747,17 +2812,34 @@ def test_fix1_shared_helpers_byte_identical_to_base_source():
             b_inv_crash = False
         except Exception:
             b_inv, b_inv_crash = None, True
-        # HEAD never crashes (the whole point of the guard).
-        h_rt = rt._coerce_int(v)
-        h_inv = inv._coerce_nonneg_int(v)
-        if b_rt_crash:
-            assert h_rt is None, f"_coerce_int({v!r}): base CRASHED, HEAD must be None, got {h_rt!r}"
-        else:
+        # HEAD shared helper: must MATCH base EXACTLY, including the raise.
+        try:
+            h_rt = rt._coerce_int(v)
+            h_rt_crash = False
+        except Exception:
+            h_rt, h_rt_crash = None, True
+        try:
+            h_inv = inv._coerce_nonneg_int(v)
+            h_inv_crash = False
+        except Exception:
+            h_inv, h_inv_crash = None, True
+        assert h_rt_crash == b_rt_crash, f"_coerce_int({v!r}): crash {h_rt_crash} != base {b_rt_crash}"
+        if not b_rt_crash:
             assert h_rt == b_rt, f"_coerce_int({v!r}): HEAD {h_rt!r} != base {b_rt!r}"
-        if b_inv_crash:
-            assert h_inv is None, f"_coerce_nonneg_int({v!r}): base CRASHED, HEAD must be None, got {h_inv!r}"
-        else:
+        assert h_inv_crash == b_inv_crash, f"_coerce_nonneg_int({v!r}): crash {h_inv_crash} != base {b_inv_crash}"
+        if not b_inv_crash:
             assert h_inv == b_inv, f"_coerce_nonneg_int({v!r}): HEAD {h_inv!r} != base {b_inv!r}"
+        # OPT-IN safe variants never crash; match base where base did not crash.
+        s_rt = rt._coerce_int_safe(v)
+        s_inv = inv._coerce_nonneg_int_safe(v)
+        if b_rt_crash:
+            assert s_rt is None, f"_coerce_int_safe({v!r}): base crashed, safe must be None, got {s_rt!r}"
+        else:
+            assert s_rt == b_rt, f"_coerce_int_safe({v!r}): {s_rt!r} != base {b_rt!r}"
+        if b_inv_crash:
+            assert s_inv is None, f"_coerce_nonneg_int_safe({v!r}): base crashed, safe must be None, got {s_inv!r}"
+        else:
+            assert s_inv == b_inv, f"_coerce_nonneg_int_safe({v!r}): {s_inv!r} != base {b_inv!r}"
 
 
 def test_fix2_strict_runtime_gate_agrees_with_optin_master_gate():
@@ -2957,6 +3039,166 @@ def test_fix6_dispatch_gate_byte_identical_for_non_strict_board(fresh_home):
         assert "side_effect_forbidden" not in codes
 
 
+# ===========================================================================
+# ROUND-6 FIX 3: the dispatch-gate '' sentinel asymmetry. Under strict, the
+# DISPATCH gate (_side_effect_and_approval_blockers) must mirror the reactive
+# gate: an action that DECLARED a side_effect_class which normalizes away to
+# empty/NULL (but is NOT explicit 'none') is routed (via the SAME
+# _canonical_side_effect_class_for_persist sentinel logic) to the dropped marker
+# -> treated as unrecognized -> defer/block, instead of the early `if not sec:
+# return blockers`. Non-strict / genuinely-absent class -> byte-identical to base.
+# ===========================================================================
+
+
+@pytest.mark.parametrize("sentinel", ["null", "-", "", "   "])
+def test_fix3_dispatch_gate_strict_declared_sentinel_defers(fresh_home, sentinel):
+    """ROUND-6 FIX 3: under strict, a DECLARED sentinel side_effect_class
+    ('' / 'null' / '-' / whitespace) that normalizes away (but is not 'none') is
+    routed to the dropped marker and DEFERS at dispatch (unrecognized fail-CLOSED),
+    mirroring the reactive gate -- instead of the early `if not sec: return`.
+
+    Mutation check: revert FIX 3 (keep the unconditional early return) and the
+    sentinel returns no blocker -> the worker dispatches UNGATED under strict, so
+    this assertion fails."""
+    # Direct probe of the gate function: a declared sentinel under strict yields the
+    # unrecognized-strict blocker; a non-strict board yields NONE (base-identical).
+    from tests.hermes_cli.test_kanban_contract_runtime import _contract as _crc
+
+    class _FakeTask:
+        action_key = "research"
+        assignee = "mock-worker"
+        id = "t1"
+        task_id = "t1"
+
+    strict_contract = _crc(side_effect_class="none")
+    strict_contract["side_effect_policy"]["strict"] = True
+    strict_contract["side_effect_class"] = sentinel  # the DECLARED, resolved class
+    # Build a fresh board to host the dispatch-gate call.
+    _cr_create_contract_board(strict_contract)
+    with kb.connect(board="serious") as conn:
+        blockers = kb._side_effect_and_approval_blockers(
+            conn,
+            task=_FakeTask(),
+            contract=strict_contract,
+            side_effect_class=sentinel,
+            board="serious",
+        )
+        codes = {b["code"] for b in blockers}
+        assert "side_effect_unrecognized_strict" in codes, (
+            f"a declared sentinel {sentinel!r} must DEFER under strict at dispatch"
+        )
+
+
+@pytest.mark.parametrize("sentinel", ["null", "-", "", "   "])
+def test_fix3_dispatch_gate_non_strict_sentinel_byte_identical_to_base(fresh_home, sentinel):
+    """ROUND-6 FIX 3: a NON-STRICT board's dispatch gate is byte-identical to base
+    for the SAME declared sentinel -- the early `if not sec: return blockers` fires
+    verbatim (no marker logic off the strict path), so NO side-effect blocker is
+    produced.
+
+    Mutation check: if the sentinel logic ran off the strict path it would produce a
+    blocker here -> this fails."""
+    from tests.hermes_cli.test_kanban_contract_runtime import _contract as _crc
+
+    class _FakeTask:
+        action_key = "research"
+        assignee = "mock-worker"
+        id = "t1"
+        task_id = "t1"
+
+    contract = _crc(side_effect_class="none")  # NON-strict (no policy.strict)
+    contract["side_effect_class"] = sentinel
+    _cr_create_contract_board(contract)
+    with kb.connect(board="serious") as conn:
+        blockers = kb._side_effect_and_approval_blockers(
+            conn,
+            task=_FakeTask(),
+            contract=contract,
+            side_effect_class=sentinel,
+            board="serious",
+        )
+        codes = {b["code"] for b in blockers}
+        assert "side_effect_unrecognized_strict" not in codes
+        assert "approval_gate_unsatisfied" not in codes
+        assert "side_effect_forbidden" not in codes
+
+
+def test_fix3_dispatch_gate_genuinely_absent_and_none_fire_base_identical(fresh_home):
+    """ROUND-6 FIX 3: a genuinely-absent class (None) and an explicit benign 'none'
+    both hit the BASE early return (no blocker) under strict AND non-strict -- the
+    sentinel logic fires ONLY for a DECLARED non-'none' value that normalizes away.
+
+    Mutation check: if the sentinel logic mis-classified None/'none' it would defer a
+    genuinely-safe action -> this fails."""
+    from tests.hermes_cli.test_kanban_contract_runtime import _contract as _crc
+
+    class _FakeTask:
+        action_key = "research"
+        assignee = "mock-worker"
+        id = "t1"
+        task_id = "t1"
+
+    # One board hosts the gate-function calls (the gate is a pure function of
+    # conn + the passed contract/class, so we vary the contract dict directly).
+    base = _crc(side_effect_class="none")
+    _cr_create_contract_board(base)
+    with kb.connect(board="serious") as conn:
+        for strict in (True, False):
+            for cls in (None, "none", "None"):
+                contract = _crc(side_effect_class="none")
+                if strict:
+                    contract["side_effect_policy"]["strict"] = True
+                contract["side_effect_class"] = cls
+                blockers = kb._side_effect_and_approval_blockers(
+                    conn,
+                    task=_FakeTask(),
+                    contract=contract,
+                    side_effect_class=cls,
+                    board="serious",
+                )
+                codes = {b["code"] for b in blockers}
+                assert "side_effect_unrecognized_strict" not in codes, (
+                    f"strict={strict} cls={cls!r}: genuinely-absent/'none' must NOT defer"
+                )
+
+
+def test_fix3_dispatch_and_reactive_gates_agree_on_sentinel(fresh_home):
+    """ROUND-6 FIX 3: the dispatch gate and the reactive gate now AGREE on a
+    declared sentinel under strict -- BOTH defer with the unrecognized-strict
+    reason. This pins the symmetry the fix establishes (both reuse the
+    _canonical_side_effect_class_for_persist sentinel logic)."""
+    from tests.hermes_cli.test_kanban_contract_runtime import _contract as _crc
+
+    class _FakeTask:
+        action_key = "research"
+        assignee = "mock-worker"
+        id = "t1"
+        task_id = "t1"
+
+    # Reactive side: a strict loop with an authored sentinel persists the dropped
+    # marker and defers (already covered by test_fixC_* ; re-asserted here for the
+    # symmetry claim).
+    contract = _strict_contract("", strict=True)
+    _approve("reactside", contract)
+    with kb.connect(board="reactside") as conn:
+        row = _schedule_row(conn, board="reactside")
+        assert row["side_effect_class"] == kb._SIDE_EFFECT_CLASS_DROPPED_DB_MARKER
+        res = kb.reactive_tick(conn, now=int(row["next_fire_at"]), board="reactside")
+        assert res["deferred"] == [
+            {"loop_key": "seller_follow_up", "reason": "side_effect_unrecognized_strict"}
+        ]
+    # Dispatch side: the SAME sentinel under strict defers with the SAME reason.
+    disp = _crc(side_effect_class="none")
+    disp["side_effect_policy"]["strict"] = True
+    disp["side_effect_class"] = ""
+    _cr_create_contract_board(disp)
+    with kb.connect(board="serious") as conn:
+        blockers = kb._side_effect_and_approval_blockers(
+            conn, task=_FakeTask(), contract=disp, side_effect_class="", board="serious",
+        )
+        assert "side_effect_unrecognized_strict" in {b["code"] for b in blockers}
+
+
 # ---------------------------------------------------------------------------
 # Round-5 dispatch-gate helpers. Reuse the contract-runtime test's fully
 # dispatch-ready contract (so the only variable is side_effect_class + strict).
@@ -3028,45 +3270,59 @@ def _fuzz_legacy_contract(*, bound_key=None, bound_value=None, strict_value=None
     return contract
 
 
-def test_overarching_round5_byte_identity_fuzz_max_nudges():
-    """ROUND-5 byte-identity: a NON-OPTED contract carrying max_nudges across the
-    full fuzz vector has invariants errors/warnings + business-contract hash
-    byte-identical to base 019271994. max_nudges is NOT a step-9 opt-in key, so
-    the contract never opts in regardless of the (malformed) value."""
-    base_inv = _load_base_module("base_inv_r5_nudges", "hermes_cli/kanban_launch_invariants.py")
-    base_kb = _load_base_module("base_kb_r5_nudges", "hermes_cli/kanban_db.py")
+def test_overarching_round6_byte_identity_fuzz_max_nudges():
+    """OVERARCHING DIRECT PROOF: a NON-OPTED contract carrying max_nudges across the
+    full fuzz vector has check_contract_invariants (errors/warnings/ok) AND
+    business-contract hash byte-identical to base 019271994 -- INCLUDING raising
+    EXACTLY where base raises ('³'/'①' propagate through the shared, non-opted
+    _coerce_nonneg_int). max_nudges is NOT a step-9 opt-in key, so the contract
+    never opts in regardless of the (malformed) value."""
+    base_inv = _load_base_module("base_inv_r6_nudges", "hermes_cli/kanban_launch_invariants.py")
+    base_kb = _load_base_module("base_kb_r6_nudges", "hermes_cli/kanban_db.py")
     for v in _FUZZ_BOUND_VALUES:
         contract = _fuzz_legacy_contract(bound_key="max_nudges", bound_value=v)
         assert grammar.contract_opts_into_step9(contract) is False, v
-        b = base_inv.check_contract_invariants(contract)
-        h = inv.check_contract_invariants(contract)
-        assert h.errors == b.errors, f"max_nudges={v!r}: ERRORS diverged from base"
-        assert h.warnings == b.warnings, f"max_nudges={v!r}: WARNINGS diverged from base"
-        assert h.ok == b.ok, f"max_nudges={v!r}: report.ok diverged from base"
+        # check_contract_invariants must crash EXACTLY where base crashes.
+        try:
+            b = base_inv.check_contract_invariants(contract)
+            b_crash = False
+        except Exception:
+            b_crash = True
+        try:
+            h = inv.check_contract_invariants(contract)
+            h_crash = False
+        except Exception:
+            h_crash = True
+        assert h_crash == b_crash, f"max_nudges={v!r}: crash {h_crash} != base {b_crash}"
+        if not b_crash:
+            assert h.errors == b.errors, f"max_nudges={v!r}: ERRORS diverged from base"
+            assert h.warnings == b.warnings, f"max_nudges={v!r}: WARNINGS diverged from base"
+            assert h.ok == b.ok, f"max_nudges={v!r}: report.ok diverged from base"
+        # The business-contract hash never runs the checker -> always defined and
+        # byte-identical to base.
         assert kb._business_contract_hash(contract) == base_kb._business_contract_hash(contract), (
             f"max_nudges={v!r}: business-contract hash diverged from base"
         )
 
 
-def test_overarching_round5_byte_identity_fuzz_max_defers():
-    """ROUND-5 byte-identity: a contract carrying max_defers across the full fuzz
+def test_overarching_round6_byte_identity_fuzz_max_defers():
+    """ROUND-6 byte-identity: a contract carrying max_defers across the full fuzz
     vector. NOTE: max_defers IS a step-9 opt-in key, so a contract that declares it
-    OPTS IN -- which is the intended behavior (the opt-in path may legitimately
-    differ from base). We therefore assert byte-identity ONLY for the value that
-    does NOT make a usable bound AND stays non-opted is impossible here; instead we
-    assert the OPT-IN behavior is consistent and never CRASHES across the vector
-    (no '³'/'①' crash), and that the hash is invariant to the (stripped) invariants
-    report."""
-    base_kb = _load_base_module("base_kb_r5_defers", "hermes_cli/kanban_db.py")
+    OPTS IN -- which is the intended behavior. The OPT-IN path is crash-SAFE (the
+    safe coercion catches '³'/'①'), so check_contract_invariants must NEVER crash
+    across the vector. The business hash is base-identical because a plain contract
+    (no persisted invariants/completeness block) hashes identically to base."""
+    base_kb = _load_base_module("base_kb_r6_defers", "hermes_cli/kanban_db.py")
     for v in _FUZZ_BOUND_VALUES:
         contract = _fuzz_legacy_contract(bound_key="max_defers", bound_value=v)
-        # max_defers present => opted in (intended). Must not crash.
+        # max_defers present => opted in (intended). The opt-in intake path is
+        # crash-SAFE -> must not raise on '³'/'①'.
         assert grammar.contract_opts_into_step9(contract) is True, v
-        rep = inv.check_contract_invariants(contract)  # must not raise on '³'/'①'
+        rep = inv.check_contract_invariants(contract)  # must not raise (opt-in safe)
         assert isinstance(rep.errors, list)
-        # FIX A: the hash is invariant to the invariants report, so even an
-        # opted-in contract's business hash equals base (the step-9 finding lives
-        # only in the stripped invariants block).
+        # The hash never carries an invariants/completeness block here, so it equals
+        # base byte-for-byte (the opt-in finding lives only in the report, which is
+        # NOT persisted into this contract dict).
         assert kb._business_contract_hash(contract) == base_kb._business_contract_hash(contract), (
             f"max_defers={v!r}: business-contract hash diverged from base"
         )
@@ -3099,25 +3355,26 @@ def test_overarching_round5_byte_identity_fuzz_strict():
         )
 
 
-def test_overarching_round5_compiled_columns_byte_identical(fresh_home):
-    """ROUND-5 byte-identity: the COMPILED runtime columns (max_nudges persisted on
-    the timer schedule) for a NON-OPTED contract match what base 019271994 would
-    compile, across the fuzz vector. A non-opted max_nudges bound is read by the
-    SAME (reverted, base-exact) ``loop_max_nudges`` -> ``_coerce_int``, so '+5' /
-    '1_000' compile to NULL (rejected, base-exact), '5' to 5, '-0'/'-1' rejected
-    by the >=0 gate, etc."""
-    base_rt = _load_base_module("base_rt_r5_cols", "hermes_cli/kanban_reactive_runtime.py")
+def test_overarching_round6_compiled_columns_byte_identical(fresh_home):
+    """OVERARCHING DIRECT PROOF: the COMPILED runtime cap (``loop_max_nudges``) for a
+    NON-OPTED contract matches base 019271994 EXACTLY across the fuzz vector,
+    INCLUDING raising where base raises. A non-opted max_nudges bound is read by the
+    SAME (reverted, base-verbatim) ``loop_max_nudges`` -> ``_coerce_int``, so '+5' /
+    '1_000' -> None (rejected, base-exact), '5' -> 5, '-0'/'-1' rejected by the >=0
+    gate, and '³'/'①' RAISE (base-verbatim -> the per-loop compile DROPS the loop)."""
+    base_rt = _load_base_module("base_rt_r6_cols", "hermes_cli/kanban_reactive_runtime.py")
     for v in _FUZZ_BOUND_VALUES:
         loop = {"max_nudges": v}
-        # HEAD and base loop_max_nudges agree (the helper is base-exact); a
-        # base-CRASH char ('³'/'①') -> None on HEAD (no crash) vs base CRASH.
         try:
             b = base_rt.loop_max_nudges(loop)
             b_crash = False
         except Exception:
             b, b_crash = None, True
-        h = rt.loop_max_nudges(loop)
-        if b_crash:
-            assert h is None, f"max_nudges={v!r}: base crashed, HEAD must compile None"
-        else:
+        try:
+            h = rt.loop_max_nudges(loop)
+            h_crash = False
+        except Exception:
+            h, h_crash = None, True
+        assert h_crash == b_crash, f"max_nudges={v!r}: crash {h_crash} != base {b_crash}"
+        if not b_crash:
             assert h == b, f"max_nudges={v!r}: compiled cap HEAD {h!r} != base {b!r}"
