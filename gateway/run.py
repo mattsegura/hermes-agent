@@ -5738,8 +5738,16 @@ class GatewayRunner:
                 # bounds) tune it autonomously. Self-throttling so it does not
                 # thrash the knob every tick. Best-effort — an optimizer hiccup
                 # must never stop the dispatcher from spawning workers.
+                # G5-B: auto-revert is a DEFAULT-ON safety net (a regressive
+                # autonomous knob write must be rollback-able). Resolve it
+                # explicitly (env > config.yaml kanban.optimizer_auto_revert >
+                # default-True) and pass it, so the gateway's behaviour is visible
+                # rather than relying on the call-site default.
                 try:
-                    _kb.optimizer_tick(conn, board=slug)
+                    _kb.optimizer_tick(
+                        conn, board=slug,
+                        auto_revert=_kb._auto_revert_enabled(None),
+                    )
                 except Exception as exc:
                     tick_ok = False
                     try:

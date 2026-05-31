@@ -717,16 +717,19 @@ def test_canary_reverts_regression_when_enabled(fresh_home):
 
 
 def test_canary_no_op_when_flag_off(fresh_home):
-    """Default-off: optimizer_tick does NOT run the canary (no revert path)."""
+    """Opt-out: with auto_revert explicitly off optimizer_tick does NOT run the
+    canary (no revert path). G5-B made the default ON, so the opt-out is now
+    explicit (``auto_revert=False``) rather than implicit."""
     slug = "canary-off"
     _make_board(slug, {"default": 72, "allowed": [48, 72]})
     base = 7_000_000
     hold = kb.OPTIMIZER_CANARY_HOLD_SECONDS
     with kb.connect(board=slug) as conn:
         _setup_regression(conn, slug, base)
-        # Flag off (default) -> the tick never enters the canary branch.
+        # Explicit opt-out -> the tick never enters the canary branch.
         res = kb.optimizer_tick(
             conn, board=slug, now=base + hold + 100, rng=random.Random(0),
+            auto_revert=False,
         )
         assert res.get("reverted") == []
 

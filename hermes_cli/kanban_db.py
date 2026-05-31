@@ -18137,15 +18137,16 @@ OPTIMIZER_MIN_NEW_OUTCOMES: int = 5
 KNOB_UPDATE_GATE_PREFIX: str = "knob_update"
 
 # ---------------------------------------------------------------------------
-# E4 canary + auto-revert (default-off).
+# E4 canary + auto-revert (G5-B: default-ON safety net).
 #
 # When the optimizer applies an in-bounds knob change it is a CANARY: if the
 # board's reward trend does not improve over a hold window after the change, a
 # later tick auto-reverts the knob to the last-known-good ``old_value`` (already
 # stored on the ``applied`` ``board_knob_audit`` row) and records a ``reverted``
-# audit row. This is BEHIND A DEFAULT-OFF FLAG because it changes existing
-# behaviour (a change that used to stick can now be rolled back); enable it with
-# env ``HERMES_OPTIMIZER_AUTO_REVERT=1`` (or pass ``auto_revert=True`` to
+# audit row. As of G5-B this is ON BY DEFAULT: a regressive autonomous knob
+# write to a live contract must always be rollback-able. Owners can opt OUT via
+# env ``HERMES_OPTIMIZER_AUTO_REVERT=0`` or config.yaml
+# ``kanban.optimizer_auto_revert: false`` (or pass ``auto_revert=False`` to
 # ``optimizer_tick``). With the flag off the canary is a pure no-op.
 # ---------------------------------------------------------------------------
 
@@ -18162,7 +18163,9 @@ OPTIMIZER_CANARY_MIN_OUTCOMES: int = 4
 #: improvement; otherwise the change is "did not improve" and is reverted.
 OPTIMIZER_CANARY_IMPROVE_EPSILON: float = 0.0
 
-#: Env flag that opts a board's optimizer ticks into E4 auto-revert. Default-off.
+#: Env flag overriding a board's optimizer auto-revert. Truthy enables, falsy
+#: (``0``/``false``/``no``/``off``) disables. Unset falls through to config.yaml
+#: ``kanban.optimizer_auto_revert`` then the G5-B default (ON).
 OPTIMIZER_AUTO_REVERT_ENV: str = "HERMES_OPTIMIZER_AUTO_REVERT"
 
 # ---------------------------------------------------------------------------
@@ -18929,16 +18932,40 @@ def _optimizer_should_reevaluate(
 
 
 def _auto_revert_enabled(auto_revert: Optional[bool]) -> bool:
-    """Resolve the E4 auto-revert flag: explicit arg wins, else the env flag.
+    """Resolve the E4 auto-revert flag with precedence: arg > env > config > default.
 
-    Default-off: returns ``False`` unless the caller explicitly passes
-    ``auto_revert=True`` or the ``HERMES_OPTIMIZER_AUTO_REVERT`` env var is set
-    to a truthy value (``1``/``true``/``yes``/``on``).
+    G5-B default-ON: auto-revert is now a safety default, not an opt-in. A
+    regressive autonomous knob write to a live contract must be rollback-able,
+    so unless an owner explicitly turns it off this returns ``True``.
+
+    Resolution order (first that is set wins):
+      1. Explicit ``auto_revert`` argument (caller override).
+      2. Env ``HERMES_OPTIMIZER_AUTO_REVERT`` (truthy ``1``/``true``/``yes``/``on``,
+         falsy ``0``/``false``/``no``/``off``).
+      3. config.yaml ``kanban.optimizer_auto_revert`` (bool/str).
+      4. Default ``True``.
     """
     if auto_revert is not None:
         return bool(auto_revert)
-    raw = os.environ.get(OPTIMIZER_AUTO_REVERT_ENV, "")
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+    raw = os.environ.get(OPTIMIZER_AUTO_REVERT_ENV)
+    if raw is not None and str(raw).strip() != "":
+        token = str(raw).strip().lower()
+        if token in {"1", "true", "yes", "on"}:
+            return True
+        if token in {"0", "false", "no", "off"}:
+            return False
+        # Unrecognized token: fall through to config/default rather than guess.
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        kb_cfg = cfg.get("kanban") if isinstance(cfg, dict) else None
+        val = (kb_cfg or {}).get("optimizer_auto_revert") if isinstance(kb_cfg, dict) else None
+    except Exception:  # pragma: no cover - config is optional
+        val = None
+    if val is not None:
+        return _coerce_bool(val)
+    return True
 
 
 def _last_applied_knob_change(
@@ -19137,11 +19164,16 @@ def optimizer_tick(
     E3: ALL present managed knobs are tuned each tick (not just the first
     ``select_managed_knob`` result); the per-knob math is unchanged.
 
-    E4 (default-off): when auto-revert is enabled (``auto_revert=True`` or env
-    ``HERMES_OPTIMIZER_AUTO_REVERT``), a canary check runs FIRST per knob -- a
-    previously-applied change whose reward trend did not improve over the hold
-    window is rolled back to the last-known-good value (recorded ``reverted``).
-    With the flag off this is a pure no-op, so existing behaviour is unchanged.
+    E4 (G5-B default-ON): when auto-revert is enabled (the default; resolved via
+    ``auto_revert`` arg > env ``HERMES_OPTIMIZER_AUTO_REVERT`` > config.yaml
+    ``kanban.optimizer_auto_revert`` > default-True), a canary check runs FIRST
+    per knob -- a previously-applied change whose reward trend did not improve
+    over the hold window is rolled back to the last-known-good value (recorded
+    ``reverted``). When explicitly disabled this is a pure no-op.
+
+    G5-A kill-switch: if the board's ``runtime.optimizer_policy.disabled`` is set,
+    the tick short-circuits with a single ``optimizer_disabled`` skip and writes
+    NO knobs (no propose, no apply, no canary).
     """
     from hermes_cli import kanban_optimizer as _opt
 
@@ -19178,6 +19210,16 @@ def optimizer_tick(
         result["skipped"].append({"knob": knob, "reason": "contract_read_failed"})
         result["error"] = str(exc)
         return result
+    # G5-A real kill-switch: an owner who sets ``runtime.optimizer_policy.disabled``
+    # must get ZERO autonomous knob writes. This used to be honored ONLY by the
+    # contract validator -- ``optimizer_tick`` ignored it, so a "disabled" board
+    # was still tuned (an autonomous-action fail-open). Short-circuit HERE, before
+    # any propose/apply (and before the canary), reusing the same resolution the
+    # validator uses (``_optimizer_policy_disabled_state``).
+    runtime = contract.get("runtime") if isinstance(contract.get("runtime"), dict) else {}
+    if _optimizer_policy_disabled_state(runtime)["disabled"]:
+        result["skipped"].append({"knob": knob, "reason": "optimizer_disabled"})
+        return result
     # E3 multi-knob tick: tune EVERY present managed knob, not just the first
     # ``select_managed_knob`` result. Mirrors the read-model loop in
     # ``build_learned_state_read_model`` (filter ``OPTIMIZER_MANAGED_KNOBS`` by
@@ -19196,7 +19238,7 @@ def optimizer_tick(
         return result
 
     for target in targets:
-        # E4 canary (default-off): judge the last applied change FIRST. A
+        # E4 canary (G5-B default-ON): judge the last applied change FIRST. A
         # regression is rolled back to the last-known-good value; when a revert
         # fires we skip re-tuning this knob this tick (let the reverted value
         # bake before proposing again). Best-effort -- a canary hiccup must never
