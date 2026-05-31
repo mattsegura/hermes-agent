@@ -46,6 +46,24 @@ except Exception:  # pragma: no cover - keep the module loadable if grammar impo
     _grammar_has_inbound = None  # type: ignore
 
 
+# Canonical dimension keys (worst-first). The dispatch gate enforces a configured
+# SUBSET of these (see kanban_db._launch_completeness_enforced_dimensions); the
+# rest stay advisory/report-mode. "invariants" is the always-on structural
+# checker (check_contract_invariants); the others are the net-new audit rules.
+# Single source of truth for the gate's per-dimension enforce flip + "all".
+DIMENSIONS: tuple[str, ...] = (
+    "invariants",
+    "side_effect_class_coverage",
+    "event_loop_termination",
+    "success_scoreability",
+    "evidence_namespace",
+    "win_signal_rail",
+    "tunable_consumer_binding",
+    "stage_reachability",
+    "distinct_terminals",
+)
+
+
 # --- net-new dimension D: success must be scoreable (mirrors the A1 helper) ---
 _SCOREABLE_SUCCESS_RE = re.compile(
     r"(\d|%|\$|>=|<=|>|<|\bat least\b|\bat most\b|\bper\b|\bwithin\b|\brate\b|"

@@ -1991,6 +1991,69 @@ def _success_entry_is_scoreable(entry: Any) -> bool:
     return bool(_SCOREABLE_SUCCESS_RE.search(text))
 
 
+def _launch_completeness_enforced_dimensions() -> frozenset[str]:
+    """Which LaunchCompletenessSpec dimensions are ENFORCED at the dispatch gate.
+
+    A finding in an *enforced* dimension is promoted from an advisory warning to
+    a readiness ERROR -- so ``board_dispatch_gate`` blocks dispatch on it (a
+    distinct ``launch_completeness_failed`` blocker). This is the keystone seam:
+    the gate finally consults the ONE unified spec, not just the presence checker.
+
+    DEFAULT EMPTY = pure report mode. Landing the seam therefore changes NO
+    runtime behavior; every dimension stays advisory until it is explicitly
+    flipped on AFTER a report-mode soak proves the live boards produce zero
+    would-block findings. Dimensions flip ONE AT A TIME -- this is the soak
+    control surface, never a big-bang enable.
+
+    Sources (first wins): env ``HERMES_LAUNCH_COMPLETENESS_ENFORCE`` (comma-list
+    of dimension names, or ``all``), else config.yaml
+    ``kanban.launch_completeness_enforce`` (list or comma-string). Unknown names
+    are ignored (a typo cannot silently enforce nothing-or-everything).
+    """
+    try:
+        from hermes_cli.launch_completeness import DIMENSIONS as _ALL_DIMS
+        valid = frozenset(_ALL_DIMS)
+    except Exception:  # pragma: no cover - defensive
+        valid = frozenset()
+    raw = os.environ.get("HERMES_LAUNCH_COMPLETENESS_ENFORCE")
+    if raw is None:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+            kb_cfg = cfg.get("kanban") if isinstance(cfg, dict) else None
+            val = (kb_cfg or {}).get("launch_completeness_enforce") if isinstance(kb_cfg, dict) else None
+            if isinstance(val, str):
+                raw = val
+            elif isinstance(val, (list, tuple, set)):
+                raw = ",".join(str(x) for x in val)
+        except Exception:  # pragma: no cover - config is optional
+            raw = None
+    if not raw:
+        return frozenset()
+    tokens = {t.strip() for t in str(raw).split(",") if t.strip()}
+    if any(t.lower() == "all" for t in tokens):
+        return valid
+    return frozenset(t for t in tokens if t in valid) if valid else frozenset(tokens)
+
+
+def _completeness_blocking_findings(report: Optional[dict], enforced_dims) -> list[str]:
+    """The launch-completeness findings that should BLOCK the gate, given the
+    configured enforced dimension set. Shared by ``validate_business_runtime_contract``
+    (readiness errors) and the degraded-fallback telemetry so both agree on what
+    "would block". Invariant findings are stored ``error:``/``warning:``-prefixed;
+    only the structural errors block (invariant warnings stay advisory)."""
+    blocking: list[str] = []
+    dims = (report or {}).get("dimensions") or {}
+    for dim in enforced_dims:
+        info = dims.get(dim) or {}
+        for finding in info.get("findings", []) or []:
+            if dim == "invariants" and not str(finding).startswith("error:"):
+                continue
+            blocking.append(f"[{dim}] {finding}")
+    return blocking
+
+
 def validate_business_runtime_contract(
     contract: Optional[Any],
     *,
@@ -2160,9 +2223,25 @@ def validate_business_runtime_contract(
         from hermes_cli.launch_completeness import assess_launch_completeness
 
         _completeness = assess_launch_completeness(normalized, enforce=False)
+        # Report visibility (unchanged): every finding is surfaced as a warning.
         for _finding in list(_completeness.get("errors", [])) + list(_completeness.get("warnings", [])):
             if _finding not in warnings:
                 warnings.append(_finding)
+        # KEYSTONE enforce seam: a finding in a configured-ENFORCED dimension is
+        # promoted to a hard readiness error so board_dispatch_gate blocks on it
+        # (a distinct launch_completeness_failed blocker). The default-EMPTY
+        # enforced set leaves `errors` byte-identical to before -> zero runtime
+        # behavior change until a dimension is flipped on after a report soak.
+        _enforced_dims = _launch_completeness_enforced_dimensions()
+        _completeness_blocking = _completeness_blocking_findings(_completeness, _enforced_dims)
+        for _msg in _completeness_blocking:
+            if _msg not in errors:
+                errors.append(_msg)
+        _completeness = dict(_completeness)
+        _completeness["enforced_dimensions"] = sorted(_enforced_dims)
+        _completeness["blocking"] = _completeness_blocking
+        if _completeness_blocking and status != "invalid":
+            status = "invalid"
     except Exception as _exc:  # pragma: no cover - defensive
         _completeness = {"ok": True, "errors": [], "warnings": [], "dimensions": {}, "unavailable": repr(_exc)}
 
@@ -3803,6 +3882,15 @@ def _run_degraded_fallback_through_completeness(
         from hermes_cli.launch_completeness import assess_launch_completeness
 
         report = assess_launch_completeness(contract, enforce=False)
+        # Annotate with the same enforced-dimension view the gate uses, so a soak
+        # observer can see what WOULD block this degraded draft at dispatch time.
+        # The degraded fallback itself stays non-blocking (its documented contract);
+        # the REAL enforcement happens when the stored contract hits the gate's
+        # validate_business_runtime_contract, so a degraded draft cannot bypass it.
+        _enforced_dims = _launch_completeness_enforced_dimensions()
+        report = dict(report)
+        report["enforced_dimensions"] = sorted(_enforced_dims)
+        report["blocking"] = _completeness_blocking_findings(report, _enforced_dims)
     except Exception as exc:  # pragma: no cover - defensive: never break the fallback
         _log.warning(
             "launch_intake: degraded fallback completeness check raised: %r", exc
@@ -4994,6 +5082,21 @@ def board_dispatch_gate(board: Optional[str] = None) -> dict[str, Any]:
             "status": readiness.get("status"),
             "missing": readiness.get("missing") or [],
             "errors": readiness.get("errors") or [],
+        })
+    # KEYSTONE: surface a DISTINCT blocker when the failure is an ENFORCED
+    # launch-completeness dimension (not just a missing presence field), so the
+    # owner/optimizer can tell "structurally unsound per the unified spec" apart
+    # from "incomplete answers". Only populated when a dimension is flipped to
+    # enforce; default-empty enforced set => this blocker never appears.
+    _gate_completeness = readiness.get("completeness") if isinstance(readiness.get("completeness"), dict) else {}
+    _gate_completeness_blocking = _gate_completeness.get("blocking") or []
+    if managed and _gate_completeness_blocking:
+        blockers.append({
+            "code": "launch_completeness_failed",
+            "enforced_dimensions": _gate_completeness.get("enforced_dimensions") or [],
+            "findings": list(_gate_completeness_blocking),
+            "message": "managed board fails enforced launch-completeness dimension(s): "
+            + "; ".join(str(f) for f in _gate_completeness_blocking[:5]),
         })
     if managed and readiness.get("ok") and not launch_approved:
         blockers.append({
