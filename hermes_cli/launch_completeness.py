@@ -45,6 +45,35 @@ try:  # reuse the typed trigger grammar so "conversational" is detected the same
 except Exception:  # pragma: no cover - keep the module loadable if grammar import fails
     _grammar_has_inbound = None  # type: ignore
 
+try:  # the prose-specificity coverage scorer (H5: fold it in as a report-mode rail)
+    from hermes_cli.kanban_launch_coverage import (
+        DEFAULT_PASS_THRESHOLD as _COVERAGE_THRESHOLD,
+        evaluate_launch_intake_coverage as _evaluate_coverage,
+    )
+except Exception:  # pragma: no cover - keep the module loadable if coverage import fails
+    _COVERAGE_THRESHOLD = 0.6  # type: ignore
+    _evaluate_coverage = None  # type: ignore
+
+
+# Canonical dimension keys (worst-first). The dispatch gate enforces a configured
+# SUBSET of these (see kanban_db._launch_completeness_enforced_dimensions); the
+# rest stay advisory/report-mode. "invariants" is the always-on structural
+# checker (check_contract_invariants); the others are the net-new audit rules.
+# Single source of truth for the gate's per-dimension enforce flip + "all".
+DIMENSIONS: tuple[str, ...] = (
+    "invariants",
+    "side_effect_class_coverage",
+    "event_loop_termination",
+    "success_scoreability",
+    "evidence_namespace",
+    "win_signal_rail",
+    "tunable_consumer_binding",
+    "stage_reachability",
+    "distinct_terminals",
+    "answer_coverage",
+    "advisory_intent_gap",
+)
+
 
 # --- net-new dimension D: success must be scoreable (mirrors the A1 helper) ---
 _SCOREABLE_SUCCESS_RE = re.compile(
@@ -53,8 +82,74 @@ _SCOREABLE_SUCCESS_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A TYPED success entry (a dict) is first-class machine-gradeable: it carries the
+# metric, the comparator, the target, and where to read the value. These four
+# keys are the contract between the owner's objective and the scoreboard; a typed
+# entry that declares all four is scoreable WITHOUT any prose regex. Mirrors
+# kanban_db._TYPED_SUCCESS_REQUIRED_KEYS (kept local so this module stays
+# stdlib-only / engine-import-optional).
+_TYPED_SUCCESS_REQUIRED_KEYS: tuple[str, ...] = ("metric", "comparator", "target", "data_source")
+
+# The closed set of comparators the scoreboard can actually evaluate. Mirrors
+# kanban_db._TYPED_SUCCESS_COMPARATORS + the prose aliases it folds to symbols.
+# A comparator OUTSIDE this set means the typed entry is not machine-gradeable
+# (the scoreboard has no operator to apply) -> the entry is NOT scoreable.
+_TYPED_SUCCESS_COMPARATORS: frozenset[str] = frozenset({">=", "<=", ">", "<", "==", "!="})
+_TYPED_SUCCESS_COMPARATOR_ALIASES: tuple[str, ...] = ("at_least", "at_most")
+
+
+def _is_typed_success(entry: Any) -> bool:
+    """A success entry is *typed* when it is a dict that declares a ``metric``."""
+    return isinstance(entry, dict) and bool(str(entry.get("metric") or "").strip())
+
+
+def _comparator_is_valid(value: Any) -> bool:
+    """True when ``value`` is a comparator the scoreboard can evaluate (a symbolic
+    operator or a known prose alias). Normalization folds aliases to symbols, so
+    we accept either form here."""
+    if not isinstance(value, str):
+        return False
+    token = value.strip().lower()
+    text = value.strip()
+    return text in _TYPED_SUCCESS_COMPARATORS or token in _TYPED_SUCCESS_COMPARATOR_ALIASES
+
+
+def _typed_success_missing_keys(entry: dict) -> list[str]:
+    """Required keys a typed success entry is missing (empty/absent values count
+    as missing). A non-empty result means the entry is NOT scoreable.
+
+    FIX 6: a ``comparator`` that is present but OUTSIDE the known comparator set
+    is treated as missing (the scoreboard cannot grade an unknown operator), and
+    a non-scalar ``target`` (dict/list/...) is rejected by the isinstance guard
+    -- closing the laundering path where a repr-stringified non-scalar looked
+    scoreable."""
+    missing: list[str] = []
+    for key in _TYPED_SUCCESS_REQUIRED_KEYS:
+        val = entry.get(key)
+        # ``target`` may legitimately be the number 0; only treat None / blank
+        # string as missing, not a falsey-but-present numeric.
+        if val is None:
+            missing.append(key)
+        elif isinstance(val, str) and not val.strip():
+            missing.append(key)
+        elif not isinstance(val, (int, float, str, bool)):
+            # non-scalar target/value (dict/list/...) is not gradeable.
+            missing.append(key)
+        elif key == "comparator" and not _comparator_is_valid(val):
+            # present but unrecognized operator -> not scoreable.
+            missing.append(key)
+    return missing
+
 
 def _is_scoreable(entry: Any) -> bool:
+    """True when an entry can be machine-graded.
+
+    A typed entry (dict with ``metric``) is scoreable iff it declares every
+    required key; a prose string falls back to the existing measurable-target
+    regex heuristic.
+    """
+    if _is_typed_success(entry):
+        return not _typed_success_missing_keys(entry)
     text = str(entry or "").strip()
     return bool(text) and bool(_SCOREABLE_SUCCESS_RE.search(text))
 
@@ -137,6 +232,21 @@ _WIN_TERMINAL_TOKENS: tuple[str, ...] = (
     "completed", "complete", "fulfilled", "succeeded", "success", "approved",
 )
 
+# Explicit LOSS-class indicators. These are checked BEFORE the win-substring
+# logic so a failure terminal whose label happens to embed a win substring
+# (e.g. 'closed_lost' contains 'closed', 'disapproved' contains 'approved',
+# 'unsigned' contains 'sign', 'incomplete'/'not_completed' contain 'complete')
+# is correctly classified as NOT a win. Tokens are deliberately PRECISE so they
+# never collide with a legitimate win label: there is no bare 'un'/'no' prefix,
+# and bare 'lose' is intentionally OMITTED because it is a substring of
+# 'closed_won'/'closed'/'close' (only 'lost'/'loss' are used).
+_LOSS_TERMINAL_TOKENS: tuple[str, ...] = (
+    "lost", "loss", "closed_lost", "unsigned", "incomplete",
+    "not_completed", "not_complete", "disapprov", "disqualif", "reject",
+    "declin", "cancel", "abandon", "churn", "expired", "dead",
+    "failed", "fail", "withdrawn", "bounced",
+)
+
 
 def _terminal_state_tokens(loop: Any) -> list[str]:
     """Lowercased terminal-state labels for a loop/entity (str or dict shapes)."""
@@ -157,6 +267,12 @@ def _terminal_state_tokens(loop: Any) -> list[str]:
 
 def _looks_like_win(token: str) -> bool:
     t = (token or "").lower()
+    # A token that reads as a LOSS is never a win, even when it also embeds a
+    # win substring (closed_lost / disapproved / unsigned / incomplete / ...).
+    # This loss check runs FIRST so the optimizer is never rewarded for a
+    # loss-producing terminal outcome.
+    if any(tok in t for tok in _LOSS_TERMINAL_TOKENS):
+        return False
     return any(tok in t for tok in _WIN_TERMINAL_TOKENS)
 
 
@@ -257,6 +373,107 @@ def _proof_artifact_keys(contract: dict) -> set[str]:
     return produced
 
 
+# --- H5: answer_coverage report-mode rail ---------------------------------- #
+# Most contracts at gate time DO NOT carry the owner's raw intake answers, so
+# this dimension is a strict no-op unless the contract explicitly embeds the
+# coverage inputs the scorer needs. When it does (a stored intake snapshot kept
+# under launch_coverage/intake, or a bare top-level answers/rough_goal), we run
+# the deterministic prose-specificity scorer and emit a REPORT-ONLY warning when
+# the corpus scores below the coverage module's own pass threshold. The gate only
+# ever ENFORCES this if an owner adds "answer_coverage" to the enforce set; by
+# default it is advisory, mirroring the report-mode contract of the other
+# net-new dimensions.
+def _coverage_inputs(contract: dict) -> Optional[dict]:
+    """Pull the intake-answer corpus a contract may embed for coverage scoring.
+
+    Returns ``{"answers", "rough_goal", "external_research"}`` when the contract
+    carries usable coverage inputs, else ``None`` (the no-op signal). Looks under
+    a stored ``launch_coverage``/``intake`` snapshot first, then a bare top-level
+    ``answers``/``rough_goal`` (the shape the intake harness produces)."""
+    if not isinstance(contract, dict):
+        return None
+    for key in ("launch_coverage", "intake"):
+        snap = contract.get(key)
+        if isinstance(snap, dict) and (snap.get("answers") or snap.get("rough_goal")):
+            return {
+                "answers": snap.get("answers") if isinstance(snap.get("answers"), dict) else None,
+                "rough_goal": snap.get("rough_goal"),
+                "external_research": snap.get("external_research"),
+            }
+    answers = contract.get("answers")
+    rough_goal = contract.get("rough_goal")
+    if (isinstance(answers, dict) and answers) or rough_goal:
+        return {
+            "answers": answers if isinstance(answers, dict) else None,
+            "rough_goal": rough_goal,
+            "external_research": contract.get("external_research"),
+        }
+    return None
+
+
+# --- H6: advisory_intent_gap report-mode rail ------------------------------ #
+# objective.budget ({ceiling, currency, period}) and objective.definition_of_done
+# (str|list) are NORMALIZED + STORED (G4 era) but NOTHING reads budget as a spend
+# cap, and nothing grades definition_of_done against a terminal check. An owner who
+# declares a budget ceiling may FALSELY believe it is enforced -- a fail-open
+# expectation gap. Wiring budget into a real spend guard is out of scope (no
+# cost-tracking seam yet), so the honest move is to make the gap VISIBLE during
+# soak rather than silent. This dimension is:
+#   * a STRICT no-op when neither field is declared (so it never touches an
+#     existing contract or either golden, which declare neither),
+#   * report-mode only by default (added to DIMENSIONS; the gate enforces it ONLY
+#     if an owner explicitly adds "advisory_intent_gap" to the enforce set), and
+#   * false-positive-resistant: a declared budget is NOT flagged when the contract
+#     also declares a runtime ``budget``-kind sensor (the only budget-consuming
+#     mechanism that exists), because then the owner HAS wired a spend meter.
+# definition_of_done has NO grading seam at all, so a declared DoD is always
+# advisory-only and is always surfaced when present.
+def _budget_is_declared(objective: Any) -> bool:
+    """True when objective.budget declares a usable ceiling (a positive number).
+
+    Mirrors kanban_db._normalize_objective_budget: a bare number is a total-spend
+    ceiling; an object carries {ceiling, currency, period}. A budget whose ceiling
+    is absent / non-numeric / <= 0 is treated as not-declared (nothing to enforce),
+    so this never fires on an empty or malformed budget stub.
+    """
+    if not isinstance(objective, dict):
+        return False
+    budget = objective.get("budget")
+    if isinstance(budget, bool) or budget is None:
+        return False
+    if isinstance(budget, (int, float)):
+        return float(budget) > 0
+    if isinstance(budget, dict):
+        return _finite_number(budget.get("ceiling"))
+    return False
+
+
+def _dod_is_declared(objective: Any) -> bool:
+    """True when objective.definition_of_done carries a non-empty str or list."""
+    if not isinstance(objective, dict):
+        return False
+    dod = objective.get("definition_of_done")
+    if isinstance(dod, str):
+        return bool(dod.strip())
+    if isinstance(dod, (list, tuple)):
+        return any(isinstance(x, str) and x.strip() for x in dod)
+    return False
+
+
+def _has_budget_sensor(contract: dict) -> bool:
+    """True when the contract declares a runtime ``budget``-kind sensor.
+
+    The runtime budget sensor (a per-window rolling spend meter) is the ONLY
+    budget-consuming mechanism that exists, so its presence means the owner HAS
+    wired a real cap and objective.budget should NOT be flagged advisory. Reads
+    sensors top-level or under ``runtime`` (the two shapes _section handles) and
+    is stdlib-only (does not import kanban_db, keeping this module standalone)."""
+    for s in _as_list(_section(contract, "sensors")):
+        if isinstance(s, dict) and str(s.get("kind") or "").strip().lower() == "budget":
+            return True
+    return False
+
+
 def assess_launch_completeness(contract: Optional[dict], *, enforce: bool = False) -> dict:
     """Run the strong structural checks + the net-new completeness rules.
 
@@ -302,15 +519,26 @@ def assess_launch_completeness(contract: Optional[dict], *, enforce: bool = Fals
     workflow = contract.get("workflow") if isinstance(contract.get("workflow"), dict) else {}
 
     # --- D: success scoreability ---
-    succ = [s for s in _as_list(objective.get("success")) if str(s or "").strip()]
+    # A typed entry counts as present even if its dict has only a metric (it is
+    # judged scoreable/un-scoreable by _is_scoreable); a prose entry counts only
+    # when non-blank.
+    succ = [s for s in _as_list(objective.get("success")) if _is_typed_success(s) or str(s or "").strip()]
     unscoreable = [s for s in succ if not _is_scoreable(s)]
     f_succ: list[str] = []
     if not succ:
         f_succ.append("objective.success is empty")
     elif unscoreable:
+
+        def _why(entry: Any) -> str:
+            if _is_typed_success(entry):
+                missing = _typed_success_missing_keys(entry)
+                metric = str(entry.get("metric") or "?").strip() or "?"
+                return f"typed metric '{metric[:40]}' missing required key(s): {', '.join(missing)}"
+            return str(entry)[:80]
+
         f_succ.append(
             f"{len(unscoreable)}/{len(succ)} success criteria carry no measurable target the "
-            f"scoreboard can grade: " + "; ".join(str(u)[:80] for u in unscoreable[:3])
+            f"scoreboard can grade: " + "; ".join(_why(u) for u in unscoreable[:3])
             + (" ..." if len(unscoreable) > 3 else "")
         )
     emit("success_scoreability", f_succ)
@@ -507,6 +735,64 @@ def assess_launch_completeness(contract: Optional[dict], *, enforce: bool = Fals
         )
     emit("distinct_terminals", f_distinct)
 
+    # --- H5: answer_coverage (report-mode soft rail; no-op without inputs) ---
+    # Composes kanban_launch_coverage. NO-OP and never raises when the contract
+    # has no embedded intake corpus (the common gate-time case) or the coverage
+    # import failed; otherwise emits a report-only warning when the corpus scores
+    # below the coverage module's pass threshold.
+    cov_inputs = None
+    f_cov: list[str] = []
+    try:
+        cov_inputs = _coverage_inputs(contract)
+        if cov_inputs is not None and _evaluate_coverage is not None:
+            report = _evaluate_coverage(
+                cov_inputs.get("answers"),
+                external_research=cov_inputs.get("external_research"),
+                rough_goal=cov_inputs.get("rough_goal"),
+            )
+            score = float(getattr(report, "score", 0.0) or 0.0)
+            passed = bool(getattr(report, "passed", False))
+            threshold = float(getattr(report, "threshold", _COVERAGE_THRESHOLD) or _COVERAGE_THRESHOLD)
+            if not passed:
+                gaps = list(getattr(report, "gaps", []) or [])
+                f_cov.append(
+                    f"intake-answer coverage {score:.2f} is below the {threshold:.2f} pass "
+                    f"threshold -> the owner's answers underspecify: "
+                    + (", ".join(str(g) for g in gaps[:6]) if gaps else "(see coverage report)")
+                )
+    except Exception:  # pragma: no cover - defensive: coverage must never break the gate
+        cov_inputs = None
+        f_cov = []
+    if cov_inputs is not None:
+        emit("answer_coverage", f_cov)
+    else:
+        # no coverage inputs -> record an empty (clean) dimension without warning,
+        # so the dimension is always present in the report but never fires/regresses
+        dims["answer_coverage"] = {"findings": [], "enforced": enforce}
+
+    # --- H6: advisory_intent_gap (report-mode; no-op unless budget/DoD declared) ---
+    # Surfaces the declared-but-advisory expectation gap so it is visible during
+    # soak instead of silently fail-open. NO-OP (clean, no warning) whenever neither
+    # objective.budget nor objective.definition_of_done is declared -- which is the
+    # case for every existing contract and both goldens, so this can never regress
+    # them. A declared budget is exempt when a runtime budget sensor is also present
+    # (that IS the consuming mechanism); a declared definition_of_done is always
+    # surfaced because no DoD-grading seam exists yet.
+    f_advisory: list[str] = []
+    if _budget_is_declared(objective) and not _has_budget_sensor(contract):
+        f_advisory.append(
+            "objective.budget declares a spend ceiling but no budget-consuming "
+            "mechanism is wired (no runtime 'budget' sensor) -> the ceiling is "
+            "ADVISORY (owner-facing intent), NOT a runtime-enforced cap."
+        )
+    if _dod_is_declared(objective):
+        f_advisory.append(
+            "objective.definition_of_done is declared but nothing grades it against "
+            "a terminal check -> it is ADVISORY (owner-facing intent), NOT a "
+            "runtime-enforced completion gate."
+        )
+    emit("advisory_intent_gap", f_advisory)
+
     return {"ok": not errors, "errors": errors, "warnings": warnings, "dimensions": dims}
 
 
@@ -572,6 +858,41 @@ if __name__ == "__main__":
     # 5. enforce-mode turns net-new findings into hard errors (ok=False)
     r5 = assess_launch_completeness(c1, enforce=True)
     check("enforce-mode makes prose success a hard error", (not r5["ok"]) and any("success_scoreability" in e for e in r5["errors"]), str(r5))
+
+    print("== G4 PART 1: typed objective.success entries are first-class scoreable ==")
+    # typed (all required keys) -> scoreable, no success_scoreability warn
+    cT = json.loads(json.dumps(base))
+    cT["objective"]["success"] = [{"metric": "mrr", "comparator": ">=", "target": 12000, "data_source": "Stripe"}]
+    rT = assess_launch_completeness(cT)
+    check("well-formed typed success does NOT warn", not any("success_scoreability" in w for w in rT["warnings"]), str(rT["warnings"]))
+    # typed missing required keys -> warns and names them
+    cTm = json.loads(json.dumps(base)); cTm["objective"]["success"] = [{"metric": "mrr", "comparator": ">="}]
+    rTm = assess_launch_completeness(cTm)
+    cov_find = " ".join(rTm["dimensions"]["success_scoreability"]["findings"])
+    check("typed-missing-keys warns + names missing keys", "target" in cov_find and "data_source" in cov_find, cov_find)
+    # enforce promotes the malformed typed entry
+    rTe = assess_launch_completeness(cTm, enforce=True)
+    check("enforce promotes malformed typed success", (not rTe["ok"]) and any("success_scoreability" in e for e in rTe["errors"]), str(rTe))
+
+    print("== G4 PART 2: side_effect_class default-DENY (missing blocks; 'none' is valid) ==")
+    # action with 'none' class -> NOT a finding (valid read-only declaration)
+    cN = json.loads(json.dumps(base)); cN["workflow"]["stages"][0]["actions"].append({"key": "read_db", "side_effect_class": "none"})
+    rN = assess_launch_completeness(cN)
+    check("side_effect_class 'none' is valid (not flagged)", "read_db" not in " ".join(rN["dimensions"]["side_effect_class_coverage"]["findings"]), str(rN["dimensions"]["side_effect_class_coverage"]))
+    # missing class -> default-deny hard error under enforce
+    cMiss = json.loads(json.dumps(base)); cMiss["workflow"]["stages"][0]["actions"].append({"key": "send_sms"})
+    rMiss = assess_launch_completeness(cMiss, enforce=True)
+    check("missing side_effect_class is default-DENY under enforce", (not rMiss["ok"]) and any("side_effect_class_coverage" in e for e in rMiss["errors"]), str(rMiss))
+
+    print("== H5: answer_coverage report-mode rail (no-op without inputs) ==")
+    # no embedded intake corpus -> no-op
+    cCov = json.loads(json.dumps(base))
+    rCov = assess_launch_completeness(cCov)
+    check("answer_coverage is a no-op without coverage inputs", rCov["dimensions"].get("answer_coverage", {}).get("findings") == [], str(rCov["dimensions"].get("answer_coverage")))
+    # embedded weak intake corpus -> report-mode warning (ok stays True)
+    cCovW = json.loads(json.dumps(base)); cCovW["answers"] = {"q1": "do the thing", "q2": "make it good"}; cCovW["rough_goal"] = "grow my app"
+    rCovW = assess_launch_completeness(cCovW)
+    check("weak embedded intake warns answer_coverage (report-mode)", any("answer_coverage" in w for w in rCovW["warnings"]) and not any("answer_coverage" in e for e in rCovW["errors"]), str(rCovW["warnings"]))
 
     print("== net-new dimensions C + E: win-signal, evidence namespace, reachability, distinct terminals ==")
     # C1. conversational loop whose terminals carry NO win-class outcome -> warns
@@ -645,6 +966,24 @@ if __name__ == "__main__":
     cE3b = json.loads(json.dumps(cE3)); cE3b["event_loops"][0]["terminal_states"] = ["closed", "paused", "disqualified"]
     rE3b = assess_launch_completeness(cE3b)
     check("distinct terminals do not warn distinct_terminals", not any("distinct_terminals" in w for w in rE3b["warnings"]), str(rE3b["warnings"]))
+
+    print("== H6: advisory_intent_gap report-mode rail (no-op unless budget/DoD declared) ==")
+    # neither field declared -> strict no-op
+    cAdv0 = json.loads(json.dumps(base))
+    rAdv0 = assess_launch_completeness(cAdv0)
+    check("advisory_intent_gap no-op when nothing declared", rAdv0["dimensions"].get("advisory_intent_gap", {}).get("findings") == [], str(rAdv0["dimensions"].get("advisory_intent_gap")))
+    # declared budget, no budget sensor -> report-mode warning (never a hard error)
+    cAdvB = json.loads(json.dumps(base)); cAdvB["objective"]["budget"] = {"ceiling": 5000, "currency": "USD", "period": "total"}
+    rAdvB = assess_launch_completeness(cAdvB)
+    check("declared budget without sensor warns advisory_intent_gap (report-mode, not a hard error)", any("advisory_intent_gap" in w for w in rAdvB["warnings"]) and not any("advisory_intent_gap" in e for e in rAdvB["errors"]), str(rAdvB["warnings"]))
+    # declared budget WITH a budget sensor -> exempt (no warn)
+    cAdvBs = json.loads(json.dumps(cAdvB)); cAdvBs["sensors"] = [{"kind": "budget", "ceiling": 5000}]
+    rAdvBs = assess_launch_completeness(cAdvBs)
+    check("declared budget with budget sensor does NOT warn", not any("advisory_intent_gap" in w for w in rAdvBs["warnings"]), str(rAdvBs["warnings"]))
+    # declared definition_of_done -> always advisory (no DoD seam) -> warns
+    cAdvD = json.loads(json.dumps(base)); cAdvD["objective"]["definition_of_done"] = "all leads contacted"
+    rAdvD = assess_launch_completeness(cAdvD)
+    check("declared definition_of_done warns advisory_intent_gap", any("advisory_intent_gap" in w for w in rAdvD["warnings"]), str(rAdvD["warnings"]))
 
     print(f"\n{'ALL PASS' if failures == 0 else str(failures) + ' FAILURES'}")
     sys.exit(1 if failures else 0)

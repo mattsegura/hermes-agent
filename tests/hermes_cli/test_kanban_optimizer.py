@@ -717,16 +717,19 @@ def test_canary_reverts_regression_when_enabled(fresh_home):
 
 
 def test_canary_no_op_when_flag_off(fresh_home):
-    """Default-off: optimizer_tick does NOT run the canary (no revert path)."""
+    """Opt-out: with auto_revert explicitly off optimizer_tick does NOT run the
+    canary (no revert path). G5-B made the default ON, so the opt-out is now
+    explicit (``auto_revert=False``) rather than implicit."""
     slug = "canary-off"
     _make_board(slug, {"default": 72, "allowed": [48, 72]})
     base = 7_000_000
     hold = kb.OPTIMIZER_CANARY_HOLD_SECONDS
     with kb.connect(board=slug) as conn:
         _setup_regression(conn, slug, base)
-        # Flag off (default) -> the tick never enters the canary branch.
+        # Explicit opt-out -> the tick never enters the canary branch.
         res = kb.optimizer_tick(
             conn, board=slug, now=base + hold + 100, rng=random.Random(0),
+            auto_revert=False,
         )
         assert res.get("reverted") == []
 
@@ -758,6 +761,43 @@ def test_canary_keeps_change_that_improved(fresh_home):
         assert rev is None
         contract2 = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
         assert contract2["tunables"][KNOB]["default"] == 48
+
+
+def test_canary_keeps_neutral_no_harm_change(fresh_home):
+    """FIX 8: a NEUTRAL (no-harm) change -- post-change mean equal to the
+    baseline -- is KEPT, not auto-reverted. Before FIX 8 (epsilon=0.0 with a
+    strict ``>`` improvement test) a neutral change was reverted (churn)."""
+    slug = "canary-neutral"
+    _make_board(slug, {"default": 72, "allowed": [48, 72]})
+    base = 9_500_000
+    hold = kb.OPTIMIZER_CANARY_HOLD_SECONDS
+    with kb.connect(board=slug) as conn:
+        # Baseline mean reward = 1.0.
+        for i in range(6):
+            _emit_outcome(
+                conn, board=slug, knob=KNOB, value=72,
+                reward_kind="conversion", reward_value=1.0, ts=base + i,
+            )
+        _seed_applied_change(conn, slug, knob=KNOB, old_value=72, new_value=48, ts=base + 10)
+        # Post-change mean reward = 1.0 (IDENTICAL -> neutral, no harm).
+        for i in range(6):
+            _emit_outcome(
+                conn, board=slug, knob=KNOB, value=48,
+                reward_kind="conversion", reward_value=1.0, ts=base + 20 + i,
+            )
+        contract = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        rev = kb._optimizer_canary_revert(
+            conn, board=slug, knob=KNOB, contract=contract, now=base + hold + 100,
+        )
+        assert rev is None, "a neutral no-harm change must be kept, not reverted"
+        contract2 = kb._metadata_as_business_contract(kb.read_board_metadata(slug))
+        assert contract2["tunables"][KNOB]["default"] == 48
+
+
+def test_canary_improve_epsilon_is_positive():
+    """FIX 8: the canary margin is a small POSITIVE value (neutral changes are
+    kept) rather than 0.0."""
+    assert kb.OPTIMIZER_CANARY_IMPROVE_EPSILON > 0.0
 
 
 def test_canary_holds_within_window(fresh_home):

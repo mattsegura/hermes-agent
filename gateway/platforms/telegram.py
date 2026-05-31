@@ -3324,15 +3324,23 @@ class TelegramAdapter(BasePlatformAdapter):
                 # the flipped status and proceeds/denies accordingly — we do
                 # NOT change that blocking model.
                 user_display = getattr(query.from_user, "first_name", "User")
+                # H4 provenance: record the ACTUAL approver identity in the audit
+                # trail instead of the literal "owner". Authorization is already
+                # gated above (_is_callback_user_authorized) and is UNCHANGED --
+                # this only improves what decided_by stores so the audit trail has
+                # real provenance (who actually clicked). Falls back to "owner"
+                # only if the user id is somehow absent (keeps the column
+                # populated and back-compatible).
+                decided_by = str(getattr(query.from_user, "id", "") or "").strip() or "owner"
                 try:
                     from agent import action_gate as _ag
                     if choice == "approve":
                         resolved = await asyncio.to_thread(
-                            _ag.approve_action, gate_action_id, "owner"
+                            _ag.approve_action, gate_action_id, decided_by
                         )
                     else:
                         resolved = await asyncio.to_thread(
-                            _ag.deny_action, gate_action_id, "owner", False
+                            _ag.deny_action, gate_action_id, decided_by, False
                         )
                 except Exception as exc:
                     logger.error(

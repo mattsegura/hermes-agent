@@ -202,7 +202,13 @@ def test_degraded_question_generation_emits_fallback_questions(fresh_home, monke
     intake = result["launch_intake"]
     assert intake["degraded_mode"] is True
     assert len(intake["generated_questions"]) >= 2
-    assert len(result["questions"]) >= 2
+    # 60757d2a8 relocated owner-facing questions into launch_intake during the
+    # clarifying phase: the engine review layer intentionally leaves top-level
+    # result["questions"] empty (the tool layer relays generated_questions to the
+    # owner). Assert the relocated contract instead of the removed top-level copy.
+    assert intake["question_generation"]["mode"] == "deterministic_fallback"
+    assert intake["state"] == "clarifying"
+    assert len(intake["questions"]) >= 2
 
 
 def test_degraded_without_aux_falls_back_to_universal_drafter(fresh_home, monkeypatch):

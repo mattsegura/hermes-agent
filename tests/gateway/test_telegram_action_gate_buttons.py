@@ -237,7 +237,9 @@ class TestActionGateCallback:
         conn.close()
         assert row["status"] == "decided"
         assert row["decision"] == "approve"
-        assert row["decided_by"] == "owner"
+        # H4 provenance: decided_by records the ACTUAL approver id (query.from_user.id),
+        # not the literal "owner", so the audit trail has real provenance.
+        assert row["decided_by"] == "1843543011"
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
 
@@ -266,11 +268,13 @@ class TestActionGateCallback:
 
         conn = gate._ensure_queue_db()
         row = conn.execute(
-            "SELECT status, decision FROM pending_actions WHERE id=?", (rid,)
+            "SELECT status, decision, decided_by FROM pending_actions WHERE id=?", (rid,)
         ).fetchone()
         conn.close()
         assert row["status"] == "decided"
         assert row["decision"] == "deny"
+        # H4 provenance: deny records the real approver id too.
+        assert row["decided_by"] == "1843543011"
         query.answer.assert_called_once()
 
     @pytest.mark.asyncio
@@ -366,3 +370,77 @@ class TestActionGateCallback:
 
         query.answer.assert_called_once()
         assert "invalid" in query.answer.call_args[1]["text"].lower()
+
+    @pytest.mark.asyncio
+    async def test_decided_by_records_actual_approver_id(self, gate):
+        """H4 provenance: the audit trail stores the id of whoever clicked the
+        button (query.from_user.id), not a hardcoded 'owner', so a multi-admin
+        chat can attribute each decision to a real identity."""
+        rid = _insert_pending(gate)
+        adapter = _make_adapter()
+
+        query = AsyncMock()
+        query.data = f"ag:approve:{rid}"
+        query.message = MagicMock()
+        query.message.chat_id = 1843543011
+        query.message.text = "Approval Required"
+        query.from_user = MagicMock()
+        # A DIFFERENT authorized id than the prior tests, to prove the value is
+        # read from from_user and not coincidentally matching a literal.
+        query.from_user.id = "7654321"
+        query.from_user.first_name = "Michael"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        # Authorize this specific user (gating is unchanged; only provenance improves).
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "7654321"}, clear=False):
+            await adapter._handle_callback_query(update, context)
+
+        conn = gate._ensure_queue_db()
+        row = conn.execute(
+            "SELECT status, decision, decided_by FROM pending_actions WHERE id=?",
+            (rid,),
+        ).fetchone()
+        conn.close()
+        assert row["status"] == "decided"
+        assert row["decision"] == "approve"
+        assert row["decided_by"] == "7654321"
+
+    @pytest.mark.asyncio
+    async def test_decided_by_falls_back_to_owner_when_id_absent(self, gate):
+        """Defensive back-compat: if the user id is somehow absent, decided_by
+        still falls back to 'owner' so the audit column is never blank."""
+        rid = _insert_pending(gate)
+        adapter = _make_adapter()
+
+        query = AsyncMock()
+        query.data = f"ag:approve:{rid}"
+        query.message = MagicMock()
+        query.message.chat_id = 1843543011
+        query.message.text = "Approval Required"
+        query.from_user = MagicMock()
+        query.from_user.id = ""  # no usable id
+        query.from_user.first_name = "Michael"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        # Authorization is independent of the (empty) id here: force-authorize so
+        # the decision lands and we can assert the decided_by fallback specifically.
+        adapter._is_callback_user_authorized = lambda *a, **k: True
+
+        await adapter._handle_callback_query(update, context)
+
+        conn = gate._ensure_queue_db()
+        row = conn.execute(
+            "SELECT decided_by FROM pending_actions WHERE id=?", (rid,)
+        ).fetchone()
+        conn.close()
+        assert row["decided_by"] == "owner"

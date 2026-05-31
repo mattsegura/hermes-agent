@@ -251,6 +251,17 @@ def _notify_human(
     notify_channel = config.get("notify", "telegram")
 
     # Format the message
+    #
+    # H4 FIX: the previous text told the owner to reply "/approve <action_id>"
+    # / "/deny <action_id>", but that path silently FAILS: the gateway's
+    # /approve handler routes any non-keyword token to _parse_approve_board_arg,
+    # which treats a numeric token as a BOARD SLUG (board slugs may be all-digit
+    # per kanban_db._BOARD_SLUG_RE), so the action-gate decision never lands.
+    # Numeric routing was rejected as ambiguous (a digit token could be a real
+    # board name), so this is the honest text fix: point the owner at the inline
+    # Approve/Deny buttons (the working, default-on path the gateway watcher
+    # renders), and show the action id for the audit trail only -- never as a
+    # text command that would silently no-op.
     args_preview = json.dumps(tool_args, default=str)[:500]
     message = (
         f"🚨 Action Gate — Approval Required\n\n"
@@ -258,10 +269,8 @@ def _notify_human(
         f"Tool: {tool_name}\n"
         f"Action: {description}\n"
         f"Args: {args_preview}\n\n"
-        f"Reply with:\n"
-        f"  /approve {action_id}\n"
-        f"  /deny {action_id}\n"
-        f"  /deny {action_id} disable_tool"
+        f"Action #{action_id} — approve or deny with the inline buttons on the "
+        f"approval card sent to your chat."
     )
 
     if notify_channel == "telegram":
@@ -335,6 +344,50 @@ def _get_gate_config() -> dict:
     return {}
 
 
+def _contract_blocked_tools() -> list[str]:
+    """G2(c): the active board contract's ``runtime.tool_policy.blocked_tools``.
+
+    DEFAULT-OFF: when ``HERMES_KANBAN_BRIDGE_TOOL_POLICY`` (env) /
+    ``kanban.bridge_tool_policy`` (config.yaml) is unset this returns ``[]`` and
+    the action gate behaves byte-identically to today (only config.yaml
+    ``action_gate.rules.blocked_tools`` apply). When ON, the board contract's
+    declared blocked tools are returned so the caller can union them into the
+    per-profile blocked set.
+
+    Resolved defensively: the active board comes from ``HERMES_KANBAN_BOARD``
+    (set on every dispatched worker). Any failure -- import error, missing
+    metadata, malformed contract -- returns ``[]`` so a contract-read hiccup can
+    NEVER break the action gate (which would wedge every tool call).
+    """
+    try:
+        from hermes_cli.kanban_db import (
+            _bridge_tool_policy_enabled,
+            read_board_metadata,
+        )
+    except Exception:
+        return []
+    try:
+        if not _bridge_tool_policy_enabled():
+            return []
+    except Exception:
+        return []
+    try:
+        board = os.environ.get("HERMES_KANBAN_BOARD") or None
+        meta = read_board_metadata(board)
+        runtime = meta.get("runtime") if isinstance(meta.get("runtime"), dict) else {}
+        tool_policy = runtime.get("tool_policy") if isinstance(runtime, dict) else None
+        if not isinstance(tool_policy, dict):
+            return []
+        raw = tool_policy.get("blocked_tools")
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple, set)):
+            return []
+        return [str(t).strip() for t in raw if str(t).strip()]
+    except Exception:
+        return []
+
+
 def check_action_gate(
     tool_name: str,
     tool_args: dict,
@@ -350,6 +403,27 @@ def check_action_gate(
     (polls the queue) until the human responds or timeout expires.
     """
     config = _get_gate_config()
+
+    # G2(c) TOOL_POLICY BRIDGE. DEFAULT-OFF: ``_contract_blocked_tools()``
+    # returns ``[]`` unless the flag is ON, so this is byte-identical to today.
+    # When ON, the active board contract's runtime.tool_policy.blocked_tools are
+    # unioned into the per-profile ``rules.blocked_tools`` so the bridged tools
+    # are hard-blocked even when the profile config does not list them (and even
+    # when there is no action_gate config at all). Merging into a COPY leaves the
+    # loaded config untouched.
+    contract_blocked = _contract_blocked_tools()
+    if contract_blocked:
+        config = dict(config)
+        rules = dict(config.get("rules") or {})
+        existing = list(rules.get("blocked_tools") or [])
+        merged = list(existing)
+        seen = {str(t).casefold() for t in existing}
+        for t in contract_blocked:
+            if str(t).casefold() not in seen:
+                merged.append(t)
+                seen.add(str(t).casefold())
+        rules["blocked_tools"] = merged
+        config["rules"] = rules
 
     # If no action_gate config exists, gate is disabled — pass through
     if not config:
