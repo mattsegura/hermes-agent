@@ -734,7 +734,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(repeatable). Appended to the built-in "
                                "kanban-worker skill. Example: "
                                "--skill translation --skill github-code-review")
-    p_create.add_argument("--goal", default=None,
+    p_create.add_argument("--goal", nargs="?", const=True, default=None,
+                          help="Compatibility flag: with a VALUE, set the "
+                               "semantic funnel goal id; without a value, "
+                               "enable goal-loop worker mode. Prefer the "
+                               "explicit --goal-id / --goal-mode flags in "
+                               "new automation.")
+    p_create.add_argument("--goal-id", dest="goal_id", default=None,
                           help="Semantic funnel goal id for optimizer/UI read-models")
     p_create.add_argument("--workstream", default=None,
                           help="Semantic funnel workstream id under the goal")
@@ -753,6 +759,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "two retries. Omit to use the dispatcher's "
                                "kanban.failure_limit config "
                                f"(default {kb.DEFAULT_FAILURE_LIMIT}).")
+    p_create.add_argument("--goal-mode", action="store_true", dest="goal_mode",
+                          help="Run the worker in a goal loop: after each "
+                               "turn a judge checks the response against the "
+                               "card title/body and, if not done, the worker "
+                               "keeps going in the same session until the "
+                               "judge agrees it's complete (or the turn "
+                               "budget runs out, which blocks the card for "
+                               "review). Best for open-ended cards one shot "
+                               "rarely finishes.")
+    p_create.add_argument("--goal-max-turns", type=int, default=None,
+                          metavar="N", dest="goal_max_turns",
+                          help="Turn budget for goal-loop workers (default 20). "
+                               "Ignored unless --goal without value or "
+                               "--goal-mode is set.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default=None,
@@ -3150,6 +3170,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if funnel_error:
         print(f"kanban: {funnel_error}", file=sys.stderr)
         return 2
+    goal_arg = getattr(args, "goal", None)
+    semantic_goal_id = getattr(args, "goal_id", None)
+    goal_mode = bool(getattr(args, "goal_mode", False))
+    if goal_arg is True:
+        goal_mode = True
+    elif goal_arg not in (None, ""):
+        if semantic_goal_id:
+            print("kanban: pass only one of --goal VALUE or --goal-id", file=sys.stderr)
+            return 2
+        semantic_goal_id = str(goal_arg)
     try:
         with kb.connect_closing() as conn:
             task_id = kb.create_task(
@@ -3169,8 +3199,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 max_runtime_seconds=max_runtime,
                 skills=getattr(args, "skills", None) or None,
                 max_retries=max_retries,
+                goal_mode=goal_mode,
+                goal_max_turns=getattr(args, "goal_max_turns", None),
                 initial_status=getattr(args, "initial_status", None),
-                goal_id=getattr(args, "goal", None),
+                goal_id=semantic_goal_id,
                 workstream_id=getattr(args, "workstream", None),
                 stage_key=getattr(args, "stage", None),
                 action_key=getattr(args, "action", None),
