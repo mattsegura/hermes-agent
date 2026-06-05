@@ -52,6 +52,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("deepseek/deepseek-v4-flash",             ""),
     # Qwen
     ("qwen/qwen3.7-max",                       ""),
+    ("qwen/qwen3.7-plus",                      ""),
     ("qwen/qwen3.6-35b-a3b",                   ""),
     # MoonshotAI
     ("moonshotai/kimi-k2.6",                   "recommended"),
@@ -169,6 +170,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "deepseek/deepseek-v4-flash",
         # Qwen
         "qwen/qwen3.7-max",
+        "qwen/qwen3.7-plus",
         "qwen/qwen3.6-35b-a3b",
         # MoonshotAI
         "moonshotai/kimi-k2.6",
@@ -588,7 +590,8 @@ def union_with_portal_free_recommendations(
     pair where:
 
     * Portal free recommendations missing from ``curated_ids`` are
-      appended at the front (so the picker shows them first).
+      appended after the curated list (so the in-repo curated models
+      show first and Portal-only picks follow).
     * ``pricing`` gets a synthetic ``{"prompt": "0", "completion": "0"}``
       entry for any free recommendation missing from the live pricing
       map, so :func:`partition_nous_models_by_tier` keeps it.
@@ -623,11 +626,11 @@ def union_with_portal_free_recommendations(
 
     augmented_ids = list(curated_ids)
     seen = set(augmented_ids)
-    # Prepend Portal free recommendations that aren't already curated, so
-    # they appear first in the picker.
+    # Append Portal free recommendations that aren't already curated, so the
+    # in-repo curated ("HA") models show first and Portal-only picks follow.
     new_ones = [mid for mid in portal_free_ids if mid not in seen]
     if new_ones:
-        augmented_ids = new_ones + augmented_ids
+        augmented_ids = augmented_ids + new_ones
 
     return (augmented_ids, augmented_pricing)
 
@@ -653,7 +656,8 @@ def union_with_portal_paid_recommendations(
     ``(model_ids, pricing)`` pair where:
 
     * Portal paid recommendations missing from ``curated_ids`` are
-      appended at the front (so the picker shows them first).
+      appended after the curated list (so the in-repo curated models
+      show first and Portal-only picks follow).
     * ``pricing`` is left untouched — we deliberately do NOT synthesize
       pricing entries for paid models. Live pricing is fetched separately
       via :func:`get_pricing_for_provider`; if the live endpoint hasn't
@@ -688,11 +692,11 @@ def union_with_portal_paid_recommendations(
 
     augmented_ids = list(curated_ids)
     seen = set(augmented_ids)
-    # Prepend Portal paid recommendations that aren't already curated, so
-    # the Portal-blessed picks surface first in the picker.
+    # Append Portal paid recommendations that aren't already curated, so the
+    # in-repo curated ("HA") models show first and Portal-only picks follow.
     new_ones = [mid for mid in portal_paid_ids if mid not in seen]
     if new_ones:
-        augmented_ids = new_ones + augmented_ids
+        augmented_ids = augmented_ids + new_ones
 
     return (augmented_ids, dict(pricing))
 
@@ -1868,19 +1872,21 @@ def model_supports_fast_mode(model_id: Optional[str]) -> bool:
 
 
 def _is_anthropic_fast_model(model_id: Optional[str]) -> bool:
-    """Return True if the model is a Claude model eligible for Anthropic Fast Mode.
+    """Return True if the model accepts the Anthropic Fast Mode ``speed`` param.
 
-    Fast mode is currently supported on Claude Opus 4.6 only. Per Anthropic's
-    docs (https://platform.claude.com/docs/en/build-with-claude/fast-mode):
-    "Fast mode is currently supported on Opus 4.6 only. Sending speed: fast
-    with an unsupported model returns an error." Opus 4.7 explicitly rejects
-    the ``speed`` parameter with HTTP 400.
+    This gates the *speed=fast request parameter*, which Anthropic supports on
+    Opus 4.6 only (Opus 4.7 explicitly 400s). It is deliberately NOT a general
+    "is this a fast model" check: for Opus 4.8 the fast offering is a SEPARATE
+    model id (``…-opus-4.8-fast``) selected via the model field, not the speed
+    parameter — see ``agent.anthropic_adapter._supports_fast_mode`` and its
+    test. Keep this in lock-step with that adapter gate so the UI never shows a
+    Fast toggle that the runtime would silently drop.
     """
     raw = _strip_vendor_prefix(str(model_id or ""))
     base = raw.split(":")[0]
     if not base.startswith("claude-"):
         return False
-    # Only Opus 4.6 supports fast mode at present.
+    # Only Opus 4.6 supports the speed=fast parameter at present.
     return "opus-4-6" in base or "opus-4.6" in base
 
 
