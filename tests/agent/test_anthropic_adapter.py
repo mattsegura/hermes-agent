@@ -113,6 +113,27 @@ class TestBuildAnthropicClient:
                 "anthropic-beta": "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
             }
 
+    def test_ccapi_anthropic_endpoint_uses_browser_user_agent(self):
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("ccapi-secret-123", base_url="https://ccapi.us")
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            assert kwargs["base_url"] == "https://ccapi.us"
+            assert kwargs["api_key"] == "ccapi-secret-123"
+            assert "auth_token" not in kwargs
+            headers = kwargs["default_headers"]
+            assert headers["User-Agent"].startswith("HermesAgent/")
+            assert "Anthropic/Python" not in headers["User-Agent"]
+            assert "interleaved-thinking-2025-05-14" in headers["anthropic-beta"]
+
+    def test_packyapi_anthropic_endpoint_uses_browser_user_agent(self):
+        with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+            build_anthropic_client("packyapi-secret-123", base_url="https://www.packyapi.com")
+            kwargs = mock_sdk.Anthropic.call_args[1]
+            headers = kwargs["default_headers"]
+            assert headers["User-Agent"].startswith("HermesAgent/")
+            assert kwargs["api_key"] == "packyapi-secret-123"
+            assert "auth_token" not in kwargs
+
     def test_azure_anthropic_endpoint_keeps_context_1m_beta(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             build_anthropic_client(

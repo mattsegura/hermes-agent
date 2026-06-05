@@ -7,7 +7,7 @@ amendment (origin ``ceo``) -- which still requires the owner's explicit
 approve -> validate -> mint. The conversation never mutates the live contract.
 
 These tests mock the auxiliary CEO model exactly like the launch-intake tests:
-by monkeypatching ``kanban_launch_intake._call_model`` to return a canned JSON
+by monkeypatching ``company_launch._call_model`` to return a canned JSON
 string, so the real ``run_ceo_turn`` parsing/proposal-extraction runs offline.
 """
 
@@ -23,7 +23,7 @@ import sys
 import pytest
 
 from hermes_cli import kanban_db as kb
-from hermes_cli import kanban_launch_intake as kli
+from hermes_cli import company_launch as kli
 
 
 _WORKTREE = Path(__file__).resolve().parents[2]

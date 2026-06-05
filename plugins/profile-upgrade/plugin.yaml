@@ -1,0 +1,11 @@
+name: profile-upgrade
+version: 1.1.0
+description: "Narrow, approval-gated delegated-worker profile upgrade proposals for orchestrator self-healing."
+author: NousResearch
+kind: standalone
+provides_tools:
+  - profile_upgrade_propose
+  - profile_upgrade_status
+  - profile_upgrade_apply
+provides_toolsets:
+  - profile_upgrade

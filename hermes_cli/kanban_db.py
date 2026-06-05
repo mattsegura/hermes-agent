@@ -3615,7 +3615,7 @@ def _prepare_business_runtime_contract_for_review(
 
 LAUNCH_INTAKE_DEGRADED_HINT = (
     "Launch intake is in degraded mode — configure the auxiliary model slot "
-    "'kanban_launch_intake' in ~/.hermes/config.yaml (runtime.models) for "
+    "'company_launch' in ~/.hermes/config.yaml (runtime.models) for "
     "server-generated questions, answer assessment, and contract synthesis. "
     "Until then Hermes falls back to model-generated questions and the "
     "deterministic universal drafter."
@@ -3665,9 +3665,9 @@ def _board_argument_mismatch_hint(
 
 
 def _launch_intake_aux_enabled() -> bool:
-    """True when the kanban_launch_intake auxiliary slot is configured."""
+    """True when the company_launch auxiliary slot is configured."""
     try:
-        from hermes_cli import kanban_launch_intake as kli
+        from hermes_cli import company_launch as kli
         return bool(kli.aux_configured())
     except Exception:  # pragma: no cover - defensive import guard
         return False
@@ -3701,11 +3701,11 @@ def _maybe_run_pre_interview_research(draft: dict[str, Any]) -> dict[str, Any]:
     if not rough_goal or not _launch_intake_aux_enabled():
         return draft
     _emit_launch_cli_progress(
-        "running pre-interview research (kanban_launch_intake aux)...",
+        "running pre-interview research (company_launch aux)...",
         owner_phrase="Researching your market…",
     )
     try:
-        from hermes_cli import kanban_launch_intake as kli
+        from hermes_cli import company_launch as kli
         result = kli.run_pre_interview_research(rough_goal)
     except Exception:  # pragma: no cover - defensive
         return draft
@@ -3759,11 +3759,11 @@ def _maybe_generate_launch_intake_questions(draft: dict[str, Any]) -> dict[str, 
         merged["launch_intake"] = _apply_launch_intake_question_fallback(dict(intake))
         return merged
     _emit_launch_cli_progress(
-        "generating launch-intake questions (kanban_launch_intake aux)...",
+        "generating launch-intake questions (company_launch aux)...",
         owner_phrase="Putting together a few questions for you…",
     )
     try:
-        from hermes_cli import kanban_launch_intake as kli
+        from hermes_cli import company_launch as kli
         result = kli.run_question_generation(
             rough_goal, external_research=intake.get("external_research")
         )
@@ -3810,11 +3810,11 @@ def _maybe_assess_launch_intake_answers(draft: dict[str, Any]) -> dict[str, Any]
         answers, rough_goal=rough_goal, external_research=intake.get("external_research")
     )
     _emit_launch_cli_progress(
-        "assessing launch-intake answers (kanban_launch_intake aux)...",
+        "assessing launch-intake answers (company_launch aux)...",
         owner_phrase="Reviewing your answers…",
     )
     try:
-        from hermes_cli import kanban_launch_intake as kli
+        from hermes_cli import company_launch as kli
         result = kli.run_answer_assessment(
             rough_goal, questions, answers, coverage=coverage.as_dict()
         )
@@ -4233,7 +4233,7 @@ def _synthesize_launch_contract_from_intake(draft: dict[str, Any]) -> dict[str, 
             return draft
 
     if _launch_intake_aux_enabled():
-        from hermes_cli import kanban_launch_intake as kli
+        from hermes_cli import company_launch as kli
         profile = (
             str(os.environ.get("HERMES_PROFILE") or os.environ.get("HERMES_PROFILE_NAME") or "").strip()
             or "personal-assistant"
@@ -4281,7 +4281,7 @@ def _synthesize_launch_contract_from_intake(draft: dict[str, Any]) -> dict[str, 
         def _progress(attempt: int):
             if attempt == 1:
                 _emit_launch_cli_progress(
-                    "synthesizing board contract (kanban_launch_intake aux)...",
+                    "synthesizing board contract (company_launch aux)...",
                     owner_phrase="Drafting your plan…",
                 )
             else:
@@ -6156,7 +6156,7 @@ def steer_board_contract_amendment(
     """Owner-facing, natural-language contract edit (the DEFAULT edit path).
 
     Routes the owner's free-text ``intent`` through the CEO steering model
-    (:func:`hermes_cli.kanban_launch_intake.run_ceo_turn`) inside the shared
+    (:func:`hermes_cli.company_launch.run_ceo_turn`) inside the shared
     bounded self-repair loop, validates each candidate with the batched
     validator, and — once it converges on a launch-ready change — stores ONE
     clean pending amendment via :func:`propose_board_contract_amendment` (so the
@@ -6189,7 +6189,7 @@ def steer_board_contract_amendment(
             ),
         }
 
-    from hermes_cli import kanban_launch_intake as kli
+    from hermes_cli import company_launch as kli
 
     meta = read_board_metadata(normed)
     current = _metadata_as_business_contract(meta)
@@ -7864,7 +7864,7 @@ def steer_reflect_amendment_state(
 _STEERING_DEGRADED_MESSAGE = (
     "The CEO reasoning model is not configured for this Hermes install, so I "
     "can't hold a live steering conversation right now. Your message has been "
-    "recorded. Configure the 'kanban_launch_intake' auxiliary model slot to "
+    "recorded. Configure the 'company_launch' auxiliary model slot to "
     "enable the conversational CEO. (No contract change was made.)"
 )
 
@@ -7886,7 +7886,7 @@ def steer_send_message(
       2. Build aux-model context: current normalized contract (or "no contract
          yet" pre-launch) + version, the coverage report (what's still weak),
          open amendments, recent signals, and the prior conversation.
-      3. Call the ``kanban_launch_intake`` aux model with the CEO system prompt
+      3. Call the ``company_launch`` aux model with the CEO system prompt
          (reusing the existing aux-call path). The CEO may request grounded
          research (one bounded round) before answering.
       4. Append the CEO reply. If the CEO emitted a structured amendment
@@ -7897,7 +7897,7 @@ def steer_send_message(
       5. Degrade gracefully when no aux model is configured: a deterministic
          system message, no crash, no amendment, no fabrication.
     """
-    from hermes_cli import kanban_launch_intake as _intake
+    from hermes_cli import company_launch as _intake
 
     board_slug = _connection_board(conn, board)
     session = get_steering_session(conn, session_id, board=board_slug)

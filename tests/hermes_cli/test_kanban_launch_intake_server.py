@@ -1,6 +1,6 @@
 """Phase 2: server-side launch-intake orchestration (mocked auxiliary).
 
-Proves the wiring routes launch intake through the ``kanban_launch_intake``
+Proves the wiring routes launch intake through the ``company_launch``
 auxiliary orchestrator when configured (server generates questions, assesses
 answers, and synthesizes the contract) and degrades to the deterministic
 universal drafter otherwise. All auxiliary + web calls are mocked -- nothing
@@ -20,7 +20,7 @@ import os
 import pytest
 
 from hermes_cli import kanban_db as kb
-from hermes_cli import kanban_launch_intake as kli
+from hermes_cli import company_launch as kli
 from hermes_cli import kanban_launch_coverage as cov
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "..", "fixtures", "launch_intake")

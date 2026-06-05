@@ -480,7 +480,7 @@ def scenario_steering() -> list[str]:
     import copy
     findings: list[str] = []
     from hermes_cli import kanban_db as kb
-    from hermes_cli import kanban_launch_intake as kli
+    from hermes_cli import company_launch as kli
 
     base = load_contract("insurance_recruiting")
 

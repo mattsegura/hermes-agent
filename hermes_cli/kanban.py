@@ -2321,7 +2321,7 @@ def _print_launch_intake_degraded_warning(intake: dict[str, Any]) -> None:
         hint = LAUNCH_INTAKE_DEGRADED_HINT
     except Exception:
         hint = (
-            "Launch intake degraded — configure kanban_launch_intake aux slot."
+            "Launch intake degraded — configure company_launch aux slot."
         )
     print(f"\nWarning: {hint}", file=sys.stderr)
 

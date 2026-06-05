@@ -391,13 +391,13 @@ def _compute_tool_definitions(
                     resolved.clear()
                 if (
                     toolset_name == "kanban"
-                    and "kanban_launch_intake" not in disabled_names
+                    and "company_launch" not in disabled_names
                 ):
                     # ``kanban`` is commonly disabled on owner-facing
                     # profiles to suppress execution tools. Launch intake is
                     # a separate review-only surface and should survive unless
                     # explicitly disabled by name.
-                    resolved.difference_update(resolve_toolset("kanban_launch_intake"))
+                    resolved.difference_update(resolve_toolset("company_launch"))
                 tools_to_include.difference_update(resolved)
                 if not quiet_mode:
                     print(f"🚫 Disabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}")

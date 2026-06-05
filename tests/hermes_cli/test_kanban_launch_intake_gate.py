@@ -46,8 +46,8 @@ def test_partial_escalation_after_max_rounds(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_LAUNCH_INTAKE_MAX_CLARIFICATION_ROUNDS", "1")
     (tmp_path / ".hermes").mkdir()
     from hermes_cli import kanban_db as kb
-    from hermes_cli import kanban_launch_intake as kli
-    from hermes_cli.kanban_launch_intake import AnswerAssessmentResult
+    from hermes_cli import company_launch as kli
+    from hermes_cli.company_launch import AnswerAssessmentResult
 
     monkeypatch.setattr(kb, "LAUNCH_INTAKE_MAX_CLARIFICATION_ROUNDS", 1)
     board = "partial-esc"

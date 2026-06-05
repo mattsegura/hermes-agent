@@ -1,0 +1,53 @@
+name: execution-gate
+version: 1.0.0
+description: |
+  Gated execution system for orchestrator profiles. Two tiers:
+  - Tier 1 (Contracts): finite deliverables → declare intent + criteria → delegate → validate artifacts
+  - Tier 2 (Boards): recurring/durable operating loops with persistent kanban state and CEO/worker hierarchy
+  
+  Orchestrators declare what success looks like. Workers execute. 
+  Results are validated against declared criteria before completion.
+  
+  Features:
+  - Parallel delegation: Break work into independent tasks, run concurrently
+  - Dependency tracking: Sequential tasks wait for dependencies
+  - Aggregation: Combine results from parallel workers
+  - Anti-hallucination: Proof comes from artifacts, not claims
+  - Anti-drift: Clear success criteria keep work focused
+  - Anti-gaming: Hidden criteria catch dishonest workers
+author: NousResearch
+kind: standalone
+provides_tools:
+  - gate_intake        # Capture lossless task envelope before routing/delegation
+  - gate_intake_verify # Verify intake quality before routing/delegation
+  - gate_conversion_ledger # Inspect local conversion-funnel events
+  # Tier routing
+  - gate_route         # Classify Tier 1 finite deliverable vs Tier 2 recurring/durable board
+  # Tier 1: Contract-gated delegation
+  - gate_contract      # Declare contract before delegating
+  - gate_delegate      # Delegate with contract context (single task)
+  - gate_parallel      # Decompose and delegate multiple tasks concurrently
+  - gate_validate      # Validate worker return against contract
+  - gate_aggregate     # Combine results from parallel subtasks
+  - gate_status        # Check current contract state
+  - gate_abandon       # Abandon contract
+  # Tier 2 tools are in kanban plugin, this integrates with them
+provides_toolsets:
+  - execution_gate
+config_schema:
+  audit_probability:
+    type: number
+    default: 0.15
+    description: "Probability of triggering hidden criteria audit (0.0-1.0)"
+  max_retry_attempts:
+    type: integer
+    default: 3
+    description: "Maximum retry attempts before escalating to user"
+  max_parallel_tasks:
+    type: integer
+    default: 3
+    description: "Maximum concurrent delegations"
+  require_contract:
+    type: boolean
+    default: true
+    description: "Require contract declaration before any delegation"

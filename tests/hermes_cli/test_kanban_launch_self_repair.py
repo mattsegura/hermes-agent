@@ -31,7 +31,7 @@ if str(_WORKTREE) not in sys.path:
     sys.path.insert(0, str(_WORKTREE))
 
 from hermes_cli import kanban_db as kb
-from hermes_cli import kanban_launch_intake as kli
+from hermes_cli import company_launch as kli
 from hermes_cli import kanban_launch_invariants as inv
 
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "..", "fixtures", "launch_intake")

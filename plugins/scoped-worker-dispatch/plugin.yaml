@@ -1,0 +1,12 @@
+name: scoped-worker-dispatch
+version: 1.0.0
+description: "Hard-scoped worker dispatch for locked orchestrator profiles. Workers are selected from tenant/board policy, not raw delegate_task."
+author: NousResearch
+kind: standalone
+provides_tools:
+  - scoped_worker_policy
+  - scoped_worker_match
+  - scoped_worker_dispatch
+  - scoped_worker_batch
+provides_toolsets:
+  - scoped_worker

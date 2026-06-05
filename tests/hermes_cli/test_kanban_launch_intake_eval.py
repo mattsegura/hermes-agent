@@ -14,7 +14,7 @@ the same to the gate. The rubric makes the difference measurable.
 
 Run just this file:
 
-    .venv/bin/python -m pytest tests/hermes_cli/test_kanban_launch_intake_eval.py -v -s
+    .venv/bin/python -m pytest tests/hermes_cli/test_company_launch_eval.py -v -s
 """
 
 from __future__ import annotations

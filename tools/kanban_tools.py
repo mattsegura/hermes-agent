@@ -4,7 +4,7 @@ Task execution tools are registered into the model's schema when the agent is
 running under the dispatcher (env var ``HERMES_KANBAN_TASK`` set) or when
 the active profile explicitly enables the full ``kanban`` toolset for
 orchestrator work. Launch-intake tools live in a narrower
-``kanban_launch_intake`` toolset so owner-facing profiles can review a
+``company_launch`` toolset so owner-facing profiles can review a
 business launch contract without seeing task creation/execution tools.
 
 Why tools instead of just shelling out to ``hermes kanban``?
@@ -47,7 +47,7 @@ KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
 
 KANBAN_FULL_TOOLSET = "kanban"
-KANBAN_LAUNCH_INTAKE_TOOLSET = "kanban_launch_intake"
+COMPANY_LAUNCH_TOOLSET = "company_launch"
 KANBAN_OWNER_LAUNCH_INTAKE_PROFILES = {"default", "personal-assistant"}
 LAUNCH_INTAKE_INTERVIEW_SKILL = "launch-intake-interview"
 
@@ -129,7 +129,7 @@ def _profile_has_kanban_toolset() -> bool:
 
 
 def _profile_has_launch_intake_toolset() -> bool:
-    if _profile_has_toolset(KANBAN_LAUNCH_INTAKE_TOOLSET, KANBAN_FULL_TOOLSET):
+    if _profile_has_toolset(COMPANY_LAUNCH_TOOLSET, KANBAN_FULL_TOOLSET):
         return True
     return (
         _active_profile_name() in KANBAN_OWNER_LAUNCH_INTAKE_PROFILES
@@ -172,7 +172,7 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
-def _check_kanban_launch_intake_mode() -> bool:
+def _check_company_launch_mode() -> bool:
     """Launch-intake tools are read/review/amend-only.
 
     They are never exposed to dispatcher-spawned task workers. Owner-facing
@@ -582,7 +582,7 @@ def _attach_launch_degraded_warning(payload: dict[str, Any]) -> None:
         from hermes_cli.kanban_db import LAUNCH_INTAKE_DEGRADED_HINT
     except Exception:
         LAUNCH_INTAKE_DEGRADED_HINT = (
-            "Configure auxiliary model slot 'kanban_launch_intake' for full launch intake."
+            "Configure auxiliary model slot 'company_launch' for full launch intake."
         )
     payload["launch_intake_degraded_warning"] = LAUNCH_INTAKE_DEGRADED_HINT
     existing = str(payload.get("owner_message") or "").strip()
@@ -2646,7 +2646,7 @@ KANBAN_BUSINESS_LAUNCH_REVIEW_SCHEMA = {
         "If the owner gives a vague business idea, call with rough_goal and "
         "create_if_missing=true — omit board= for new boards (do not pass a slug "
         "that does not exist yet). Load launch-intake-interview skill during "
-        "intake Q&A. The server runs the kanban_launch_intake "
+        "intake Q&A. The server runs the company_launch "
         "auxiliary pipeline (research, generated_questions, answer assessment, "
         "contract synthesis) and returns assistant_next_action telling you what "
         "to say next on Telegram. Relay server-generated questions verbatim; "
@@ -3381,91 +3381,91 @@ registry.register(
 
 registry.register(
     name="kanban_list_boards",
-    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    toolset=COMPANY_LAUNCH_TOOLSET,
     schema=KANBAN_LIST_BOARDS_SCHEMA,
     handler=_handle_list_boards,
-    check_fn=_check_kanban_launch_intake_mode,
+    check_fn=_check_company_launch_mode,
     emoji="🗂",
 )
 
 registry.register(
     name="kanban_match_board",
-    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    toolset=COMPANY_LAUNCH_TOOLSET,
     schema=KANBAN_MATCH_BOARD_SCHEMA,
     handler=_handle_match_board,
-    check_fn=_check_kanban_launch_intake_mode,
+    check_fn=_check_company_launch_mode,
     emoji="🧭",
 )
 
 registry.register(
     name="kanban_board_launch_status",
-    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    toolset=COMPANY_LAUNCH_TOOLSET,
     schema=KANBAN_BOARD_LAUNCH_STATUS_SCHEMA,
     handler=_handle_board_launch_status,
-    check_fn=_check_kanban_launch_intake_mode,
+    check_fn=_check_company_launch_mode,
     emoji="🧭",
 )
 
 registry.register(
     name="kanban_business_launch_review",
-    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    toolset=COMPANY_LAUNCH_TOOLSET,
     schema=KANBAN_BUSINESS_LAUNCH_REVIEW_SCHEMA,
     handler=_handle_business_launch_review,
-    check_fn=_check_kanban_launch_intake_mode,
+    check_fn=_check_company_launch_mode,
     emoji="🧭",
 )
 
 registry.register(
     name="kanban_launch_credentials_status",
-    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    toolset=COMPANY_LAUNCH_TOOLSET,
     schema=KANBAN_LAUNCH_CREDENTIALS_STATUS_SCHEMA,
     handler=_handle_launch_credentials_status,
-    check_fn=_check_kanban_launch_intake_mode,
+    check_fn=_check_company_launch_mode,
     emoji="🔐",
 )
 
 registry.register(
     name="kanban_submit_launch_credentials",
-    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    toolset=COMPANY_LAUNCH_TOOLSET,
     schema=KANBAN_SUBMIT_LAUNCH_CREDENTIALS_SCHEMA,
     handler=_handle_submit_launch_credentials,
-    check_fn=_check_kanban_launch_intake_mode,
+    check_fn=_check_company_launch_mode,
     emoji="🔐",
 )
 
 registry.register(
     name="kanban_contract_amendment_propose",
-    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    toolset=COMPANY_LAUNCH_TOOLSET,
     schema=KANBAN_CONTRACT_AMENDMENT_PROPOSE_SCHEMA,
     handler=_handle_contract_amendment_propose,
-    check_fn=_check_kanban_launch_intake_mode,
+    check_fn=_check_company_launch_mode,
     emoji="🧭",
 )
 
 registry.register(
     name="kanban_contract_steer",
-    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    toolset=COMPANY_LAUNCH_TOOLSET,
     schema=KANBAN_CONTRACT_STEER_SCHEMA,
     handler=_handle_contract_steer,
-    check_fn=_check_kanban_launch_intake_mode,
+    check_fn=_check_company_launch_mode,
     emoji="🗣️",
 )
 
 registry.register(
     name="kanban_contract_schema",
-    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    toolset=COMPANY_LAUNCH_TOOLSET,
     schema=KANBAN_CONTRACT_SCHEMA_SCHEMA,
     handler=_handle_contract_schema,
-    check_fn=_check_kanban_launch_intake_mode,
+    check_fn=_check_company_launch_mode,
     emoji="📐",
 )
 
 registry.register(
     name="kanban_contract_amendment_apply",
-    toolset=KANBAN_LAUNCH_INTAKE_TOOLSET,
+    toolset=COMPANY_LAUNCH_TOOLSET,
     schema=KANBAN_CONTRACT_AMENDMENT_APPLY_SCHEMA,
     handler=_handle_contract_amendment_apply,
-    check_fn=_check_kanban_launch_intake_mode,
+    check_fn=_check_company_launch_mode,
     emoji="🧭",
 )
 

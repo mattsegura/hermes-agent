@@ -382,6 +382,36 @@ def _is_third_party_anthropic_endpoint(base_url: str | None) -> bool:
     return True  # Any other endpoint is a third-party proxy
 
 
+def _hermes_agent_user_agent() -> str:
+    """Return Hermes' browser-safe provider User-Agent."""
+    try:
+        from hermes_cli import __version__ as _HERMES_VERSION
+    except Exception:
+        _HERMES_VERSION = "1.0"
+    return f"HermesAgent/{_HERMES_VERSION}"
+
+
+def _requires_browser_user_agent(base_url: str | None) -> bool:
+    """Return True for Anthropic-compatible proxies that block SDK UAs."""
+    return any(
+        base_url_host_matches(base_url or "", domain)
+        for domain in ("ccapi.us", "packyapi.com")
+    )
+
+
+def _default_headers_for_anthropic_proxy(
+    base_url: str | None,
+    common_betas: list[str],
+) -> dict[str, str]:
+    """Build default headers for third-party Anthropic Messages endpoints."""
+    headers: dict[str, str] = {}
+    if _requires_browser_user_agent(base_url):
+        headers["User-Agent"] = _hermes_agent_user_agent()
+    if common_betas:
+        headers["anthropic-beta"] = ",".join(common_betas)
+    return headers
+
+
 def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
     """Return True for Kimi's /coding endpoint that requires claude-code UA."""
     normalized = _normalize_base_url_text(base_url)
@@ -696,7 +726,7 @@ def build_anthropic_client(
 
     normalized_base_url = _normalize_base_url_text(base_url)
     _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
-    kwargs = {
+    kwargs: dict[str, Any] = {
         "timeout": Timeout(timeout=float(_read_timeout), connect=10.0),
     }
     if normalized_base_url:
@@ -731,24 +761,26 @@ def build_anthropic_client(
         # not use Anthropic's sk-ant-api prefix and would otherwise be misread as
         # Anthropic OAuth/setup tokens.
         kwargs["auth_token"] = api_key
-        if common_betas:
-            kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
+        default_headers = _default_headers_for_anthropic_proxy(
+            normalized_base_url,
+            common_betas,
+        )
+        if default_headers:
+            kwargs["default_headers"] = default_headers
     elif _is_third_party_anthropic_endpoint(base_url):
-        # Third-party proxies (Microsoft Foundry, AWS Bedrock, etc.) use their
-        # own API keys with x-api-key auth. Skip OAuth detection — their keys
-        # don't follow Anthropic's sk-ant-* prefix convention and would be
-        # misclassified as OAuth tokens.
+        # Third-party proxies (Microsoft Foundry, AWS Bedrock, CCAPI/PackyAPI,
+        # etc.) use their own API keys with x-api-key auth. Skip OAuth
+        # detection — their keys don't follow Anthropic's sk-ant-* prefix
+        # convention and would be misclassified as OAuth tokens. Some NewAPI
+        # proxies also block Anthropic SDK's default User-Agent, so attach the
+        # Hermes UA when the host is known to need it.
         kwargs["api_key"] = api_key
-        _tp_headers = {}
-        if common_betas:
-            _tp_headers["anthropic-beta"] = ",".join(common_betas)
-        # PackyAPI's Cloudflare WAF blocks the Anthropic SDK's default
-        # User-Agent ("Anthropic/Python X.Y.Z") with 403.  Override with a
-        # neutral UA so requests pass WAF inspection.
-        if "packyapi.com" in (normalized_base_url or "").lower():
-            _tp_headers["User-Agent"] = "Hermes/1.0"
-        if _tp_headers:
-            kwargs["default_headers"] = _tp_headers
+        default_headers = _default_headers_for_anthropic_proxy(
+            normalized_base_url,
+            common_betas,
+        )
+        if default_headers:
+            kwargs["default_headers"] = default_headers
     elif _is_oauth_token(api_key):
         # OAuth access token / setup-token → Bearer auth + Claude Code identity.
         # Anthropic routes OAuth requests based on user-agent and headers;

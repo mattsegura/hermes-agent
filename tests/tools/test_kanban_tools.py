@@ -251,7 +251,7 @@ def test_launch_tools_registered_under_launch_intake_toolset():
     from tools.registry import registry
 
     for name in LAUNCH_INTAKE_TOOLS:
-        assert registry.get_toolset_for_tool(name) == "kanban_launch_intake"
+        assert registry.get_toolset_for_tool(name) == "company_launch"
 
 
 def test_personal_assistant_launch_intake_hides_full_kanban_execution(monkeypatch, tmp_path):
@@ -318,7 +318,7 @@ def test_disabled_launch_intake_removes_default_launch_tools(monkeypatch, tmp_pa
 
     names = _tool_definition_names(
         ["hermes-cli"],
-        disabled_toolsets=["kanban", "kanban_launch_intake"],
+        disabled_toolsets=["kanban", "company_launch"],
     )
     kanban = {n for n in names if n and n.startswith("kanban_")}
 
@@ -481,8 +481,8 @@ def test_board_discovery_tools_available_on_default(monkeypatch, tmp_path):
     assert "kanban_match_board" in names
     # They live in the launch-intake toolset → survive the disabled-kanban
     # carve-out that the router profile relies on.
-    assert registry.get_toolset_for_tool("kanban_list_boards") == "kanban_launch_intake"
-    assert registry.get_toolset_for_tool("kanban_match_board") == "kanban_launch_intake"
+    assert registry.get_toolset_for_tool("kanban_list_boards") == "company_launch"
+    assert registry.get_toolset_for_tool("kanban_match_board") == "company_launch"
 
 
 def test_list_boards_excludes_phantom_default(monkeypatch, tmp_path):
@@ -549,7 +549,7 @@ def test_router_boundary_strips_side_effecting_tools(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(home))
 
     enabled = ["web", "file", "clarify", "session_search", "vision", "todo",
-               "skills", "kanban_launch_intake"]
+               "skills", "company_launch"]
     disabled = ["terminal", "code_execution", "delegation", "messaging",
                 "cronjob", "kanban", "image_gen", "computer_use"]
     names = _tool_definition_names(enabled, disabled)
@@ -927,7 +927,7 @@ def test_sanitize_launch_result_surfaces_degraded_warning(monkeypatch, tmp_path)
     }
     sanitized = kt._sanitize_launch_tool_result(kb, result)
     assert sanitized.get("launch_intake_degraded_warning")
-    assert "kanban_launch_intake" in sanitized["launch_intake_degraded_warning"]
+    assert "company_launch" in sanitized["launch_intake_degraded_warning"]
 
 
 def test_business_launch_review_tool_requires_approval_token(monkeypatch, tmp_path):

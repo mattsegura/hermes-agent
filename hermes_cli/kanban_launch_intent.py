@@ -185,7 +185,7 @@ def _template_clarifying_question(goal: str) -> str:
 def _try_aux_clarifying_question(goal: str, fallback: str) -> str:
     """Optional aux-model question; returns fallback when unconfigured or invalid."""
     try:
-        from hermes_cli.kanban_launch_intake import _call_model, aux_configured
+        from hermes_cli.company_launch import _call_model, aux_configured
     except Exception:  # pragma: no cover - defensive import
         return fallback
 
@@ -203,7 +203,7 @@ def _try_aux_clarifying_question(goal: str, fallback: str) -> str:
         return fallback
 
     try:
-        from hermes_cli.kanban_launch_intake import _extract_json
+        from hermes_cli.company_launch import _extract_json
     except Exception:  # pragma: no cover
         return fallback
 

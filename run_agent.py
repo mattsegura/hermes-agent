@@ -3359,7 +3359,11 @@ class AIAgent:
             self._client_kwargs["default_headers"] = build_or_headers()
         elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
             self._client_kwargs["default_headers"] = build_nvidia_nim_headers(base_url)
-        elif base_url_host_matches(base_url, "api.routermint.com"):
+        elif (
+            base_url_host_matches(base_url, "api.routermint.com")
+            or base_url_host_matches(base_url, "ccapi.us")
+            or base_url_host_matches(base_url, "packyapi.com")
+        ):
             self._client_kwargs["default_headers"] = _routermint_headers()
         elif base_url_host_matches(base_url, "api.githubcopilot.com"):
             from hermes_cli.models import copilot_default_headers

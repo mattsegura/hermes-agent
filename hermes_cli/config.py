@@ -1258,7 +1258,7 @@ DEFAULT_CONFIG = {
         # Left as "auto"/empty by default: while unconfigured, launch intake
         # degrades to the deterministic universal drafter (no auxiliary call).
         # Point this at a capable model to enable server-side synthesis.
-        "kanban_launch_intake": {
+        "company_launch": {
             "provider": "auto",
             "model": "",
             "base_url": "",

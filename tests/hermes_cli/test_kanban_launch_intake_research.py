@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 
-from hermes_cli import kanban_launch_intake as kli
+from hermes_cli import company_launch as kli
 
 
 _FAKE_HITS = [
