@@ -870,13 +870,23 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
         logger.debug("Keychain: no entry found for 'Claude Code-credentials'")
         return None
 
-    raw = result.stdout.strip()
+    stdout = getattr(result, "stdout", "")
+    if isinstance(stdout, bytes):
+        raw = stdout.decode("utf-8", errors="ignore").strip()
+    elif isinstance(stdout, str):
+        raw = stdout.strip()
+    else:
+        # Tests and plugin shims may mock subprocess.run() with a generic
+        # MagicMock whose stdout is not a real string. Treat that exactly like
+        # an empty keychain response and fall through to file/env credentials.
+        logger.debug("Keychain: credentials stdout is not text; ignoring")
+        return None
     if not raw:
         return None
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         logger.debug("Keychain: credentials payload is not valid JSON")
         return None
 
